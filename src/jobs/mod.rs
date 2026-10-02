@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::rc::Rc;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
@@ -24,10 +24,10 @@ pub enum Category {
 
 #[derive(Default)]
 struct RunCache {
-    tables: HashMap<Category, Arc<Table>>,
-    authority: Option<Arc<HashSet<String>>>,
-    invoices: Option<Arc<MultiValueIndex>>,
-    receipts: Option<Arc<MultiValueIndex>>,
+    tables: HashMap<Category, Table>,
+    authority: Option<Rc<HashSet<String>>>,
+    invoices: Option<Rc<MultiValueIndex>>,
+    receipts: Option<Rc<MultiValueIndex>>,
     stats: Option<coupons::MatchStats>,
 }
 
@@ -44,13 +44,7 @@ impl ScopedCache {
     }
 
     pub(crate) fn get(category: Category) -> Option<Table> {
-        CACHE.with(|c| {
-            c.borrow()
-                .as_ref()?
-                .tables
-                .get(&category)
-                .map(|arc| (**arc).clone())
-        })
+        CACHE.with(|c| c.borrow().as_ref()?.tables.get(&category).cloned())
     }
 
     /// 只读借用缓存中的表并执行闭包，避免整表深拷贝。
@@ -60,15 +54,15 @@ impl ScopedCache {
     {
         CACHE.with(|c| {
             let borrow = c.borrow();
-            let arc = borrow.as_ref()?.tables.get(&category)?;
-            Some(f(arc))
+            let table = borrow.as_ref()?.tables.get(&category)?;
+            Some(f(table))
         })
     }
 
     pub(crate) fn put(category: Category, table: &Table) {
         CACHE.with(|c| {
             if let Some(map) = c.borrow_mut().as_mut() {
-                map.tables.insert(category, Arc::new(table.clone()));
+                map.tables.insert(category, table.clone());
             }
         });
     }

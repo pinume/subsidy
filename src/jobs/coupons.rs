@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, LazyLock};
+use std::rc::Rc;
+use std::sync::LazyLock;
 
 use regex::Regex;
 use rust_decimal::Decimal;
@@ -210,7 +211,7 @@ impl Job for CouponsJob {
     }
 }
 
-fn build_authority(input_dir: &Path) -> Result<Arc<HashSet<String>>, ProcessError> {
+fn build_authority(input_dir: &Path) -> Result<Rc<HashSet<String>>, ProcessError> {
     if let Some(index) = super::CACHE.with(|c| c.borrow().as_ref()?.authority.clone()) {
         return Ok(index);
     }
@@ -220,8 +221,8 @@ fn build_authority(input_dir: &Path) -> Result<Arc<HashSet<String>>, ProcessErro
         .unwrap_or_else(|| cache_authority(&records)))
 }
 
-pub(super) fn cache_authority(records: &[unionpay::UnionPayRecord]) -> Arc<HashSet<String>> {
-    let index = Arc::new(
+pub(super) fn cache_authority(records: &[unionpay::UnionPayRecord]) -> Rc<HashSet<String>> {
+    let index = Rc::new(
         records
             .iter()
             .map(|r| r.retrieval_no.as_str())
@@ -231,7 +232,7 @@ pub(super) fn cache_authority(records: &[unionpay::UnionPayRecord]) -> Arc<HashS
     );
     super::CACHE.with(|c| {
         if let Some(cache) = c.borrow_mut().as_mut() {
-            cache.authority = Some(Arc::clone(&index));
+            cache.authority = Some(Rc::clone(&index));
         }
     });
     index
@@ -245,7 +246,7 @@ fn is_valid_ref_no(value: &str) -> bool {
 
 /// 按`匹配单据号`汇总发票明细全部非空`数电发票号码`（未去重）；歧义判定见`to_row`
 /// 中复用的`resolve`（与 10.6.2 节"命中权威值需唯一"同一原则，不得任选）。
-fn build_invoice_index(input_dir: &Path) -> Result<Arc<MultiValueIndex>, ProcessError> {
+fn build_invoice_index(input_dir: &Path) -> Result<Rc<MultiValueIndex>, ProcessError> {
     if let Some(index) = super::CACHE.with(|c| c.borrow().as_ref()?.invoices.clone()) {
         return Ok(index);
     }
@@ -255,7 +256,7 @@ fn build_invoice_index(input_dir: &Path) -> Result<Arc<MultiValueIndex>, Process
         .unwrap_or_else(|| cache_invoice_index(&records)))
 }
 
-pub(super) fn cache_invoice_index(records: &[invoice::InvoiceRecord]) -> Arc<MultiValueIndex> {
+pub(super) fn cache_invoice_index(records: &[invoice::InvoiceRecord]) -> Rc<MultiValueIndex> {
     let mut grouped: MultiValueIndex = HashMap::new();
     for record in records {
         let Value::Text(match_doc_no) = &record.match_doc_no else {
@@ -269,17 +270,17 @@ pub(super) fn cache_invoice_index(records: &[invoice::InvoiceRecord]) -> Arc<Mul
             .or_default()
             .push(record.invoice_no.clone());
     }
-    let index = Arc::new(grouped);
+    let index = Rc::new(grouped);
     super::CACHE.with(|c| {
         if let Some(cache) = c.borrow_mut().as_mut() {
-            cache.invoices = Some(Arc::clone(&index));
+            cache.invoices = Some(Rc::clone(&index));
         }
     });
     index
 }
 
 /// 按`匹配单据号`汇总收款单统计全部非空`备注`（未去重）；歧义判定同样复用`resolve`。
-fn build_receipts_index(input_dir: &Path) -> Result<Arc<MultiValueIndex>, ProcessError> {
+fn build_receipts_index(input_dir: &Path) -> Result<Rc<MultiValueIndex>, ProcessError> {
     if let Some(index) = super::CACHE.with(|c| c.borrow().as_ref()?.receipts.clone()) {
         return Ok(index);
     }
@@ -289,7 +290,7 @@ fn build_receipts_index(input_dir: &Path) -> Result<Arc<MultiValueIndex>, Proces
         .unwrap_or_else(|| cache_receipts_index(&records)))
 }
 
-pub(super) fn cache_receipts_index(records: &[receipts::ReceiptRecord]) -> Arc<MultiValueIndex> {
+pub(super) fn cache_receipts_index(records: &[receipts::ReceiptRecord]) -> Rc<MultiValueIndex> {
     let mut grouped: MultiValueIndex = HashMap::new();
     for record in records {
         if record.match_doc_no.is_empty() || record.remark.is_empty() {
@@ -300,10 +301,10 @@ pub(super) fn cache_receipts_index(records: &[receipts::ReceiptRecord]) -> Arc<M
             .or_default()
             .push(record.remark.clone());
     }
-    let index = Arc::new(grouped);
+    let index = Rc::new(grouped);
     super::CACHE.with(|c| {
         if let Some(cache) = c.borrow_mut().as_mut() {
-            cache.receipts = Some(Arc::clone(&index));
+            cache.receipts = Some(Rc::clone(&index));
         }
     });
     index
@@ -1817,7 +1818,7 @@ mod tests {
     }
 
     #[test]
-    fn derived_indexes_share_arcs_and_expire_after_batch() {
+    fn derived_indexes_share_rcs_and_expire_after_batch() {
         let dir = unique_temp_path("coupons-derived-cache");
         std::fs::create_dir(&dir).unwrap();
         write_unionpay_fixture(&dir, "16867252734N");
@@ -1831,15 +1832,15 @@ mod tests {
             let authority = build_authority(&dir).unwrap();
             let invoices = build_invoice_index(&dir).unwrap();
             let receipts = build_receipts_index(&dir).unwrap();
-            assert!(Arc::ptr_eq(&authority, &build_authority(&dir).unwrap()));
-            assert!(Arc::ptr_eq(&invoices, &build_invoice_index(&dir).unwrap()));
-            assert!(Arc::ptr_eq(&receipts, &build_receipts_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&authority, &build_authority(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&invoices, &build_invoice_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&receipts, &build_receipts_index(&dir).unwrap()));
             write_unionpay_fixture(&dir, "99999999999N");
             write_invoice_fixture(&dir, &[]);
             write_receipts_fixture(&dir, &[]);
-            assert!(Arc::ptr_eq(&authority, &build_authority(&dir).unwrap()));
-            assert!(Arc::ptr_eq(&invoices, &build_invoice_index(&dir).unwrap()));
-            assert!(Arc::ptr_eq(&receipts, &build_receipts_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&authority, &build_authority(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&invoices, &build_invoice_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&receipts, &build_receipts_index(&dir).unwrap()));
         }
         let _guard = super::super::ScopedCache::activate();
         assert!(build_authority(&dir).unwrap().contains("99999999999N"));

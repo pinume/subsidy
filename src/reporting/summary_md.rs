@@ -196,83 +196,21 @@ pub(crate) fn write_summary_markdown(
     // ==========================================
     out.push_str("## 二、 结构与比率分析图\n\n```text\n");
 
-    let app_comp_amt = m.paid.app_amt + m.pass.app_amt;
-    let dig_comp_amt = m.paid.dig_amt + m.pass.dig_amt;
-
-    let t2_rows: [(&str, Decimal, f64, Decimal, f64, Decimal, f64); 8] = [
-        (
-            "发生额",
-            m.occur.app_amt,
-            div_pct(m.occur.app_amt, tot_gen_amt),
-            m.occur.dig_amt,
-            div_pct(m.occur.dig_amt, tot_gen_amt),
-            tot_gen_amt,
-            1.0,
-        ),
-        (
-            "已回款",
-            m.paid.app_amt,
-            div_pct(m.paid.app_amt, m.occur.app_amt),
-            m.paid.dig_amt,
-            div_pct(m.paid.dig_amt, m.occur.dig_amt),
-            tot_paid_amt,
-            div_pct(tot_paid_amt, tot_gen_amt),
-        ),
-        (
-            "未回款",
-            m.unpaid.app_amt,
-            div_pct(m.unpaid.app_amt, m.occur.app_amt),
-            m.unpaid.dig_amt,
-            div_pct(m.unpaid.dig_amt, m.occur.dig_amt),
-            tot_unpaid_amt,
-            div_pct(tot_unpaid_amt, tot_gen_amt),
-        ),
-        (
-            "审核通过未回款",
-            m.pass.app_amt,
-            div_pct(m.pass.app_amt, m.unpaid.app_amt),
-            m.pass.dig_amt,
-            div_pct(m.pass.dig_amt, m.unpaid.dig_amt),
-            tot_pass_amt,
-            div_pct(tot_pass_amt, tot_unpaid_amt),
-        ),
-        (
-            "待审核",
-            m.wait.app_amt,
-            div_pct(m.wait.app_amt, m.unpaid.app_amt),
-            m.wait.dig_amt,
-            div_pct(m.wait.dig_amt, m.unpaid.dig_amt),
-            tot_wait_amt,
-            div_pct(tot_wait_amt, tot_unpaid_amt),
-        ),
-        (
-            "审核失败",
-            m.fail.app_amt,
-            div_pct(m.fail.app_amt, m.unpaid.app_amt),
-            m.fail.dig_amt,
-            div_pct(m.fail.dig_amt, m.unpaid.dig_amt),
-            tot_fail_amt,
-            div_pct(tot_fail_amt, tot_unpaid_amt),
-        ),
-        (
-            "未上传",
-            m.unup.app_amt,
-            div_pct(m.unup.app_amt, m.unpaid.app_amt),
-            m.unup.dig_amt,
-            div_pct(m.unup.dig_amt, m.unpaid.dig_amt),
-            tot_unup_amt,
-            div_pct(tot_unup_amt, tot_unpaid_amt),
-        ),
-        (
-            "回款+审核通过未回款",
-            app_comp_amt,
-            div_pct(app_comp_amt, m.occur.app_amt),
-            dig_comp_amt,
-            div_pct(dig_comp_amt, m.occur.dig_amt),
-            tot_comp_amt,
-            div_pct(tot_comp_amt, tot_gen_amt),
-        ),
-    ];
+    let ratios = m.amount_ratios();
+    let t2_rows = [
+        ("发生额", 0),
+        ("已回款", 1),
+        ("未回款", 3),
+        ("审核通过未回款", 4),
+        ("待审核", 5),
+        ("审核失败", 6),
+        ("未上传", 7),
+        ("回款+审核通过未回款", 2),
+    ]
+    .map(|(name, index)| {
+        let (a, ap, d, dp, t, tp) = ratios[index];
+        (name, a, ap, d, dp, t, tp)
+    });
 
     let visible_t2 = |row: &(&str, Decimal, f64, Decimal, f64, Decimal, f64)| {
         !row.1.is_zero() || !row.3.is_zero() || !row.5.is_zero()

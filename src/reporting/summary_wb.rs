@@ -18,7 +18,7 @@ use super::data::{CommonInputs, SheetData};
 use super::reader::{read_sheet_rows, read_upload_rows};
 use super::summary_data::{
     AnomalyColors, MetricRow, STD_CATEGORIES, SalesMatrix, SummaryMetrics, SummaryRecords,
-    build_invoice_name_map, build_sales_matrix, div_pct,
+    build_invoice_name_map, build_sales_matrix,
 };
 
 /// Generate Workbook 1: 国补上传情况汇总.xlsx (5 Sheets)
@@ -276,88 +276,21 @@ fn build_summary_sheet(wb: &mut Workbook, s: &StylePool, m: &SummaryMetrics) -> 
     cur_row += 2;
 
     // Table 2 Ratios
-    let tot_gen_amt = m.occur.tot_amt();
-    let tot_paid_amt = m.paid.tot_amt();
-    let tot_unpaid_amt = m.unpaid.tot_amt();
-    let tot_pass_amt = m.pass.tot_amt();
-    let tot_wait_amt = m.wait.tot_amt();
-    let tot_fail_amt = m.fail.tot_amt();
-    let tot_unup_amt = m.unup.tot_amt();
-
-    let t2_data: [(&str, Decimal, f64, Decimal, f64, Decimal, f64); 8] = [
-        (
-            "国补发生额及占比",
-            m.occur.app_amt,
-            div_pct(m.occur.app_amt, tot_gen_amt),
-            m.occur.dig_amt,
-            div_pct(m.occur.dig_amt, tot_gen_amt),
-            tot_gen_amt,
-            1.0,
-        ),
-        (
-            "国补回款额及回款率",
-            m.paid.app_amt,
-            div_pct(m.paid.app_amt, m.occur.app_amt),
-            m.paid.dig_amt,
-            div_pct(m.paid.dig_amt, m.occur.dig_amt),
-            tot_paid_amt,
-            div_pct(tot_paid_amt, tot_gen_amt),
-        ),
-        (
-            "回款+审核通过未回款及综合回款率",
-            m.paid.app_amt + m.pass.app_amt,
-            div_pct(m.paid.app_amt + m.pass.app_amt, m.occur.app_amt),
-            m.paid.dig_amt + m.pass.dig_amt,
-            div_pct(m.paid.dig_amt + m.pass.dig_amt, m.occur.dig_amt),
-            tot_paid_amt + tot_pass_amt,
-            div_pct(tot_paid_amt + tot_pass_amt, tot_gen_amt),
-        ),
-        (
-            "未回款额",
-            m.unpaid.app_amt,
-            div_pct(m.unpaid.app_amt, m.occur.app_amt),
-            m.unpaid.dig_amt,
-            div_pct(m.unpaid.dig_amt, m.occur.dig_amt),
-            tot_unpaid_amt,
-            div_pct(tot_unpaid_amt, tot_gen_amt),
-        ),
-        (
-            "审核通过未回款",
-            m.pass.app_amt,
-            div_pct(m.pass.app_amt, m.unpaid.app_amt),
-            m.pass.dig_amt,
-            div_pct(m.pass.dig_amt, m.unpaid.dig_amt),
-            tot_pass_amt,
-            div_pct(tot_pass_amt, tot_unpaid_amt),
-        ),
-        (
-            "待审核",
-            m.wait.app_amt,
-            div_pct(m.wait.app_amt, m.unpaid.app_amt),
-            m.wait.dig_amt,
-            div_pct(m.wait.dig_amt, m.unpaid.dig_amt),
-            tot_wait_amt,
-            div_pct(tot_wait_amt, tot_unpaid_amt),
-        ),
-        (
-            "审核失败",
-            m.fail.app_amt,
-            div_pct(m.fail.app_amt, m.unpaid.app_amt),
-            m.fail.dig_amt,
-            div_pct(m.fail.dig_amt, m.unpaid.dig_amt),
-            tot_fail_amt,
-            div_pct(tot_fail_amt, tot_unpaid_amt),
-        ),
-        (
-            "未上传",
-            m.unup.app_amt,
-            div_pct(m.unup.app_amt, m.unpaid.app_amt),
-            m.unup.dig_amt,
-            div_pct(m.unup.dig_amt, m.unpaid.dig_amt),
-            tot_unup_amt,
-            div_pct(tot_unup_amt, tot_unpaid_amt),
-        ),
+    let names = [
+        "国补发生额及占比",
+        "国补回款额及回款率",
+        "回款+审核通过未回款及综合回款率",
+        "未回款额",
+        "审核通过未回款",
+        "待审核",
+        "审核失败",
+        "未上传",
     ];
+    let ratios = m.amount_ratios();
+    let t2_data: [_; 8] = std::array::from_fn(|index| {
+        let (a, ap, d, dp, t, tp) = ratios[index];
+        (names[index], a, ap, d, dp, t, tp)
+    });
 
     for (i, (name, a_amt, a_pct, d_amt, d_pct, t_amt, t_pct)) in t2_data.iter().enumerate() {
         if i == 4 {

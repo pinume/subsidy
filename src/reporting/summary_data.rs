@@ -92,6 +92,45 @@ pub struct SummaryMetrics {
 }
 
 impl SummaryMetrics {
+    /// 数值顺序：发生、已回款、综合回款、未回款、通过、待审、失败、未上传。
+    pub(crate) fn amount_ratios(&self) -> [(Decimal, f64, Decimal, f64, Decimal, f64); 8] {
+        let combined = MetricRow::new(
+            self.paid.app_amt + self.pass.app_amt,
+            0,
+            self.paid.dig_amt + self.pass.dig_amt,
+            0,
+        );
+        let total = self.occur.tot_amt();
+        let ratio = |row: &MetricRow, denominator: &MetricRow| {
+            (
+                row.app_amt,
+                div_pct(row.app_amt, denominator.app_amt),
+                row.dig_amt,
+                div_pct(row.dig_amt, denominator.dig_amt),
+                row.tot_amt(),
+                div_pct(row.tot_amt(), denominator.tot_amt()),
+            )
+        };
+        [
+            // 发生额合计占比沿用报表固定值，零金额时也为 100%。
+            (
+                self.occur.app_amt,
+                div_pct(self.occur.app_amt, total),
+                self.occur.dig_amt,
+                div_pct(self.occur.dig_amt, total),
+                total,
+                1.0,
+            ),
+            ratio(&self.paid, &self.occur),
+            ratio(&combined, &self.occur),
+            ratio(&self.unpaid, &self.occur),
+            ratio(&self.pass, &self.unpaid),
+            ratio(&self.wait, &self.unpaid),
+            ratio(&self.fail, &self.unpaid),
+            ratio(&self.unup, &self.unpaid),
+        ]
+    }
+
     pub(crate) fn calculate(
         sales: &SheetData,
         app_up: &SheetData,
@@ -339,6 +378,33 @@ fn refund_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_amount_ratios_keep_fixed_occurrence_share_and_zero_other_rates() {
+        let zero = MetricRow::default();
+        let metrics = SummaryMetrics {
+            occur: zero,
+            paid: zero,
+            unpaid: zero,
+            pass: zero,
+            wait: zero,
+            fail: zero,
+            unup: zero,
+        };
+        for (index, row) in metrics.amount_ratios().into_iter().enumerate() {
+            assert_eq!(
+                row,
+                (
+                    Decimal::ZERO,
+                    0.0,
+                    Decimal::ZERO,
+                    0.0,
+                    Decimal::ZERO,
+                    if index == 0 { 1.0 } else { 0.0 },
+                )
+            );
+        }
+    }
 
     #[test]
     fn selections_keep_row_order_and_distinguish_color_and_merchant_filters() {

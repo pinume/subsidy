@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use super::data::{CommonInputs, SheetData};
-use super::excel::{write_date_cell, write_refund_cell};
+use super::excel::{write_date_cell, write_decimal_cell, write_refund_cell};
 use super::reader::{HeaderMap, UploadColumns, cell_to_decimal, cell_to_string};
 use super::styles::StylePool;
 
@@ -378,13 +378,7 @@ fn build_store_occurrence_sheet(
                 }
                 // Money: 5:交易金额, 6:清算金额, 7:手续费, 8:T0手续费, 9:D1手续费, 21:优惠金额, 22:分期手续费
                 5 | 6 | 7 | 8 | 9 | 21 | 22 => {
-                    if let Some(dec) = cell_to_decimal(cell) {
-                        ws.write_with_format(cur_row, col as u16, dec, &s.money)
-                            .map_err(|e| e.to_string())?;
-                    } else {
-                        ws.write_string_with_format(cur_row, col as u16, "", &s.text_right)
-                            .map_err(|e| e.to_string())?;
-                    }
+                    write_decimal_cell(ws, cur_row, col as u16, cell, &s.money, &s.text_right)?;
                 }
                 _ => {
                     let val = cell_to_string(cell);
@@ -635,13 +629,14 @@ fn build_store_upload_sheet(
                     }
                     // Money: 5:交易金额, 20:发票金额, 54:subsideAmt
                     5 | 20 | 54 => {
-                        if let Some(dec) = cell_to_decimal(cell) {
-                            ws.write_with_format(*cur_row, col as u16, dec, &s.money)
-                                .map_err(|e| e.to_string())?;
-                        } else {
-                            ws.write_string_with_format(*cur_row, col as u16, "", &s.text_right)
-                                .map_err(|e| e.to_string())?;
-                        }
+                        write_decimal_cell(
+                            ws,
+                            *cur_row,
+                            col as u16,
+                            cell,
+                            &s.money,
+                            &s.text_right,
+                        )?;
                     }
                     // Center text: 7:模版类型, 8:状态, 12:终端号, 17:地区编码, 24:是否属于 AI 产品, 47:ocrModify, 48:modifyStatus, 49:introduceInvoiceFlag, 50:是否交旧, 51:是否自提, 57:收货地址是否农村地区
                     7 | 8 | 12 | 17 | 24 | 47 | 48 | 49 | 50 | 51 | 57 => {
