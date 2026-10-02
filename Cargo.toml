@@ -1,0 +1,26 @@
+[package]
+name = "subsidy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[[bin]]
+name = "subsidy"
+path = "src/main.rs"
+
+[dependencies]
+calamine = { version = "=0.36.1", features = ["dates"] }
+rust_xlsxwriter = { version = "=0.99.1", features = ["chrono", "rust_decimal"] }
+chrono = "=0.4.45"
+rust_decimal = "=1.43.0"
+regex = "=1.13.1"
+thiserror = "=2.0.20"
+
+quick-xml = "=0.41.0"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

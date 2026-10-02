@@ -1,0 +1,47 @@
+# Rust / Cargo 构建产物
+/target/
+**/*.rs.bk
+
+# 本地业务数据、输出目录与运行锁
+/data/
+/原始数据/
+/国补明细/
+/国补报表/
+.combine.lock
+
+# Office / Excel 临时文件与锁
+~$*
+.~lock.*#
+
+# 编辑器与 IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统目录与隐藏文件 (macOS / Windows / Linux)
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+.fuse_hidden*
+.directory
+.Trash-*
+
+# 临时文件与日志
+*.log
+*.tmp
+*.bak
+
+# 本地规范文件
+AGENTS.md
