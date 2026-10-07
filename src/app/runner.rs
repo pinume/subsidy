@@ -50,7 +50,7 @@ fn execute(job: &dyn Job, input_dir: &Path) -> bool {
         Ok(path) => {
             println!("[{title}] 处理成功：{}", path.display());
             if job.category() == jobs::Category::Coupons {
-                jobs::coupons::print_stats();
+                jobs::ScopedCache::print_stats();
             }
             true
         }

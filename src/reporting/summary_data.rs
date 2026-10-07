@@ -299,7 +299,7 @@ pub(crate) struct SummaryRecords {
 }
 
 impl SummaryRecords {
-    // Keep source row indices: Excel and Markdown apply their own presentation ordering.
+    // Keep source row indices for workbook presentation ordering.
     pub fn new(
         sources: [&[Vec<Data>]; 5],
         headers: [&HeaderMap; 5],

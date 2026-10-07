@@ -164,9 +164,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<ReceiptRecord>, Proce
 
     compute_remarks(&mut records);
 
-    if super::CACHE.with(|c| c.borrow().is_some()) {
-        super::coupons::cache_receipts_index(&records);
-    }
+    super::ScopedCache::store_receipts(&records);
     Ok(records)
 }
 

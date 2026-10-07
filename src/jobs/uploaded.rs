@@ -7,9 +7,9 @@ use rust_decimal::Decimal;
 
 use crate::io::paths::list_xlsx_files;
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
-use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
+use crate::model::{Column, ColumnType, DecimalScale, ProcessError, Row, Table, Value};
 
-use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL};
+use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL, subsidy_indices};
 use super::{
     Category, Job, MultiValueIndex, PriorityOutcome, amount_value, cell_amount, cell_date_or_text,
     cell_datetime_or_text, cell_text, check_duplicate_fingerprint, data_error,
@@ -513,51 +513,39 @@ const VALUE_COL_REFERENCE: usize = 6; // 检索参考号
 const VALUE_COL_STATUS: usize = 8; // 状态
 const VALUE_COL_INVOICE_NO: usize = 19; // 发票号码
 
-// 回款明细（refund.rs）24 列统一输出中用于匹配的字段位置（0 基）。
-const REFUND_COL_REFERENCE: usize = 2; // 交易参考号
-const REFUND_COL_MERCHANT_ORDER: usize = 3; // 商户订单号
-const REFUND_COL_SUBSIDY: usize = 10; // 补贴金额
-const REFUND_COL_INVOICE_NO: usize = 19; // 发票号
-
-/// 按`商户订单号`、`交易参考号`、`发票号`分别汇总回款明细"正常区域"（排除第7.5/8.5节
-/// 沉底的粉色重复记录）全部`补贴金额`（未去重，格式化为两位小数文本以统一比较）。
-fn build_refund_indices(
-    refund_table: &Table,
-) -> (MultiValueIndex, MultiValueIndex, MultiValueIndex) {
-    let mut by_order: MultiValueIndex = HashMap::new();
+/// 按`检索参考号`和`发票号码`分别汇总已上传家电电脑、已上传数码合并后的全部非空`状态`
+/// （未去重）；两个数据组共用同一对索引，不按财务大类等字段区分数据组。
+pub(super) fn status_indices(
+    input_dir: &Path,
+) -> Result<(MultiValueIndex, MultiValueIndex), ProcessError> {
     let mut by_reference: MultiValueIndex = HashMap::new();
     let mut by_invoice_no: MultiValueIndex = HashMap::new();
 
-    for row in refund_table
-        .rows
-        .iter()
-        .filter(|r| r.fill != Some(Fill::Pink))
-    {
-        let Value::Decimal(subsidy) = &row.values[REFUND_COL_SUBSIDY] else {
-            continue;
+    for job in [&UPLOADED_APPLIANCE, &UPLOADED_DIGITAL] {
+        let mut accumulate = |table: &Table| {
+            for row in &table.rows {
+                let Value::Text(status) = &row.values[VALUE_COL_STATUS] else {
+                    continue;
+                };
+                if let Value::Text(reference) = &row.values[VALUE_COL_REFERENCE] {
+                    by_reference
+                        .entry(reference.clone())
+                        .or_default()
+                        .push(status.clone());
+                }
+                if let Value::Text(invoice_no) = &row.values[VALUE_COL_INVOICE_NO] {
+                    by_invoice_no
+                        .entry(invoice_no.clone())
+                        .or_default()
+                        .push(status.clone());
+                }
+            }
         };
-        let subsidy_text = subsidy.round_dp(2).to_string();
-
-        if let Value::Text(order_no) = &row.values[REFUND_COL_MERCHANT_ORDER] {
-            by_order
-                .entry(order_no.clone())
-                .or_default()
-                .push(subsidy_text.clone());
-        }
-        if let Value::Text(reference) = &row.values[REFUND_COL_REFERENCE] {
-            by_reference
-                .entry(reference.clone())
-                .or_default()
-                .push(subsidy_text.clone());
-        }
-        if let Value::Text(invoice_no) = &row.values[REFUND_COL_INVOICE_NO] {
-            by_invoice_no
-                .entry(invoice_no.clone())
-                .or_default()
-                .push(subsidy_text);
+        if super::ScopedCache::with_table(job.category(), &mut accumulate).is_none() {
+            accumulate(&job.run(input_dir)?);
         }
     }
-    (by_order, by_reference, by_invoice_no)
+    Ok((by_reference, by_invoice_no))
 }
 
 /// 按`订单号`（主键）→`检索参考号`（次键）→`发票号码`（三键）依次在回款明细索引中查找
@@ -667,11 +655,11 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
         ),
     };
     let (by_order, by_reference, by_invoice_no) =
-        match super::ScopedCache::with_table(refund_job.category(), build_refund_indices) {
+        match super::ScopedCache::with_table(refund_job.category(), subsidy_indices) {
             Some(indices) => indices,
             None => {
                 let refund_table = refund_job.run(input_dir)?;
-                build_refund_indices(&refund_table)
+                subsidy_indices(&refund_table)
             }
         };
     let subsidy_cap = subsidy_cap(config.category);

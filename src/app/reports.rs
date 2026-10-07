@@ -37,19 +37,17 @@ pub(super) fn run_all(input: &Path, cleaned: &Path, success: &HashSet<Category>)
         .join(REPORT_DIR);
     let common_inputs = OnceCell::new();
     let mut all_ok = true;
-    for (stem, dependencies, generator, markdown) in [
+    for (stem, dependencies, generator) in [
         (
             "国补上传情况汇总",
             SUMMARY_DEPENDENCIES,
             summary_wb::generate_with_inputs
                 as fn(&Path, &Path, &CommonInputs) -> Result<(), String>,
-            true,
         ),
         (
             "26年国补门店财务统筹表",
             FINANCE_DEPENDENCIES,
             finance_wb::generate_with_inputs,
-            false,
         ),
     ] {
         let missing: Vec<_> = jobs::registry()
@@ -69,19 +67,13 @@ pub(super) fn run_all(input: &Path, cleaned: &Path, success: &HashSet<Category>)
         }
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
             validate_output_dir(input)?;
-            generate_and_publish(
-                stem,
-                cleaned,
-                &output,
-                |input, path| {
-                    let inputs = common_inputs
-                        .get_or_init(|| CommonInputs::load(input))
-                        .as_ref()
-                        .map_err(Clone::clone)?;
-                    generator(input, path, inputs)
-                },
-                markdown,
-            )
+            generate_and_publish(stem, cleaned, &output, |input, path| {
+                let inputs = common_inputs
+                    .get_or_init(|| CommonInputs::load(input))
+                    .as_ref()
+                    .map_err(Clone::clone)?;
+                generator(input, path, inputs)
+            })
         }))
         .unwrap_or_else(|payload| {
             Err(ProcessError::Read(format!(
@@ -105,60 +97,16 @@ fn generate_and_publish(
     input: &Path,
     output: &Path,
     generator: impl FnOnce(&Path, &Path) -> Result<(), String>,
-    markdown: bool,
 ) -> Result<(), ProcessError> {
     std::fs::create_dir_all(output)?;
     let temporary = publisher::temp_path(output, stem);
-    let temporary_md = temporary.with_extension("md");
-    let mut guards = vec![publisher::TempFile::new(temporary.clone())];
-    let mut files = vec![(temporary, format!("{stem}.xlsx"))];
-    if markdown {
-        guards.push(publisher::TempFile::new(temporary_md.clone()));
-        files.push((temporary_md, format!("{stem}.md")));
+    let mut guard = publisher::TempFile::new(temporary.clone());
+    if let Err(error) = generator(input, &temporary).map_err(ProcessError::Read) {
+        return Err(guard.fail(error));
     }
-    let generated = (|| {
-        generator(input, &files[0].0).map_err(ProcessError::Read)?;
-        for (temp, _) in &files {
-            let metadata = std::fs::metadata(temp)?;
-            if !metadata.is_file() || metadata.len() == 0 {
-                return Err(
-                    std::io::Error::other(format!("临时结果为空：{}", temp.display())).into(),
-                );
-            }
-        }
-        Ok(())
-    })();
-    if let Err(mut error) = generated {
-        for guard in &mut guards {
-            error = guard.fail(error);
-        }
-        return Err(error);
-    }
-
-    let mut published = Vec::new();
-    for ((temp, filename), guard) in files.iter().zip(&mut guards) {
-        guard.disarm(); // publisher takes ownership of cleanup and rollback.
-        match publisher::publish(output, filename, temp) {
-            Ok(path) => {
-                println!("已发布：{}", path.display());
-                published.push(filename.as_str());
-            }
-            Err(error) => {
-                let mut error = ProcessError::Read(format!(
-                    "发布 {filename} 失败：{error}；本次已发布：{}",
-                    if published.is_empty() {
-                        "无".to_string()
-                    } else {
-                        published.join("、")
-                    }
-                ));
-                for guard in &mut guards {
-                    error = guard.fail(error);
-                }
-                return Err(error);
-            }
-        }
-    }
+    guard.disarm(); // publisher takes ownership of cleanup and rollback.
+    let path = publisher::publish(output, &format!("{stem}.xlsx"), &temporary)?;
+    println!("已发布：{}", path.display());
     Ok(())
 }
 
@@ -213,76 +161,43 @@ mod tests {
 
     #[test]
     fn report_failures_preserve_old_files_clean_temps_and_allow_next_report() {
-        for stage in [
-            "generation",
-            "missing-markdown",
-            "panic",
-            "publish-markdown",
-        ] {
+        for stage in ["generation", "missing-output", "panic", "publication"] {
             let output = unique_temp_path("report-failure");
             std::fs::create_dir(&output).unwrap();
             let xlsx = output.join("summary.xlsx");
-            let md = output.join("summary.md");
             std::fs::write(&xlsx, b"old xlsx").unwrap();
-            if stage == "publish-markdown" {
-                std::fs::create_dir(&md).unwrap();
-                std::fs::write(md.join("keep"), b"old markdown").unwrap();
-            } else {
-                std::fs::write(&md, b"old markdown").unwrap();
+            if stage == "publication" {
+                publisher::inject(&[("replace", false)]);
             }
             let result = panic::catch_unwind(|| {
-                generate_and_publish(
-                    "summary",
-                    &output,
-                    &output,
-                    |_, path| {
+                generate_and_publish("summary", &output, &output, |_, path| {
+                    if stage != "missing-output" {
                         std::fs::write(path, b"new xlsx").unwrap();
-                        if stage != "missing-markdown" {
-                            std::fs::write(path.with_extension("md"), b"new markdown").unwrap();
-                        }
-                        match stage {
-                            "generation" => Err("injected generation failure".into()),
-                            "panic" => panic!("injected generation panic"),
-                            _ => Ok(()),
-                        }
-                    },
-                    true,
-                )
+                    }
+                    match stage {
+                        "generation" => Err("injected generation failure".into()),
+                        "panic" => panic!("injected generation panic"),
+                        _ => Ok(()),
+                    }
+                })
             });
+            publisher::inject(&[]);
             if stage == "panic" {
                 assert!(result.is_err());
             } else {
-                let error = result.unwrap().unwrap_err().to_string();
-                if stage == "publish-markdown" {
-                    assert!(error.contains("本次已发布：summary.xlsx"), "{error}");
-                }
+                assert!(result.unwrap().is_err());
             }
-            assert_eq!(
-                std::fs::read(&xlsx).unwrap(),
-                if stage == "publish-markdown" {
-                    b"new xlsx"
-                } else {
-                    b"old xlsx"
-                }
-            );
-            assert_eq!(
-                std::fs::read(if md.is_dir() { md.join("keep") } else { md }).unwrap(),
-                b"old markdown"
-            );
-            assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
-            generate_and_publish(
-                "finance",
-                &output,
-                &output,
-                |_, path| std::fs::write(path, b"finance").map_err(|error| error.to_string()),
-                false,
-            )
+            assert_eq!(std::fs::read(&xlsx).unwrap(), b"old xlsx");
+            assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+            generate_and_publish("finance", &output, &output, |_, path| {
+                std::fs::write(path, b"finance").map_err(|error| error.to_string())
+            })
             .unwrap();
             assert_eq!(
                 std::fs::read(output.join("finance.xlsx")).unwrap(),
                 b"finance"
             );
-            assert_eq!(std::fs::read_dir(&output).unwrap().count(), 3);
+            assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
             std::fs::remove_dir_all(output).unwrap();
         }
     }

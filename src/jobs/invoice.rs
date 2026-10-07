@@ -295,9 +295,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
         });
     }
 
-    if super::CACHE.with(|c| c.borrow().is_some()) {
-        super::coupons::cache_invoice_index(&records);
-    }
+    super::ScopedCache::store_invoices(&records);
     Ok(records)
 }
 

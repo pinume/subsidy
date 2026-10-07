@@ -1,7 +1,5 @@
-use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
@@ -22,57 +20,8 @@ pub enum Category {
     Coupons,
 }
 
-#[derive(Default)]
-struct RunCache {
-    tables: HashMap<Category, Table>,
-    authority: Option<Rc<HashSet<String>>>,
-    invoices: Option<Rc<MultiValueIndex>>,
-    receipts: Option<Rc<MultiValueIndex>>,
-    stats: Option<coupons::MatchStats>,
-}
-
-thread_local! {
-    static CACHE: RefCell<Option<RunCache>> = const { RefCell::new(None) };
-}
-
-pub(crate) struct ScopedCache;
-
-impl ScopedCache {
-    pub(crate) fn activate() -> Self {
-        CACHE.with(|c| *c.borrow_mut() = Some(RunCache::default()));
-        ScopedCache
-    }
-
-    pub(crate) fn get(category: Category) -> Option<Table> {
-        CACHE.with(|c| c.borrow().as_ref()?.tables.get(&category).cloned())
-    }
-
-    /// 只读借用缓存中的表并执行闭包，避免整表深拷贝。
-    pub(crate) fn with_table<F, R>(category: Category, f: F) -> Option<R>
-    where
-        F: FnOnce(&Table) -> R,
-    {
-        CACHE.with(|c| {
-            let borrow = c.borrow();
-            let table = borrow.as_ref()?.tables.get(&category)?;
-            Some(f(table))
-        })
-    }
-
-    pub(crate) fn put(category: Category, table: &Table) {
-        CACHE.with(|c| {
-            if let Some(map) = c.borrow_mut().as_mut() {
-                map.tables.insert(category, table.clone());
-            }
-        });
-    }
-}
-
-impl Drop for ScopedCache {
-    fn drop(&mut self) {
-        CACHE.with(|c| *c.borrow_mut() = None);
-    }
-}
+mod cache;
+pub(crate) use cache::{MatchStats, ScopedCache};
 
 pub trait Job {
     fn category(&self) -> Category;

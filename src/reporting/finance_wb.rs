@@ -1,12 +1,10 @@
 use calamine::Data;
-use rust_decimal::Decimal;
 use rust_xlsxwriter::{Workbook, Worksheet};
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::data::{CommonInputs, SheetData};
-use super::excel::{write_date_cell, write_decimal_cell, write_refund_cell};
-use super::reader::{HeaderMap, UploadColumns, cell_to_decimal, cell_to_string};
+use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
+use super::reader::{HeaderMap, UploadColumns, cell_to_string};
 use super::styles::StylePool;
 
 /// Generate Workbook 2: 26年国补门店财务统筹表.xlsx (4 Sheets)
@@ -194,37 +192,8 @@ fn build_final_match_sheet(
     let s_ref_idx = store_h.find(&["检索号"]).ok_or("门店发生表缺少检索号")?;
     let s_rem_idx = store_h.find(&["备注"]).ok_or("门店发生表缺少备注")?;
 
-    let store_col_map: [(&str, u16); 20] = [
-        ("清算时间", 1),
-        ("交易时间", 2),
-        ("终端号", 3),
-        ("交易类型", 4),
-        ("卡号", 5),
-        ("交易金额", 6),
-        ("清算金额", 7),
-        ("手续费", 8),
-        ("流水号", 9),
-        ("检索号", 10),
-        ("卡类型", 11),
-        ("发卡行", 12),
-        ("商户号", 13),
-        ("商户名称", 14),
-        ("分店简称", 15),
-        ("商户订单号", 16),
-        ("银商订单号", 17),
-        ("交易方式", 18),
-        ("分店", 19),
-        ("优惠金额", 20),
-    ];
-
-    let resolved_store_cols: Vec<(usize, u16)> = store_col_map
-        .iter()
-        .map(|(name, target_col)| {
-            store_h
-                .require(name, "银联交易明细门店.xlsx")
-                .map(|src_idx| (src_idx, *target_col))
-        })
-        .collect::<Result<_, _>>()?;
+    let resolved_store_cols =
+        store_occ.select(headers[1..21].iter().copied(), "银联交易明细门店.xlsx")?;
 
     for (r_idx, row) in store_occ.iter().enumerate().skip(1) {
         let cur_row = r_idx as u32; // Row 1 is header, data starts at row 1
@@ -236,30 +205,10 @@ fn build_final_match_sheet(
             .map_err(|e| e.to_string())?;
 
         // Col 1-20: Pre-resolved from store occurrence
-        for &(src_idx, target_col) in &resolved_store_cols {
-            if src_idx < row.len() {
-                let cell = &row[src_idx];
-                match target_col {
-                    1 | 2 => {
-                        write_date_cell(ws, cur_row, target_col, cell, &s.datetime)?;
-                    }
-                    6 | 7 | 8 | 20 => {
-                        let val = cell_to_decimal(cell).unwrap_or(Decimal::ZERO);
-                        ws.write_with_format(cur_row, target_col, val, &s.money)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    3 | 4 => {
-                        let val = cell_to_string(cell);
-                        ws.write_string_with_format(cur_row, target_col, val, &s.text_center)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    _ => {
-                        let val = cell_to_string(cell);
-                        ws.write_string_with_format(cur_row, target_col, val, &s.text_left)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
-            }
+        for (index, column) in resolved_store_cols.iter().enumerate() {
+            column
+                .kind
+                .write(ws, s, cur_row, index as u16 + 1, column.cell(row))?;
         }
 
         let ref_num = cell_to_string(&row[s_ref_idx]);
@@ -353,39 +302,20 @@ fn build_store_occurrence_sheet(
             .map_err(|e| e.to_string())?;
     }
 
-    // Data rows
+    let columns: Vec<_> = store_occ[0]
+        .iter()
+        .take(26)
+        .enumerate()
+        .map(|(col, field)| ReportColumn::new(Some(col), &cell_to_string(field)))
+        .collect();
     for (r_idx, row) in store_occ.iter().enumerate().skip(1) {
         let cur_row = r_idx as u32;
         ws.set_row_height(cur_row, 22.0)
             .map_err(|e| e.to_string())?;
-
-        for col in 0..26 {
-            let cell = if col < row.len() {
-                &row[col]
-            } else {
-                &Data::Empty
-            };
-            match col {
-                // DateTime: 0:清算时间, 1:交易时间
-                0 | 1 => {
-                    write_date_cell(ws, cur_row, col as u16, cell, &s.datetime)?;
-                }
-                // Center strings: 2:终端号, 3:交易类型
-                2 | 3 => {
-                    let val = cell_to_string(cell);
-                    ws.write_string_with_format(cur_row, col as u16, val, &s.text_center)
-                        .map_err(|e| e.to_string())?;
-                }
-                // Money: 5:交易金额, 6:清算金额, 7:手续费, 8:T0手续费, 9:D1手续费, 21:优惠金额, 22:分期手续费
-                5 | 6 | 7 | 8 | 9 | 21 | 22 => {
-                    write_decimal_cell(ws, cur_row, col as u16, cell, &s.money, &s.text_right)?;
-                }
-                _ => {
-                    let val = cell_to_string(cell);
-                    ws.write_string_with_format(cur_row, col as u16, val, &s.text_left)
-                        .map_err(|e| e.to_string())?;
-                }
-            }
+        for (col, column) in columns.iter().enumerate() {
+            column
+                .kind
+                .write(ws, s, cur_row, col as u16, column.cell(row))?;
         }
     }
 
@@ -418,10 +348,10 @@ fn build_store_refund_sheet(
     if app_refund[0].len() < 24 {
         return Err("回款明细家电电脑.xlsx: 表头不足 24 列".to_string());
     }
+    let fields: Vec<_> = app_refund[0].iter().take(24).map(cell_to_string).collect();
     ws.set_row_height(0, 30.0).map_err(|e| e.to_string())?;
-    for (col, cell) in app_refund[0].iter().take(24).enumerate() {
-        let name = cell_to_string(cell);
-        ws.write_string_with_format(0, col as u16, name, &s.col_header)
+    for (col, field) in fields.iter().enumerate() {
+        ws.write_string_with_format(0, col as u16, field, &s.col_header)
             .map_err(|e| e.to_string())?;
     }
 
@@ -434,18 +364,16 @@ fn build_store_refund_sheet(
      -> Result<(), String> {
         let h = &rows.header;
         let mch_idx = h.find(&["核销商编"]).ok_or("回款明细缺少核销商编")?;
+        let columns = rows.select(fields.iter().map(String::as_str), "回款明细")?;
 
         for row in &rows[1..] {
             if cell_to_string(&row[mch_idx]) == store_code {
                 ws.set_row_height(*cur_row, 22.0)
                     .map_err(|e| e.to_string())?;
-                for col in 0..24 {
-                    let cell = if col < row.len() {
-                        &row[col]
-                    } else {
-                        &Data::Empty
-                    };
-                    write_refund_cell(ws, s, *cur_row, col as u16, cell)?;
+                for (col, column) in columns.iter().enumerate() {
+                    column
+                        .kind
+                        .write(ws, s, *cur_row, col as u16, column.cell(row))?;
                 }
                 *cur_row += 1;
             }
@@ -557,7 +485,7 @@ fn build_store_upload_sheet(
 
     // Build output-column index extractor parameterized by category
     let resolve_indices =
-        |h: &HeaderMap, is_dig: bool, label: &str| -> Result<Vec<Option<usize>>, String> {
+        |h: &HeaderMap, is_dig: bool, label: &str| -> Result<Vec<ReportColumn>, String> {
             (0..col_defs.len())
                 .map(|col| {
                     let optional =
@@ -594,7 +522,11 @@ fn build_store_upload_sheet(
                     if index.is_none() && !optional {
                         return Err(format!("{}: 缺少必要列 [{}]", label, col_defs[col].0));
                     }
-                    Ok(index)
+                    let mut column = ReportColumn::new(index, col_defs[col].0);
+                    if col_defs[col].0 == "状态" {
+                        column.kind = CellKind::CenteredText;
+                    }
+                    Ok(column)
                 })
                 .collect()
         };
@@ -606,50 +538,16 @@ fn build_store_upload_sheet(
 
     let write_dataset = |ws: &mut Worksheet,
                          rows: &[Vec<Data>],
-                         col_map: &[Option<usize>],
+                         col_map: &[ReportColumn],
                          cur_row: &mut u32|
      -> Result<(), String> {
         for row in &rows[1..] {
             ws.set_row_height(*cur_row, 22.0)
                 .map_err(|e| e.to_string())?;
-            for (col, source_col) in col_map.iter().enumerate() {
-                let cell = match source_col {
-                    Some(src_col) if *src_col < row.len() => &row[*src_col],
-                    _ => &Data::Empty,
-                };
-
-                match col {
-                    // Date: 4:交易日期, 59:开票日期
-                    4 | 59 => {
-                        write_date_cell(ws, *cur_row, col as u16, cell, &s.date)?;
-                    }
-                    // DateTime: 10:提交时间, 11:更新时间, 42:签收时间
-                    10 | 11 | 42 => {
-                        write_date_cell(ws, *cur_row, col as u16, cell, &s.datetime)?;
-                    }
-                    // Money: 5:交易金额, 20:发票金额, 54:subsideAmt
-                    5 | 20 | 54 => {
-                        write_decimal_cell(
-                            ws,
-                            *cur_row,
-                            col as u16,
-                            cell,
-                            &s.money,
-                            &s.text_right,
-                        )?;
-                    }
-                    // Center text: 7:模版类型, 8:状态, 12:终端号, 17:地区编码, 24:是否属于 AI 产品, 47:ocrModify, 48:modifyStatus, 49:introduceInvoiceFlag, 50:是否交旧, 51:是否自提, 57:收货地址是否农村地区
-                    7 | 8 | 12 | 17 | 24 | 47 | 48 | 49 | 50 | 51 | 57 => {
-                        let val = cell_to_string(cell);
-                        ws.write_string_with_format(*cur_row, col as u16, val, &s.text_center)
-                            .map_err(|e| e.to_string())?;
-                    }
-                    _ => {
-                        let val = cell_to_string(cell);
-                        ws.write_string_with_format(*cur_row, col as u16, val, &s.text_left)
-                            .map_err(|e| e.to_string())?;
-                    }
-                }
+            for (col, column) in col_map.iter().enumerate() {
+                column
+                    .kind
+                    .write(ws, s, *cur_row, col as u16, column.cell(row))?;
             }
             *cur_row += 1;
         }
@@ -666,6 +564,222 @@ fn build_store_upload_sheet(
 mod tests {
     use super::*;
     use calamine::{Reader, open_workbook_auto};
+
+    fn finance_fixture(label: &str) -> std::path::PathBuf {
+        use crate::jobs::{refund::OUTPUT_FIELDS, unionpay::HEADERS, uploaded};
+        let root = crate::test_support::unique_temp_path(label);
+        std::fs::create_dir_all(&root).unwrap();
+        for (name, tail, merchant) in [
+            (
+                "已上传家电电脑.xlsx",
+                &uploaded::APPLIANCE_TAIL,
+                "89813015722APT1",
+            ),
+            (
+                "已上传数码.xlsx",
+                &uploaded::DIGITAL_TAIL,
+                "89813014812B06R",
+            ),
+        ] {
+            let headers: Vec<_> = uploaded::FRONT_HEADERS
+                .iter()
+                .copied()
+                .chain(tail.iter().map(|field| field.synonyms[0]))
+                .chain(["补贴金额"])
+                .collect();
+            write_fixture(
+                &root,
+                name,
+                &headers,
+                &[&[("商户号", merchant), ("状态", "待审核")]],
+            );
+        }
+        for (name, merchant) in [
+            ("回款明细家电电脑.xlsx", "89813015722APT1"),
+            ("回款明细数码.xlsx", "89813014812B06R"),
+        ] {
+            write_fixture(&root, name, &OUTPUT_FIELDS, &[&[("核销商编", merchant)]]);
+        }
+        write_fixture(
+            &root,
+            "销售用券情况统计.xlsx",
+            &["数电发票号码", "财务大类", "品牌", "商品名称"],
+            &[],
+        );
+        write_fixture(
+            &root,
+            "发票明细.xlsx",
+            &["数电发票号码", "开票类型", "开票状态"],
+            &[],
+        );
+        write_fixture(&root, "银联交易明细门店.xlsx", &HEADERS, &[]);
+        root
+    }
+
+    fn write_fixture(root: &Path, name: &str, headers: &[&str], rows: &[&[(&str, &str)]]) {
+        let mut book = Workbook::new();
+        let sheet = book.add_worksheet();
+        for (col, header) in headers.iter().enumerate() {
+            sheet.write_string(0, col as u16, *header).unwrap();
+        }
+        for (row, values) in rows.iter().enumerate() {
+            for (field, value) in *values {
+                let col = headers.iter().position(|header| header == field).unwrap();
+                sheet
+                    .write_string(row as u32 + 1, col as u16, *value)
+                    .unwrap();
+            }
+        }
+        book.save(root.join(name)).unwrap();
+    }
+
+    #[test]
+    fn finance_report_aligns_reordered_refunds_by_header() {
+        use crate::jobs::refund::OUTPUT_FIELDS;
+        let root = finance_fixture("finance-reordered");
+        let mut app_headers = OUTPUT_FIELDS;
+        app_headers.rotate_left(3);
+        let mut dig_headers = OUTPUT_FIELDS;
+        dig_headers.swap(10, 17);
+        for (name, headers, merchant, product) in [
+            (
+                "回款明细家电电脑.xlsx",
+                &app_headers,
+                "89813015722APT1",
+                "冰箱A",
+            ),
+            (
+                "回款明细数码.xlsx",
+                &dig_headers,
+                "89813014812B06R",
+                "手机B",
+            ),
+        ] {
+            write_fixture(
+                &root,
+                name,
+                headers,
+                &[&[
+                    ("核销商编", merchant),
+                    ("补贴金额", "123.45"),
+                    ("商品名称", product),
+                    ("交易完成时间", "2025-10-13 12:00:00"),
+                    ("补贴比例", "0.15"),
+                ]],
+            );
+        }
+        let path = root.join("finance.xlsx");
+        generate_store_finance_workbook(&root, &path).unwrap();
+        let mut book = open_workbook_auto(&path).unwrap();
+        let range = book
+            .worksheet_range("2.门店累计回款表（事业部财务下发，门店筛选自己的）")
+            .unwrap();
+        let rows: Vec<_> = range.rows().collect();
+        for (col, field) in app_headers.iter().enumerate() {
+            assert_eq!(cell_to_string(&rows[0][col]), *field);
+        }
+        let h = HeaderMap::from_header_row(rows[0]);
+        for (row, product) in [(rows[1], "冰箱A"), (rows[2], "手机B")] {
+            assert_eq!(
+                row[h.require("补贴金额", "output").unwrap()],
+                Data::Float(123.45)
+            );
+            assert_eq!(
+                cell_to_string(&row[h.require("商品名称", "output").unwrap()]),
+                product
+            );
+            assert_eq!(
+                row[h.require("补贴比例", "output").unwrap()],
+                Data::Float(0.15)
+            );
+            assert!(matches!(
+                row[h.require("交易完成时间", "output").unwrap()],
+                Data::DateTime(_)
+            ));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finance_report_formats_reordered_store_fields_by_name() {
+        let root = finance_fixture("finance-reordered-store");
+        let mut headers = crate::jobs::unionpay::HEADERS;
+        headers.reverse();
+        write_fixture(
+            &root,
+            "银联交易明细门店.xlsx",
+            &headers,
+            &[&[
+                ("检索号", "00123456789N"),
+                ("交易时间", "2026-09-14 10:18:09"),
+                ("交易金额", "-123.45"),
+                ("商户订单号", "000123"),
+            ]],
+        );
+        let path = root.join("finance.xlsx");
+        generate_store_finance_workbook(&root, &path).unwrap();
+        let mut book = open_workbook_auto(&path).unwrap();
+        for sheet in [0, 1] {
+            let range = book.worksheet_range_at(sheet).unwrap().unwrap();
+            let rows: Vec<_> = range.rows().collect();
+            let header = HeaderMap::from_header_row(rows[0]);
+            assert_eq!(
+                rows[1][header.require("交易金额", "output").unwrap()],
+                Data::Float(-123.45)
+            );
+            assert_eq!(
+                rows[1][header.require("商户订单号", "output").unwrap()],
+                "000123"
+            );
+            assert!(matches!(
+                rows[1][header.require("交易时间", "output").unwrap()],
+                Data::DateTime(_)
+            ));
+            assert_eq!(
+                rows[1][header.require("清算金额", "output").unwrap()],
+                Data::Empty
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finance_report_preserves_empty_zero_and_signed_amounts() {
+        let root = finance_fixture("finance-empty-money");
+        write_fixture(
+            &root,
+            "银联交易明细门店.xlsx",
+            &crate::jobs::unionpay::HEADERS,
+            &[
+                &[("检索号", "empty")],
+                &[("检索号", "zero"), ("清算金额", "0")],
+                &[("检索号", "negative"), ("清算金额", "-12.34")],
+                &[("检索号", "positive"), ("清算金额", "56.78")],
+            ],
+        );
+        let path = root.join("finance.xlsx");
+        generate_store_finance_workbook(&root, &path).unwrap();
+        let mut book = open_workbook_auto(&path).unwrap();
+        let final_rows = book
+            .worksheet_range("最终匹配表（全部的国补发生数据上匹配）")
+            .unwrap();
+        let store_rows = book
+            .worksheet_range("1.门店国补发生表（银联系统直接导出，不需要加工）")
+            .unwrap();
+        for (row, expected) in [
+            (1, Data::Empty),
+            (2, Data::Float(0.0)),
+            (3, Data::Float(-12.34)),
+            (4, Data::Float(56.78)),
+        ] {
+            assert_eq!(final_rows.get_value((row, 7)), Some(&expected));
+            assert_eq!(store_rows.get_value((row, 6)), Some(&expected));
+        }
+        for col in [6, 8, 20] {
+            assert_eq!(final_rows.get_value((1, col)), Some(&Data::Empty));
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn final_products_use_invoice_first_row_and_full_name() {

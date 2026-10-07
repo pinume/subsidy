@@ -70,11 +70,10 @@ fn test_all_acceptance_benchmarks() {
         );
     }
     let out_dir = root.join("国补报表");
-    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 3);
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 2);
     let wb1_path = out_dir.join("国补上传情况汇总.xlsx");
     let wb2_path = out_dir.join("26年国补门店财务统筹表.xlsx");
 
-    let md1_path = out_dir.join("国补上传情况汇总.md");
     // Public standalone APIs must produce the same workbook content as the shared CLI.
     let standalone = root.join("standalone");
     std::fs::create_dir(&standalone).unwrap();
@@ -84,157 +83,8 @@ fn test_all_acceptance_benchmarks() {
     generate_store_finance_workbook(&cleaned, &standalone_finance).unwrap();
     assert_workbook_equal(&wb1_path, &standalone_summary);
     assert_workbook_equal(&wb2_path, &standalone_finance);
-    assert_eq!(
-        std::fs::read(&md1_path).unwrap(),
-        std::fs::read(standalone_summary.with_extension("md")).unwrap()
-    );
-    assert!(md1_path.exists(), "MD report file should exist");
-    let md_content = std::fs::read_to_string(&md1_path).expect("Read MD report failed");
-    assert!(md_content.contains("# 国补上传情况汇总分析报告"));
-    assert!(!md_content.contains("核心指标大盘看板"));
-    assert!(!md_content.contains("审核失败原因分类汇总"));
-    assert!(md_content.contains("## 一、 金额与数量结构图"));
-    let summary_section = md_content
-        .split("## 一、 金额与数量结构图")
-        .nth(1)
-        .unwrap()
-        .split("## 二、 结构与比率分析图")
-        .next()
-        .unwrap();
-    assert!(summary_section.contains("```text\n发生额（"));
-    assert!(summary_section.contains("    · 家电："));
-    assert!(summary_section.contains("    · 数码："));
-    assert!(summary_section.contains("│   · 家电："));
-    assert!(summary_section.contains("├── 已回款（"));
-    assert!(summary_section.contains("└── 未回款（"));
-    assert!(summary_section.contains("    ├── 审核通过未回款（"));
-    assert!(!summary_section.contains("mermaid"));
-    assert!(!summary_section.contains("| 项目 |"));
-    let ratio_section = md_content
-        .split("## 二、 结构与比率分析图")
-        .nth(1)
-        .unwrap()
-        .split("## 三、 品类品牌汇总")
-        .next()
-        .unwrap();
-    assert!(ratio_section.contains("```text\n发生额（"));
-    assert!(ratio_section.contains("├── 已回款（"));
-    assert!(ratio_section.contains("└── 未回款（"));
-    assert!(ratio_section.contains("    ├── 审核通过未回款（"));
-    assert!(ratio_section.contains("派生指标\n回款+审核通过未回款（"));
-    assert!(ratio_section.contains("家电："));
-    assert!(!ratio_section.contains("| 指标 |"));
-    assert!(!md_content.contains("## 二、 结构与比率分析表"));
-    assert!(md_content.contains("## 三、 品类品牌汇总"));
-    assert!(md_content.contains("## 四、 审核失败明细清单"));
-    assert!(md_content.contains("### 4.1 家电电脑审核失败明细清单"));
-    assert!(md_content.contains("### 4.2 数码审核失败明细清单"));
-    assert!(md_content.contains("## 五、 异常回款明细清单"));
-    assert!(md_content.contains("## 六、 异常发票明细清单"));
-    assert!(md_content.contains("## 七、 口径说明"));
-    assert!(md_content.contains("开票属性说明"));
-    let category_overview = md_content
-        .split("### 3.1 各大类经营概况（已排除退货）")
-        .nth(1)
-        .unwrap()
-        .split("### 3.2 品牌分布明细")
-        .next()
-        .unwrap();
-    assert!(category_overview.starts_with("\n\n> **数据口径**"));
-    assert!(category_overview.contains("- **合计**（发生"));
-    assert!(category_overview.contains("├── 已回款："));
-    assert!(category_overview.contains("└── 未回款："));
-    assert!(category_overview.find("- **合计**") < category_overview.find("- **空调**"));
-    assert!(!category_overview.contains("| 财务大类 |"));
-    assert!(category_overview.contains("\n- **"));
-    let small_appliance = category_overview
-        .split("- **小电**")
-        .nth(1)
-        .unwrap()
-        .split("- **数码**")
-        .next()
-        .unwrap();
-    assert!(small_appliance.contains("未上传"));
-    assert!(small_appliance.contains("待审核"));
-    assert!(!small_appliance.contains("已回款"));
-    assert!(!small_appliance.contains("审核通过未回款"));
-    assert!(!small_appliance.contains("0.00 万元"));
-    let counter_section = md_content
-        .split("### 3.2 品牌分布明细")
-        .nth(1)
-        .unwrap()
-        .split("## 四、 审核失败明细清单")
-        .next()
-        .unwrap();
-    assert!(counter_section.contains("- **合计**（发生合计"));
-    assert!(counter_section.contains("- **海尔洗衣机**（发生合计"));
-    assert!(counter_section.contains("├── 已回款："));
-    assert!(counter_section.contains("└── 未回款："));
-    assert!(counter_section.contains("#### 厨卫"));
-    assert!(counter_section.contains("#### 洗衣机"));
-    assert!(!counter_section.contains("金额 -，数量 -"));
-    assert!(!counter_section.contains("| 专柜 |"));
-
-    let appliance_failed_section = md_content
-        .split("### 4.1 家电电脑审核失败明细清单")
-        .nth(1)
-        .unwrap()
-        .split("### 4.2 数码审核失败明细清单")
-        .next()
-        .unwrap();
-    assert!(appliance_failed_section.contains("- **1. 检索参考号 `"));
-    assert!(appliance_failed_section.contains("├── ⚠️ 失败原因："));
-    assert!(appliance_failed_section.contains("├── 发票号码：`"));
-    assert!(appliance_failed_section.contains("└── 交易设备："));
-    assert!(!appliance_failed_section.contains("| 序号 |"));
-
-    let digital_failed_section = md_content
-        .split("### 4.2 数码审核失败明细清单")
-        .nth(1)
-        .unwrap()
-        .split("## 五、 异常回款明细清单")
-        .next()
-        .unwrap();
-    assert!(digital_failed_section.contains("- **1. 检索参考号 `"));
-    assert!(digital_failed_section.contains("├── ⚠️ 失败原因："));
-    assert!(digital_failed_section.contains("├── 发票号码：`"));
-    assert!(digital_failed_section.contains("└── 交易设备："));
-    assert!(digital_failed_section.contains("IMEI1 `"));
-    assert!(!digital_failed_section.contains("| 序号 |"));
-
-    let refund_section = md_content
-        .split("## 五、 异常回款明细清单")
-        .nth(1)
-        .unwrap()
-        .split("## 六、 异常发票明细清单")
-        .next()
-        .unwrap();
-    assert!(refund_section.contains("- **1. 交易参考号 `"));
-    assert!(refund_section.contains("├── 关联档案：商户订单号 `"));
-    assert!(refund_section.contains("├── 拨付流水："));
-    assert!(refund_section.contains("└── 冲销流水："));
-    assert!(refund_section.contains("⚠️ 冲销对"));
-    assert!(refund_section.contains("单笔记录"));
-    assert!(!refund_section.contains("| 序号 |"));
-
-    let invoice_section = md_content
-        .split("黄色异常发票明细清单")
-        .nth(1)
-        .unwrap()
-        .split("## 七、 口径说明")
-        .next()
-        .unwrap();
-    assert!(invoice_section.contains("- **1. 匹配单据号 `"));
-    assert!(invoice_section.contains("├── 发票 1：`"));
-    assert!(invoice_section.contains("└── 发票 2：`"));
-    assert!(invoice_section.contains("开票档案："));
-    assert!(invoice_section.contains("备注信息："));
-    assert!(!invoice_section.contains("| 序号 |"));
-    assert!(!md_content.contains("核销主体"));
-    assert!(md_content.contains("海尔洗衣机"));
-    assert!(md_content.contains("格力"));
-    assert!(!md_content.contains("| 开票类型 |"));
-    assert!(!md_content.contains("| 销售企业名称 |"));
+    assert!(!out_dir.join("国补上传情况汇总.md").exists());
+    assert!(!standalone_summary.with_extension("md").exists());
 
     let mut wb1 = open_workbook_auto(&wb1_path).expect("Open WB1 failed");
     let sheets1 = wb1.sheet_names();
@@ -444,7 +294,7 @@ fn test_all_acceptance_benchmarks() {
     // With a missing raw invoice, valid old cleaned/report files must remain unused.
     let invoice = cleaned.join("发票明细.xlsx");
     let invoice_before = std::fs::read(&invoice).unwrap();
-    let reports_before: Vec<_> = [&wb1_path, &wb2_path, &md1_path]
+    let reports_before: Vec<_> = [&wb1_path, &wb2_path]
         .into_iter()
         .map(|path| (path, std::fs::read(path).unwrap()))
         .collect();

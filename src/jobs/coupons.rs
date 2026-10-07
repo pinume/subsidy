@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::Path;
-use std::rc::Rc;
 use std::sync::LazyLock;
 
 use regex::Regex;
@@ -11,11 +12,13 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
 use crate::utils::{numbers, text};
 
+use super::uploaded;
 use super::{
-    Category, Job, MultiValueIndex, PriorityOutcome, build_match_doc_no, cell_text, data_error,
-    parse_date_field, resolve, resolve_via, text_value,
+    Category, Job, MatchStats, MultiValueIndex, PriorityOutcome, ScopedCache, build_match_doc_no,
+    cell_text, data_error, parse_date_field, resolve, resolve_via, text_value,
 };
-use super::{invoice, receipts, unionpay, uploaded};
+#[cfg(test)]
+use std::rc::Rc;
 
 const FILE_NAME: &str = "销售用券情况统计.xlsx";
 const TITLE: &str = "销售用券情况统计";
@@ -70,24 +73,6 @@ struct CouponRecord {
     finance_category: String,
     subsidy: Decimal,
     summary: String,
-}
-
-/// 命中分类互斥；不同阶段的歧义可重复计数。
-#[derive(Default)]
-pub(super) struct MatchStats {
-    hits: [usize; 4],
-    ambiguous: [usize; 4],
-}
-
-pub(crate) fn print_stats() {
-    super::CACHE.with(|c| {
-        if let Some(stats) = c.borrow().as_ref().and_then(|cache| cache.stats.as_ref()) {
-            println!("匹配统计：收款单备注 {}，上传参考号 {}，上传发票号 {}，未上传 {}；合计 {}。",
-                stats.hits[0], stats.hits[1], stats.hits[2], stats.hits[3], stats.hits.iter().sum::<usize>());
-            println!("歧义记录：参考号提取 {}，发票号码 {}，收款单备注 {}，上传状态 {}（不同阶段可重复计数）。",
-                stats.ambiguous[0], stats.ambiguous[1], stats.ambiguous[2], stats.ambiguous[3]);
-        }
-    });
 }
 
 fn matched(outcome: PriorityOutcome, count: &mut usize) -> Option<String> {
@@ -167,16 +152,16 @@ impl Job for CouponsJob {
 
         // 10.6.1：权威校验集缺失、结构异常或无法完整读取时必须停止，不得绕过校验；
         // 直接复用 unionpay::load_records 的全部校验（文件发现、表头、首尾结构、重复导出）。
-        let authority = build_authority(input_dir)?;
+        let authority = ScopedCache::authority(input_dir)?;
         // 数电发票号码：缺失或结构异常时同样必须停止，直接复用 invoice::load_records
         // 的全部校验（最新文件选择、表头、逐行解析）。
-        let invoice_index = build_invoice_index(input_dir)?;
+        let invoice_index = ScopedCache::invoice_index(input_dir)?;
         // 备注：缺失或结构异常时同样必须停止，直接复用 receipts::load_records 的全部
         // 校验（表头、末行合计结构）及其已算好的第 9.5 节三阶段备注。
-        let receipts_index = build_receipts_index(input_dir)?;
+        let receipts_index = ScopedCache::receipts_index(input_dir)?;
         // 备注兜底：缺失或结构异常时同样必须停止，直接复用已上传家电电脑/已上传数码
         // 两个 Job 各自的全部校验（文件发现、表头、第26列起字段解析、重复UUID）。
-        let (uploaded_by_reference, uploaded_by_invoice_no) = build_uploaded_index(input_dir)?;
+        let (uploaded_by_reference, uploaded_by_invoice_no) = uploaded::status_indices(input_dir)?;
 
         let mut stats = MatchStats::default();
         let mut rows = Vec::new();
@@ -199,155 +184,12 @@ impl Job for CouponsJob {
         top.extend(bottom);
 
         assert_eq!(stats.hits.iter().sum::<usize>(), top.len());
-        super::CACHE.with(|c| {
-            if let Some(cache) = c.borrow_mut().as_mut() {
-                cache.stats = Some(stats);
-            }
-        });
+        ScopedCache::record_stats(stats);
         Ok(Table {
             columns: output_columns(),
             rows: top,
         })
     }
-}
-
-fn build_authority(input_dir: &Path) -> Result<Rc<HashSet<String>>, ProcessError> {
-    if let Some(index) = super::CACHE.with(|c| c.borrow().as_ref()?.authority.clone()) {
-        return Ok(index);
-    }
-    let records = unionpay::load_records(input_dir)?;
-    Ok(super::CACHE
-        .with(|c| c.borrow().as_ref()?.authority.clone())
-        .unwrap_or_else(|| cache_authority(&records)))
-}
-
-pub(super) fn cache_authority(records: &[unionpay::UnionPayRecord]) -> Rc<HashSet<String>> {
-    let index = Rc::new(
-        records
-            .iter()
-            .map(|r| r.retrieval_no.as_str())
-            .filter(|v| is_valid_ref_no(v))
-            .map(str::to_owned)
-            .collect(),
-    );
-    super::CACHE.with(|c| {
-        if let Some(cache) = c.borrow_mut().as_mut() {
-            cache.authority = Some(Rc::clone(&index));
-        }
-    });
-    index
-}
-
-fn is_valid_ref_no(value: &str) -> bool {
-    value.len() == 12
-        && value.as_bytes()[11] == b'N'
-        && value.as_bytes()[..11].iter().all(u8::is_ascii_digit)
-}
-
-/// 按`匹配单据号`汇总发票明细全部非空`数电发票号码`（未去重）；歧义判定见`to_row`
-/// 中复用的`resolve`（与 10.6.2 节"命中权威值需唯一"同一原则，不得任选）。
-fn build_invoice_index(input_dir: &Path) -> Result<Rc<MultiValueIndex>, ProcessError> {
-    if let Some(index) = super::CACHE.with(|c| c.borrow().as_ref()?.invoices.clone()) {
-        return Ok(index);
-    }
-    let records = invoice::load_records(input_dir)?;
-    Ok(super::CACHE
-        .with(|c| c.borrow().as_ref()?.invoices.clone())
-        .unwrap_or_else(|| cache_invoice_index(&records)))
-}
-
-pub(super) fn cache_invoice_index(records: &[invoice::InvoiceRecord]) -> Rc<MultiValueIndex> {
-    let mut grouped: MultiValueIndex = HashMap::new();
-    for record in records {
-        let Value::Text(match_doc_no) = &record.match_doc_no else {
-            continue;
-        };
-        if record.invoice_no.is_empty() {
-            continue;
-        }
-        grouped
-            .entry(match_doc_no.clone())
-            .or_default()
-            .push(record.invoice_no.clone());
-    }
-    let index = Rc::new(grouped);
-    super::CACHE.with(|c| {
-        if let Some(cache) = c.borrow_mut().as_mut() {
-            cache.invoices = Some(Rc::clone(&index));
-        }
-    });
-    index
-}
-
-/// 按`匹配单据号`汇总收款单统计全部非空`备注`（未去重）；歧义判定同样复用`resolve`。
-fn build_receipts_index(input_dir: &Path) -> Result<Rc<MultiValueIndex>, ProcessError> {
-    if let Some(index) = super::CACHE.with(|c| c.borrow().as_ref()?.receipts.clone()) {
-        return Ok(index);
-    }
-    let records = receipts::load_records(input_dir)?;
-    Ok(super::CACHE
-        .with(|c| c.borrow().as_ref()?.receipts.clone())
-        .unwrap_or_else(|| cache_receipts_index(&records)))
-}
-
-pub(super) fn cache_receipts_index(records: &[receipts::ReceiptRecord]) -> Rc<MultiValueIndex> {
-    let mut grouped: MultiValueIndex = HashMap::new();
-    for record in records {
-        if record.match_doc_no.is_empty() || record.remark.is_empty() {
-            continue;
-        }
-        grouped
-            .entry(record.match_doc_no.clone())
-            .or_default()
-            .push(record.remark.clone());
-    }
-    let index = Rc::new(grouped);
-    super::CACHE.with(|c| {
-        if let Some(cache) = c.borrow_mut().as_mut() {
-            cache.receipts = Some(Rc::clone(&index));
-        }
-    });
-    index
-}
-
-// 已上传家电电脑/已上传数码前25列固定结构中的字段位置（0 基，对齐 Table.rows[].values）。
-const UPLOADED_COL_REFERENCE: usize = 6; // 检索参考号
-const UPLOADED_COL_STATUS: usize = 8; // 状态
-const UPLOADED_COL_INVOICE_NO: usize = 19; // 发票号码
-
-/// 按`检索参考号`和`发票号码`分别汇总已上传家电电脑、已上传数码合并后的全部非空`状态`
-/// （未去重）；两个数据组共用同一对索引，不按财务大类等字段区分数据组。
-fn build_uploaded_index(
-    input_dir: &Path,
-) -> Result<(MultiValueIndex, MultiValueIndex), ProcessError> {
-    let mut by_reference: MultiValueIndex = HashMap::new();
-    let mut by_invoice_no: MultiValueIndex = HashMap::new();
-
-    for job in [&uploaded::UPLOADED_APPLIANCE, &uploaded::UPLOADED_DIGITAL] {
-        let mut accumulate = |table: &Table| {
-            for row in &table.rows {
-                let Value::Text(status) = &row.values[UPLOADED_COL_STATUS] else {
-                    continue;
-                };
-                if let Value::Text(reference) = &row.values[UPLOADED_COL_REFERENCE] {
-                    by_reference
-                        .entry(reference.clone())
-                        .or_default()
-                        .push(status.clone());
-                }
-                if let Value::Text(invoice_no) = &row.values[UPLOADED_COL_INVOICE_NO] {
-                    by_invoice_no
-                        .entry(invoice_no.clone())
-                        .or_default()
-                        .push(status.clone());
-                }
-            }
-        };
-        if super::ScopedCache::with_table(job.category(), &mut accumulate).is_none() {
-            accumulate(&job.run(input_dir)?);
-        }
-    }
-    Ok((by_reference, by_invoice_no))
 }
 
 /// 补贴额：取源字段`合计`，按 10.7 节尾差规则统一为两位小数；为空或超出容差时终止。
@@ -704,14 +546,6 @@ mod tests {
 
     fn authority_of(values: &[&str]) -> HashSet<String> {
         values.iter().map(ToString::to_string).collect()
-    }
-
-    #[test]
-    fn validates_reference_number_shape() {
-        assert!(is_valid_ref_no("16867252734N"));
-        assert!(!is_valid_ref_no("16867252734W")); // 结尾不是大写 N
-        assert!(!is_valid_ref_no("1686725273N")); // 只有 10 位数字
-        assert!(!is_valid_ref_no("16867252734n")); // 小写 n 不算
     }
 
     #[test]
@@ -1801,19 +1635,19 @@ mod tests {
                 ],
             );
         }
-        let expected = build_uploaded_index(&dir).unwrap();
+        let expected = uploaded::status_indices(&dir).unwrap();
         assert_eq!(expected.0["ref"].len(), 4);
         assert_eq!(expected.0["ref"], expected.1["inv"]);
         assert!(!expected.0.contains_key("ignored"));
         let _guard = super::super::ScopedCache::activate();
         // First run takes the uncached path and populates both tables.
-        assert_eq!(build_uploaded_index(&dir).unwrap(), expected);
+        assert_eq!(uploaded::status_indices(&dir).unwrap(), expected);
         // Removing raw fixtures proves the second run borrows cached tables.
         for merchant in [MERCHANT_APPLIANCE, MERCHANT_DIGITAL] {
             std::fs::remove_file(dir.join(format!("MER_{merchant}_20260914101809_yjhx.xlsx")))
                 .unwrap();
         }
-        assert_eq!(build_uploaded_index(&dir).unwrap(), expected);
+        assert_eq!(uploaded::status_indices(&dir).unwrap(), expected);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1829,28 +1663,51 @@ mod tests {
             unionpay::UnionPayJob.run(&dir).unwrap();
             invoice::InvoiceJob.run(&dir).unwrap();
             receipts::ReceiptsJob.run(&dir).unwrap();
-            let authority = build_authority(&dir).unwrap();
-            let invoices = build_invoice_index(&dir).unwrap();
-            let receipts = build_receipts_index(&dir).unwrap();
-            assert!(Rc::ptr_eq(&authority, &build_authority(&dir).unwrap()));
-            assert!(Rc::ptr_eq(&invoices, &build_invoice_index(&dir).unwrap()));
-            assert!(Rc::ptr_eq(&receipts, &build_receipts_index(&dir).unwrap()));
+            let authority = ScopedCache::authority(&dir).unwrap();
+            let invoices = ScopedCache::invoice_index(&dir).unwrap();
+            let receipts = ScopedCache::receipts_index(&dir).unwrap();
+            assert!(Rc::ptr_eq(
+                &authority,
+                &ScopedCache::authority(&dir).unwrap()
+            ));
+            assert!(Rc::ptr_eq(
+                &invoices,
+                &ScopedCache::invoice_index(&dir).unwrap()
+            ));
+            assert!(Rc::ptr_eq(
+                &receipts,
+                &ScopedCache::receipts_index(&dir).unwrap()
+            ));
             write_unionpay_fixture(&dir, "99999999999N");
             write_invoice_fixture(&dir, &[]);
             write_receipts_fixture(&dir, &[]);
-            assert!(Rc::ptr_eq(&authority, &build_authority(&dir).unwrap()));
-            assert!(Rc::ptr_eq(&invoices, &build_invoice_index(&dir).unwrap()));
-            assert!(Rc::ptr_eq(&receipts, &build_receipts_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(
+                &authority,
+                &ScopedCache::authority(&dir).unwrap()
+            ));
+            assert!(Rc::ptr_eq(
+                &invoices,
+                &ScopedCache::invoice_index(&dir).unwrap()
+            ));
+            assert!(Rc::ptr_eq(
+                &receipts,
+                &ScopedCache::receipts_index(&dir).unwrap()
+            ));
         }
         let _guard = super::super::ScopedCache::activate();
-        assert!(build_authority(&dir).unwrap().contains("99999999999N"));
-        assert!(build_invoice_index(&dir).unwrap().is_empty());
-        assert!(build_receipts_index(&dir).unwrap().is_empty());
+        assert!(
+            ScopedCache::authority(&dir)
+                .unwrap()
+                .contains("99999999999N")
+        );
+        assert!(ScopedCache::invoice_index(&dir).unwrap().is_empty());
+        assert!(ScopedCache::receipts_index(&dir).unwrap().is_empty());
         // 失败读取不能留下部分成功索引。
         std::fs::write(dir.join("发票_20261001.xlsx"), b"corrupt workbook").unwrap();
-        super::super::CACHE.with(|c| c.borrow_mut().as_mut().unwrap().invoices = None);
-        assert!(build_invoice_index(&dir).is_err());
-        assert!(super::super::CACHE.with(|c| c.borrow().as_ref().unwrap().invoices.is_none()));
+        drop(_guard);
+        let _guard = ScopedCache::activate();
+        assert!(ScopedCache::invoice_index(&dir).is_err());
+        assert!(ScopedCache::invoice_index(&dir).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1903,12 +1760,9 @@ mod tests {
         assert_eq!(table.rows[0].values[10], Value::Text("参考号状态".into()));
         assert_eq!(table.rows[1].values[10], Value::Text("发票号状态".into()));
         assert_eq!(table.rows[2].values[10], Value::Text("未上传".into()));
-        super::super::CACHE.with(|c| {
-            let cache = c.borrow();
-            let stats = cache.as_ref().unwrap().stats.as_ref().unwrap();
-            assert_eq!(stats.hits, [1, 1, 1, 1]);
-            assert_eq!(stats.ambiguous, [0; 4]);
-        });
+        let stats = ScopedCache::stats().unwrap();
+        assert_eq!(stats.hits, [1, 1, 1, 1]);
+        assert_eq!(stats.ambiguous, [0; 4]);
         std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]

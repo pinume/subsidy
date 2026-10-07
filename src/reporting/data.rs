@@ -3,12 +3,91 @@ use calamine::Data;
 use std::ops::Deref;
 use std::path::Path;
 
+#[derive(Clone, Copy)]
+pub(crate) enum CellKind {
+    Text,
+    CenteredText,
+    Date,
+    DateTime,
+    Money,
+    Percent,
+}
+
+impl CellKind {
+    fn for_field(field: &str) -> Self {
+        match field {
+            "交易日期" | "开票日期" => Self::Date,
+            "清算时间" | "交易时间" | "交易完成时间" | "开票时间" | "提交时间" | "更新时间"
+            | "签收时间" => Self::DateTime,
+            "销售金额" | "实收销售金额" | "补贴金额" | "发票金额" | "交易金额" | "清算金额"
+            | "手续费" | "T0手续费" | "D1手续费" | "优惠金额" | "分期手续费" | "subsideAmt" => {
+                Self::Money
+            }
+            "补贴比例" => Self::Percent,
+            "终端号"
+            | "交易类型"
+            | "模版类型"
+            | "地区编码"
+            | "是否属于 AI 产品"
+            | "ocrModify"
+            | "modifyStatus"
+            | "introduceInvoiceFlag"
+            | "是否交旧"
+            | "是否自提"
+            | "收货地址是否农村地区" => Self::CenteredText,
+            // 其他支付 is intentionally rendered as text in refund reports.
+            _ => Self::Text,
+        }
+    }
+}
+
+pub(crate) struct ReportColumn {
+    source: Option<usize>,
+    pub kind: CellKind,
+}
+
+impl ReportColumn {
+    pub fn new(source: Option<usize>, field: &str) -> Self {
+        Self {
+            source,
+            kind: CellKind::for_field(field),
+        }
+    }
+
+    pub fn cell<'a>(&self, row: &'a [Data]) -> &'a Data {
+        self.source
+            .and_then(|col| row.get(col))
+            .unwrap_or(&Data::Empty)
+    }
+}
+
 pub(crate) struct SheetData {
     rows: Vec<Vec<Data>>,
     pub header: HeaderMap,
 }
 
 impl SheetData {
+    pub fn select<'a>(
+        &self,
+        fields: impl IntoIterator<Item = &'a str>,
+        label: &str,
+    ) -> Result<Vec<ReportColumn>, String> {
+        fields
+            .into_iter()
+            .map(|field| {
+                let aliases: &[&str] = match field {
+                    "S/N码" => &["S/N码", "sn码"],
+                    _ => &[field],
+                };
+                let source = self
+                    .header
+                    .find(aliases)
+                    .ok_or_else(|| format!("{label}: 缺少必要列 [{field}]"))?;
+                Ok(ReportColumn::new(Some(source), field))
+            })
+            .collect()
+    }
+
     pub fn new(rows: Vec<Vec<Data>>) -> Self {
         let header = HeaderMap::from_header_row(&rows[0]);
         Self { rows, header }

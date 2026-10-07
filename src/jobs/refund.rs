@@ -9,8 +9,8 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, amount_value, cell_amount, cell_text, data_error, pick_unique_latest,
-    resolve_synonym_column, text_value,
+    Category, Job, MultiValueIndex, amount_value, cell_amount, cell_text, data_error,
+    pick_unique_latest, resolve_synonym_column, text_value,
 };
 
 pub(crate) const OUTPUT_FIELDS: [&str; 24] = [
@@ -68,6 +68,9 @@ const COLUMN_TYPES: [ColumnType; 24] = [
 ];
 
 // 24 列固定顺序中的关键索引（0 基）。
+const REFERENCE: usize = 2;
+const MERCHANT_ORDER: usize = 3;
+const INVOICE_NO: usize = 19;
 const OTHER_PAYMENT: usize = 7;
 const SUBSIDY_AMOUNT: usize = 10;
 const RATIO: usize = 11;
@@ -128,7 +131,7 @@ const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年以旧换新补贴明细.xlsx",
     field_synonyms: APPLIANCE_SYNONYMS,
     required_indices: &APPLIANCE_REQUIRED,
-    grouping_priority: [4, 3, 19], // 交易订单号 → 商户订单号 → 发票号
+    grouping_priority: [4, MERCHANT_ORDER, INVOICE_NO], // 交易订单号 → 商户订单号 → 发票号
     dealer_code: "89813015722APT1",
 };
 
@@ -168,7 +171,7 @@ const DIGITAL_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年数码补贴明细.xlsx",
     field_synonyms: DIGITAL_SYNONYMS,
     required_indices: &DIGITAL_REQUIRED,
-    grouping_priority: [2, 3, 19], // 交易参考号 → 商户订单号 → 发票号
+    grouping_priority: [REFERENCE, MERCHANT_ORDER, INVOICE_NO], // 交易参考号 → 商户订单号 → 发票号
     dealer_code: "89813014812B06R",
 };
 
@@ -491,6 +494,47 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
         columns: output_columns(),
         rows,
     })
+}
+
+/// 按`商户订单号`、`交易参考号`、`发票号`分别汇总回款明细"正常区域"（排除第7.5/8.5节
+/// 沉底的粉色重复记录）全部`补贴金额`（未去重，格式化为两位小数文本以统一比较）。
+pub(super) fn subsidy_indices(
+    refund_table: &Table,
+) -> (MultiValueIndex, MultiValueIndex, MultiValueIndex) {
+    let mut by_order: MultiValueIndex = HashMap::new();
+    let mut by_reference: MultiValueIndex = HashMap::new();
+    let mut by_invoice_no: MultiValueIndex = HashMap::new();
+
+    for row in refund_table
+        .rows
+        .iter()
+        .filter(|r| r.fill != Some(Fill::Pink))
+    {
+        let Value::Decimal(subsidy) = &row.values[SUBSIDY_AMOUNT] else {
+            continue;
+        };
+        let subsidy_text = subsidy.round_dp(2).to_string();
+
+        if let Value::Text(order_no) = &row.values[MERCHANT_ORDER] {
+            by_order
+                .entry(order_no.clone())
+                .or_default()
+                .push(subsidy_text.clone());
+        }
+        if let Value::Text(reference) = &row.values[REFERENCE] {
+            by_reference
+                .entry(reference.clone())
+                .or_default()
+                .push(subsidy_text.clone());
+        }
+        if let Value::Text(invoice_no) = &row.values[INVOICE_NO] {
+            by_invoice_no
+                .entry(invoice_no.clone())
+                .or_default()
+                .push(subsidy_text);
+        }
+    }
+    (by_order, by_reference, by_invoice_no)
 }
 
 #[cfg(test)]

@@ -6,14 +6,12 @@ use rust_xlsxwriter::{
 use std::collections::HashMap;
 use std::path::Path;
 
-use super::excel::{write_date_cell, write_refund_cell};
 use super::reader::{
-    HeaderMap, cell_to_decimal, cell_to_string, get_colored_row_indices,
-    get_colored_row_indices_multi,
+    cell_to_decimal, cell_to_string, get_colored_row_indices, get_colored_row_indices_multi,
 };
 use super::styles::StylePool;
 
-use super::data::{CommonInputs, SheetData};
+use super::data::{CommonInputs, ReportColumn, SheetData};
 #[cfg(test)]
 use super::reader::{read_sheet_rows, read_upload_rows};
 use super::summary_data::{
@@ -118,22 +116,6 @@ pub(crate) fn generate_with_inputs(
     workbook
         .save(output_path)
         .map_err(|e| format!("保存工作簿一失败: {}", e))?;
-
-    // Simultaneously generate Markdown report
-    let md_path = output_path.with_extension("md");
-    super::summary_md::write_summary_markdown(
-        &md_path,
-        &metrics,
-        &sales_matrix,
-        app_upload_rows,
-        dig_upload_rows,
-        invoice_rows,
-        &invoice_name_map,
-        app_refund_rows,
-        dig_refund_rows,
-        &records,
-        headers,
-    )?;
 
     Ok(())
 }
@@ -568,39 +550,50 @@ fn build_failed_records_sheet(
     }
     cur_row += 1;
 
+    let failed_fields = [
+        "交易日期",
+        "检索参考号",
+        "描述",
+        "发票号码",
+        "发票金额",
+        "购买方名称",
+        "S/N码",
+    ];
+    let app_columns = if app_failed.is_empty() {
+        Vec::new()
+    } else {
+        app_up.select(failed_fields, "已上传家电电脑.xlsx")?
+    };
+    let dig_columns = if dig_failed.is_empty() {
+        Vec::new()
+    } else {
+        dig_up.select(failed_fields, "已上传数码.xlsx")?
+    };
     let write_fail_row = |ws: &mut Worksheet,
                           row: &[Data],
-                          h: &HeaderMap,
+                          columns: &[ReportColumn],
                           extra1: &str,
                           extra2: Option<&str>,
                           cur_row: u32|
      -> Result<(), String> {
-        let date_idx = h.find(&["交易日期"]).ok_or("已上传明细缺少交易日期")?;
-        let ref_idx = h.find(&["检索参考号"]).ok_or("已上传明细缺少检索参考号")?;
-        let desc_idx = h.find(&["描述"]).ok_or("已上传明细缺少描述")?;
-        let inv_idx = h.find(&["发票号码"]).ok_or("已上传明细缺少发票号码")?;
-        let inv_amt_idx = h.find(&["发票金额"]).ok_or("已上传明细缺少发票金额")?;
-        let buyer_idx = h.find(&["购买方名称"]).ok_or("已上传明细缺少购买方名称")?;
-        let sn_idx = h.find(&["S/N码", "sn码"]).ok_or("已上传明细缺少 S/N码")?;
-
         ws.set_row_height(cur_row, 22.0)
             .map_err(|e| e.to_string())?;
-        write_date_cell(ws, cur_row, 0, &row[date_idx], &s.date)?;
-        ws.write_string_with_format(cur_row, 1, cell_to_string(&row[ref_idx]), &s.text_left)
-            .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 2, "审核失败", &s.text_left)
-            .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 3, cell_to_string(&row[desc_idx]), &s.text_left)
-            .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 4, cell_to_string(&row[inv_idx]), &s.text_left)
-            .map_err(|e| e.to_string())?;
-        let amt = cell_to_decimal(&row[inv_amt_idx]).unwrap_or(Decimal::ZERO);
-        ws.write_with_format(cur_row, 5, amt, &s.money)
-            .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 6, cell_to_string(&row[buyer_idx]), &s.text_left)
-            .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 7, cell_to_string(&row[sn_idx]), &s.text_left)
-            .map_err(|e| e.to_string())?;
+        for (column, target) in columns.iter().zip([0, 1, 3, 4, 5, 6, 7]) {
+            if target == 3 {
+                ws.write_string_with_format(cur_row, 2, "审核失败", &s.text_left)
+                    .map_err(|e| e.to_string())?;
+            }
+            if target == 5 {
+                // Failed-upload invoice amounts retain the existing zero fallback.
+                let amount = cell_to_decimal(column.cell(row)).unwrap_or(Decimal::ZERO);
+                ws.write_with_format(cur_row, target, amount, &s.money)
+                    .map_err(|e| e.to_string())?;
+            } else {
+                column
+                    .kind
+                    .write(ws, s, cur_row, target, column.cell(row))?;
+            }
+        }
         ws.write_string_with_format(cur_row, 8, extra1, &s.text_left)
             .map_err(|e| e.to_string())?;
         if let Some(e2) = extra2 {
@@ -616,7 +609,7 @@ fn build_failed_records_sheet(
         let row = &app_up[index];
         let inv_no = cell_to_string(&row[inv_idx]);
         let prod_name = invoice_name_map.get(&inv_no).cloned().unwrap_or_default();
-        write_fail_row(ws, row, app_h, &prod_name, None, cur_row)?;
+        write_fail_row(ws, row, &app_columns, &prod_name, None, cur_row)?;
         cur_row += 1;
     }
 
@@ -670,7 +663,7 @@ fn build_failed_records_sheet(
         let row = &dig_up[index];
         let imei1 = cell_to_string(&row[d_imei1_idx]);
         let imei2 = cell_to_string(&row[d_imei2_idx]);
-        write_fail_row(ws, row, dig_h, &imei1, Some(&imei2), cur_row)?;
+        write_fail_row(ws, row, &dig_columns, &imei1, Some(&imei2), cur_row)?;
         cur_row += 1;
     }
 
@@ -737,12 +730,15 @@ fn build_refund_anomaly_sheet(
         // Write header row (24 columns from source)
         ws.set_row_height(*start_row, 34.0)
             .map_err(|e| e.to_string())?;
-        for col in 0..24 {
-            let col_name = if col < rows[0].len() {
-                cell_to_string(&rows[0][col])
-            } else {
-                String::new()
-            };
+        let fields: Vec<_> = (0..24)
+            .map(|col| rows[0].get(col).map(cell_to_string).unwrap_or_default())
+            .collect();
+        let columns: Vec<_> = fields
+            .iter()
+            .enumerate()
+            .map(|(col, field)| ReportColumn::new(Some(col), field))
+            .collect();
+        for (col, col_name) in fields.iter().enumerate() {
             ws.write_string_with_format(*start_row, col as u16, col_name, &s.col_header)
                 .map_err(|e| e.to_string())?;
         }
@@ -766,13 +762,10 @@ fn build_refund_anomaly_sheet(
         for row in matched_rows {
             ws.set_row_height(*start_row, 22.0)
                 .map_err(|e| e.to_string())?;
-            for col in 0..24 {
-                let val = if col < row.len() {
-                    &row[col]
-                } else {
-                    &Data::Empty
-                };
-                write_refund_cell(ws, s, *start_row, col as u16, val)?;
+            for (col, column) in columns.iter().enumerate() {
+                column
+                    .kind
+                    .write(ws, s, *start_row, col as u16, column.cell(row))?;
             }
             *start_row += 1;
         }
@@ -869,6 +862,12 @@ fn build_invoice_anomaly_sheet(
             .map_err(|e| e.to_string())?;
     }
 
+    let columns: Vec<_> = invoices[0]
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(col, field)| ReportColumn::new(Some(col), &cell_to_string(field)))
+        .collect();
     let h = &invoices.header;
     let doc_no_idx = h.find(&["匹配单据号"]).ok_or("发票明细缺少匹配单据号")?;
 
@@ -883,14 +882,10 @@ fn build_invoice_anomaly_sheet(
     for (cur_row, row) in (5_u32..).zip(collected) {
         ws.set_row_height(cur_row, 22.0)
             .map_err(|e| e.to_string())?;
-        for (col, cell) in row.iter().take(8).enumerate() {
-            if col == 0 {
-                write_date_cell(ws, cur_row, col as u16, cell, &s.datetime)?;
-            } else {
-                let val = cell_to_string(cell);
-                ws.write_string_with_format(cur_row, col as u16, val, &s.text_left)
-                    .map_err(|e| e.to_string())?;
-            }
+        for (col, column) in columns.iter().enumerate() {
+            column
+                .kind
+                .write(ws, s, cur_row, col as u16, column.cell(row))?;
         }
     }
 
@@ -900,6 +895,74 @@ fn build_invoice_anomaly_sheet(
 #[cfg(test)]
 mod status_tests {
     use super::*;
+
+    #[test]
+    fn standalone_summary_generates_only_excel() {
+        use crate::jobs::{refund::OUTPUT_FIELDS, uploaded};
+        use calamine::{Reader, open_workbook_auto};
+        let root = crate::test_support::unique_temp_path("summary-excel-only");
+        let input = root.join("input");
+        let output = root.join("output");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir(&output).unwrap();
+        let mut fixtures = vec![
+            (
+                "销售用券情况统计.xlsx",
+                vec!["财务大类", "品牌", "补贴额", "数量", "备注"],
+            ),
+            (
+                "发票明细.xlsx",
+                vec![
+                    "开票时间",
+                    "开票类型",
+                    "数电发票号码",
+                    "购方名称",
+                    "主要商品名称",
+                    "备注信息",
+                    "开票状态",
+                    "匹配单据号",
+                ],
+            ),
+            ("回款明细家电电脑.xlsx", OUTPUT_FIELDS.to_vec()),
+            ("回款明细数码.xlsx", OUTPUT_FIELDS.to_vec()),
+        ];
+        for (name, tail) in [
+            ("已上传家电电脑.xlsx", &uploaded::APPLIANCE_TAIL),
+            ("已上传数码.xlsx", &uploaded::DIGITAL_TAIL),
+        ] {
+            fixtures.push((
+                name,
+                uploaded::FRONT_HEADERS
+                    .iter()
+                    .copied()
+                    .chain(tail.iter().map(|field| field.synonyms[0]))
+                    .chain(["补贴金额"])
+                    .collect(),
+            ));
+        }
+        for (name, headers) in fixtures {
+            let mut book = Workbook::new();
+            let sheet = book.add_worksheet();
+            for (col, header) in headers.iter().enumerate() {
+                sheet.write_string(0, col as u16, *header).unwrap();
+            }
+            if name.starts_with("已上传") {
+                let merchant = headers.iter().position(|field| *field == "商户号").unwrap();
+                let status = headers.iter().position(|field| *field == "状态").unwrap();
+                sheet
+                    .write_string(1, merchant as u16, "89813015722APT1")
+                    .unwrap();
+                sheet.write_string(1, status as u16, "待审核").unwrap();
+            }
+            book.save(input.join(name)).unwrap();
+        }
+        let path = output.join("summary.xlsx");
+        generate_summary_workbook(&input, &path).unwrap();
+        assert_eq!(open_workbook_auto(&path).unwrap().sheet_names().len(), 5);
+        assert!(!path.with_extension("md").exists());
+        assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn terminated_uploads_are_failed_in_metrics_and_records() {

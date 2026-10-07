@@ -270,9 +270,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
         }
     }
 
-    if super::CACHE.with(|c| c.borrow().is_some()) {
-        super::coupons::cache_authority(&records);
-    }
+    super::ScopedCache::store_authority(&records);
     Ok(records)
 }
 

@@ -1,7 +1,8 @@
-use std::fmt;
+use std::fmt::{self, Write};
 use std::path::Path;
 
-use calamine::{Data, Range, Reader, Xlsx, open_workbook};
+use calamine::{Data, ExcelDateTime, ExcelDateTimeType, Range, Reader, Xlsx, open_workbook};
+use rust_xlsxwriter::IntoExcelDateTime;
 
 use crate::model::ProcessError;
 
@@ -13,7 +14,7 @@ pub enum RawCell {
     Float(f64),
     Int(i64),
     Bool(bool),
-    /// Excel 日期/时间序列值（未做 1900/1904 纪元换算），由`utils::dates`解析。
+    /// Excel 日期/时间序列值，统一为 1900 日期系统，由`utils::dates`解析。
     DateTime(f64),
     Error(String),
 }
@@ -42,7 +43,16 @@ impl From<&Data> for RawCell {
             Data::Float(value) => RawCell::Float(*value),
             Data::Int(value) => RawCell::Int(*value),
             Data::Bool(value) => RawCell::Bool(*value),
-            Data::DateTime(value) => RawCell::DateTime(value.as_f64()),
+            Data::DateTime(value) => {
+                let serial = value.as_f64();
+                let standard = ExcelDateTime::new(serial, ExcelDateTimeType::DateTime, false);
+                // 1900 序列值原样保留；其他纪元复用依赖的日期转换，避免早期日期闰年修正。
+                let normalized = match (value.as_datetime(), standard.as_datetime()) {
+                    (Some(actual), Some(base)) if actual != base => actual.to_excel_serial_date(),
+                    _ => serial,
+                };
+                RawCell::DateTime(normalized)
+            }
             Data::Error(error) => RawCell::Error(error.to_string()),
         }
     }
@@ -99,10 +109,19 @@ impl SheetGrid {
 
     /// 计算指定行范围内的内容指纹（表头+明细），用于检测不同文件是否为完全相同的重复导出。
     pub fn fingerprint(&self, start_row: u32, end_row: u32) -> String {
-        (start_row..=end_row)
-            .map(|row| self.row_texts(row).join("\u{1}"))
-            .collect::<Vec<_>>()
-            .join("\u{2}")
+        let Some((_, start_col)) = self.range.start() else {
+            return String::new();
+        };
+        let width = self.range.width() as u32;
+        let mut fingerprint = format!("{start_col}:{width}:");
+        for row in start_row..=end_row {
+            let cells: Vec<_> = (start_col..start_col + width)
+                .map(|col| self.range.get_value((row - 1, col)).unwrap_or(&Data::Empty))
+                .collect();
+            // Debug 表示保留类型、日期纪元及错误值，并转义文本中的分隔字符。
+            write!(fingerprint, "{cells:?}").expect("writing to String cannot fail");
+        }
+        fingerprint
     }
 }
 
@@ -120,4 +139,66 @@ pub fn open_sheets(path: &Path) -> Result<Vec<SheetGrid>, ProcessError> {
             Ok(SheetGrid { name, range })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fingerprint(cells: [Data; 2]) -> String {
+        let mut range = Range::new((0, 0), (0, 1));
+        for (col, cell) in cells.into_iter().enumerate() {
+            range.set_value((0, col as u32), cell);
+        }
+        SheetGrid {
+            name: "Sheet1".into(),
+            range,
+        }
+        .fingerprint(1, 1)
+    }
+
+    #[test]
+    fn fingerprints_preserve_types_errors_and_text_boundaries() {
+        let text = |s: &str| Data::String(s.into());
+        assert_ne!(
+            fingerprint([Data::Int(1), Data::Empty]),
+            fingerprint([text("1"), Data::Empty])
+        );
+        assert_ne!(
+            fingerprint([Data::Error(calamine::CellErrorType::NA), Data::Empty]),
+            fingerprint([Data::Empty, Data::Empty])
+        );
+        assert_ne!(
+            fingerprint([text("a\u{1}b"), text("c")]),
+            fingerprint([text("a"), text("b\u{1}c")])
+        );
+        assert_eq!(
+            fingerprint([text("same"), Data::Float(1.5)]),
+            fingerprint([text("same"), Data::Float(1.5)])
+        );
+    }
+
+    #[test]
+    fn standard_epoch_serials_are_unchanged() {
+        for serial in [0.5, 59.0, 60.0, 61.0, 45943.123456789] {
+            let cell = Data::DateTime(ExcelDateTime::new(
+                serial,
+                ExcelDateTimeType::DateTime,
+                false,
+            ));
+            assert_eq!(RawCell::from(&cell), RawCell::DateTime(serial));
+        }
+    }
+
+    #[test]
+    fn early_1904_dates_use_the_correct_epoch() {
+        for serial in [0.0, 0.5, 59.0, 60.0, 61.0] {
+            let cell = Data::DateTime(ExcelDateTime::new(
+                serial,
+                ExcelDateTimeType::DateTime,
+                true,
+            ));
+            assert_eq!(RawCell::from(&cell), RawCell::DateTime(serial + 1462.0));
+        }
+    }
 }
