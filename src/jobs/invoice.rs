@@ -134,7 +134,7 @@ fn date_label_regex() -> &'static Regex {
 
 fn doc_no_label_regex() -> &'static Regex {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:单据号|单据收款号)[：:、\s]*((?:收款)?[A-Za-z]*[0-9]+)").unwrap()
+        Regex::new(r"(?:单据号|单据收款号)[：:、\s]*((?:收款)?[A-Za-z]*[0-9][A-Za-z0-9]*)").unwrap()
     });
     &RE
 }
@@ -542,6 +542,91 @@ mod tests {
             "操作人甲",
             "已打印",
         ]
+    }
+
+    #[test]
+    fn interleaved_document_number_survives_invoice_cleaning() {
+        let dir = unique_temp_path("invoice-interleaved-document");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_invoice_workbook(
+            &dir.join("发票_20260914.xlsx"),
+            "发票_20260914",
+            &[sample_source_row(
+                "2026-01-25 10:00:00",
+                "蓝票",
+                "开票完成",
+                "销售日期:2026-01-25 单据号:收款ZG2J000424",
+                "VIVO-国产手机",
+            )],
+        );
+        let table = InvoiceJob.run(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(
+            table.rows[0].values[7],
+            Value::Text("260125ZG2J000424".into())
+        );
+    }
+
+    #[test]
+    fn interleaved_documents_keep_date_length_and_uniqueness_rules() {
+        let dir = unique_temp_path("invoice-interleaved-guards");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            (
+                "购机日期:2026-01-25 单据收款号:ZG2J000424",
+                "valid",
+                Some("260125ZG2J000424"),
+            ),
+            (
+                "销售日期:2026-01-25 单据号:收款ZG2J000424 单据号:收款ZG2J000425",
+                "ambiguous-document",
+                None,
+            ),
+            (
+                "销售日期:2026-01-25 购机日期:2026-01-26 单据号:收款ZG2J000424",
+                "ambiguous-date",
+                None,
+            ),
+            ("单据号:收款ZG2J000424", "missing-date", None),
+            (
+                "销售日期:2026-01-25 单据号:收款ZG2J00042",
+                "short-document",
+                None,
+            ),
+            (
+                "销售日期:2026-01-25 单据号:收款ZG2J000424AB",
+                "long-document",
+                None,
+            ),
+            ("销售日期:2026-01-25 单据号:ABCDEFGHIJ", "no-digits", None),
+            (
+                "销售日期:2026-01-25 单据号:收款ZG2J000424 单据号:收款ZG2J000424",
+                "same-document",
+                Some("260125ZG2J000424"),
+            ),
+        ];
+        let source: Vec<_> = cases
+            .iter()
+            .map(|(remark, name, _)| {
+                sample_source_row("2026-01-25 10:00:00", "蓝票", "开票完成", remark, name)
+            })
+            .collect();
+        write_invoice_workbook(&dir.join("发票_20260914.xlsx"), "发票_20260914", &source);
+        let table = InvoiceJob.run(&dir).unwrap();
+        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(table.rows.len(), cases.len());
+        for (_, name, expected) in cases {
+            let row = table
+                .rows
+                .iter()
+                .find(|row| row.values[4] == Value::Text(name.into()))
+                .unwrap();
+            assert_eq!(
+                row.values[7],
+                expected.map_or(Value::Empty, |value| Value::Text(value.into())),
+                "{name}"
+            );
+        }
     }
 
     #[test]
