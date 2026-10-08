@@ -134,7 +134,7 @@ fn date_label_regex() -> &'static Regex {
 
 fn doc_no_label_regex() -> &'static Regex {
     static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:单据号|单据收款号)[：:、\s]*((?:收款)?[A-Za-z]*[0-9][A-Za-z0-9]*)").unwrap()
+        Regex::new(r"(?:单据号收款号|单据号收款|单据收款号|单据号)[：:、\s]*((?:收款)?[A-Za-z]*[0-9][A-Za-z0-9]*)").unwrap()
     });
     &RE
 }
@@ -147,20 +147,16 @@ fn parse_labeled_date(year: &str, month: &str, day: &str) -> Option<NaiveDate> {
     NaiveDate::from_ymd_opt(year, month.parse().ok()?, day.parse().ok()?)
 }
 
-/// 标准化并校验单据号：10 位直接使用；11 位从起始补零段删除一个 0；
+/// 标准化并校验单据号：10 位直接使用；11 位从首个补零段删除一个 0；
 /// `ZFP300008`定向修正为`ZFP3000008`；其余情况判定无效。
 fn normalize_document_no(raw: &str) -> Option<String> {
     match raw.len() {
         10 => Some(raw.to_string()),
         11 => {
-            let digit_start = raw.find(|c: char| c.is_ascii_digit())?;
-            if raw.as_bytes().get(digit_start) == Some(&b'0') {
-                let mut corrected = raw.to_string();
-                corrected.remove(digit_start);
-                Some(corrected)
-            } else {
-                None
-            }
+            let zero = raw.find('0')?;
+            let mut corrected = raw.to_string();
+            corrected.remove(zero);
+            Some(corrected)
         }
         9 if raw == "ZFP300008" => Some("ZFP3000008".to_string()),
         _ => None,
@@ -542,6 +538,93 @@ mod tests {
             "操作人甲",
             "已打印",
         ]
+    }
+
+    #[test]
+    fn alternate_document_labels_survive_invoice_cleaning() {
+        let dir = unique_temp_path("invoice-alternate-labels");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            (
+                "购机日期：2026.2.27 单据号收款：ZHFH000125",
+                "260227ZHFH000125",
+            ),
+            (
+                "销售日期、2026-01-18单据号收款号、ZFP3000105",
+                "260118ZFP3000105",
+            ),
+        ];
+        for (remark, expected) in cases {
+            write_invoice_workbook(
+                &dir.join("发票_20260914.xlsx"),
+                "发票_20260914",
+                &[sample_source_row(
+                    "2026-01-25 10:00:00",
+                    "蓝票",
+                    "开票完成",
+                    remark,
+                    "商品",
+                )],
+            );
+            let table = InvoiceJob.run(&dir).unwrap();
+            assert_eq!(
+                table.rows[0].values[7],
+                Value::Text(expected.into()),
+                "{remark}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn interleaved_padding_is_corrected_without_relaxing_invoice_guards() {
+        let dir = unique_temp_path("invoice-interleaved-padding");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            (
+                "销售日期:2026-01-03 单据号:收款ZHA40000013",
+                Some("260103ZHA4000013"),
+            ),
+            (
+                "销售日期:2026-05-31 单据号:收款ZH700000103",
+                Some("260531ZH70000103"),
+            ),
+            (
+                "销售日期:2026-05-31 单据号:收款ZH700000102",
+                Some("260531ZH70000102"),
+            ),
+            (
+                "销售日期:2026-05-31 单据号:收款ZH700000101",
+                Some("260531ZH70000101"),
+            ),
+            ("销售日期:2026-05-31 单据号:收款ZH712345678", None),
+            ("销售日期:2026-05-31 单据号:收款ZH7000023", None),
+            ("单据号收款：ZH700000103", None),
+            (
+                "销售日期:2026-05-31 单据号收款：ZH700000103 单据号:ZH700000102",
+                None,
+            ),
+        ];
+        for (remark, expected) in cases {
+            write_invoice_workbook(
+                &dir.join("发票_20260914.xlsx"),
+                "发票_20260914",
+                &[sample_source_row(
+                    "2026-01-25 10:00:00",
+                    "蓝票",
+                    "开票完成",
+                    remark,
+                    "商品",
+                )],
+            );
+            let table = InvoiceJob.run(&dir).unwrap();
+            assert_eq!(
+                table.rows[0].values[7],
+                expected.map_or(Value::Empty, |value| Value::Text(value.into())),
+                "{remark}"
+            );
+        }
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
