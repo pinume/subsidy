@@ -9,7 +9,7 @@ use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Ta
 
 use super::{
     Category, Job, amount_value, cell_amount, cell_date_or_text, cell_datetime_or_text, cell_text,
-    check_duplicate_fingerprint, data_error, text_value,
+    data_error, text_value,
 };
 
 pub(crate) const HEADERS: [&str; 26] = [
@@ -69,8 +69,6 @@ const COLUMN_TYPES: [ColumnType; 26] = [
     ColumnType::Text,
     ColumnType::Text,
 ];
-
-const MERCHANTS: [&str; 2] = ["89813014812B06R", "89813015722APT1"];
 
 pub(crate) const D1_NOTICE: &str =
     "请注意：D1手续费字段为预估数据仅供参考，实际以17：40分之后的D1划付数据为准。";
@@ -177,24 +175,10 @@ fn read_record(
     })
 }
 
-/// 文件发现 → 工作表与表头校验 → 排除首行汇总、表头、末行提示 → 重复导出检查
+/// 文件发现 → 工作表与表头校验 → 排除首行汇总、表头、末行提示
 /// → 返回有效原始交易。`coupons.rs`复用本函数建立参考号校验集。
 pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, ProcessError> {
     let all_xlsx = list_xlsx_files(input_dir)?;
-    for path in &all_xlsx {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if let Some(stem) = name.strip_suffix(".xlsx")
-            && stem.contains("_MX_")
-            && !MERCHANTS.iter().any(|m| stem.starts_with(m))
-        {
-            return Err(ProcessError::Structure {
-                file: name.to_string(),
-                sheet: String::new(),
-                detail: format!("发现非允许商户号的门店交易文件，仅允许处理 {MERCHANTS:?} 的数据"),
-            });
-        }
-    }
-
     let mut files: Vec<_> = all_xlsx
         .into_iter()
         .filter(|path| {
@@ -211,14 +195,9 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
     }
 
     let mut records = Vec::new();
-    let mut fingerprints: HashMap<String, String> = HashMap::new();
 
     for path in &files {
         let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let expected_merchant = MERCHANTS
-            .iter()
-            .find(|m| file_name.starts_with(**m))
-            .expect("files are pre-filtered by matches_filename");
         let sheets = open_sheets(path)?;
 
         for sheet in &sheets {
@@ -250,21 +229,8 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
                 });
             }
 
-            let fingerprint = sheet.fingerprint(1, last_row.saturating_sub(1));
-            check_duplicate_fingerprint(&mut fingerprints, fingerprint, &file_name)?;
-
             for row in 3..last_row {
                 let record = read_record(sheet, row, &file_name, &sheet_name)?;
-                if record.merchant_no != *expected_merchant {
-                    return Err(data_error(
-                        &file_name,
-                        &sheet_name,
-                        row,
-                        "商户号",
-                        record.merchant_no,
-                        format!("商户号与文件名中的期望商户号“{expected_merchant}”不一致"),
-                    ));
-                }
                 records.push(record);
             }
         }
@@ -609,7 +575,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_export_across_files() {
+    fn retains_duplicate_export_across_files() {
         let dir = unique_temp_path("unionpay-duplicate");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -625,14 +591,14 @@ mod tests {
             &rows,
         );
 
-        let error = load_records(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Duplicate { .. }));
+        let table = UnionPayJob.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 2);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn rejects_unallowed_merchant_mx_filename_in_input_dir() {
+    fn ignores_unallowed_merchant_mx_filename_in_input_dir() {
         let dir = unique_temp_path("unionpay-unallowed-merchant-file");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -644,13 +610,13 @@ mod tests {
         );
 
         let error = load_records(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Structure { .. }));
+        assert!(matches!(error, ProcessError::NoInput { .. }));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn rejects_row_merchant_mismatch_with_filename() {
+    fn retains_row_merchant_mismatch_with_filename() {
         let dir = unique_temp_path("unionpay-merchant-mismatch-row");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -662,8 +628,12 @@ mod tests {
             &[row],
         );
 
-        let error = load_records(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Data { .. }));
+        let table = UnionPayJob.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(
+            table.rows[0].values[14],
+            Value::Text("89813015722APT1".into())
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

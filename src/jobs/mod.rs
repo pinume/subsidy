@@ -266,26 +266,6 @@ pub(crate) fn resolve_via(index: &MultiValueIndex, key: Option<&str>) -> Priorit
     resolve(index.get(key).cloned().unwrap_or_default())
 }
 
-/// 记录并检查工作表内容指纹：同一指纹已属于另一个文件时判定为疑似重复导出并报错；
-/// 否则记录该指纹归属的当前文件。
-pub(crate) fn check_duplicate_fingerprint(
-    fingerprints: &mut HashMap<String, String>,
-    fingerprint: String,
-    file_name: &str,
-) -> Result<(), ProcessError> {
-    if let Some(previous_file) = fingerprints.get(&fingerprint)
-        && previous_file != file_name
-    {
-        return Err(ProcessError::Duplicate {
-            detail: format!("{file_name} 与 {previous_file} 的工作表内容完全相同，疑似重复导出"),
-        });
-    }
-    fingerprints
-        .entry(fingerprint)
-        .or_insert_with(|| file_name.to_string());
-    Ok(())
-}
-
 /// 在`(路径, 排序键)`候选中选择键最大的唯一一项；键并列时判定为无法唯一确定并报错。
 pub(crate) fn pick_unique_latest<K: Ord + Copy>(
     dated: Vec<(PathBuf, K)>,

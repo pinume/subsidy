@@ -1,4 +1,4 @@
-use std::fmt::{self, Write};
+use std::fmt;
 use std::path::Path;
 
 use calamine::{Data, ExcelDateTime, ExcelDateTimeType, Range, Reader, Xlsx, open_workbook};
@@ -106,23 +106,6 @@ impl SheetGrid {
             })
             .collect()
     }
-
-    /// 计算指定行范围内的内容指纹（表头+明细），用于检测不同文件是否为完全相同的重复导出。
-    pub fn fingerprint(&self, start_row: u32, end_row: u32) -> String {
-        let Some((_, start_col)) = self.range.start() else {
-            return String::new();
-        };
-        let width = self.range.width() as u32;
-        let mut fingerprint = format!("{start_col}:{width}:");
-        for row in start_row..=end_row {
-            let cells: Vec<_> = (start_col..start_col + width)
-                .map(|col| self.range.get_value((row - 1, col)).unwrap_or(&Data::Empty))
-                .collect();
-            // Debug 表示保留类型、日期纪元及错误值，并转义文本中的分隔字符。
-            write!(fingerprint, "{cells:?}").expect("writing to String cannot fail");
-        }
-        fingerprint
-    }
 }
 
 /// 打开工作簿并按原顺序返回全部工作表。
@@ -144,39 +127,6 @@ pub fn open_sheets(path: &Path) -> Result<Vec<SheetGrid>, ProcessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn fingerprint(cells: [Data; 2]) -> String {
-        let mut range = Range::new((0, 0), (0, 1));
-        for (col, cell) in cells.into_iter().enumerate() {
-            range.set_value((0, col as u32), cell);
-        }
-        SheetGrid {
-            name: "Sheet1".into(),
-            range,
-        }
-        .fingerprint(1, 1)
-    }
-
-    #[test]
-    fn fingerprints_preserve_types_errors_and_text_boundaries() {
-        let text = |s: &str| Data::String(s.into());
-        assert_ne!(
-            fingerprint([Data::Int(1), Data::Empty]),
-            fingerprint([text("1"), Data::Empty])
-        );
-        assert_ne!(
-            fingerprint([Data::Error(calamine::CellErrorType::NA), Data::Empty]),
-            fingerprint([Data::Empty, Data::Empty])
-        );
-        assert_ne!(
-            fingerprint([text("a\u{1}b"), text("c")]),
-            fingerprint([text("a"), text("b\u{1}c")])
-        );
-        assert_eq!(
-            fingerprint([text("same"), Data::Float(1.5)]),
-            fingerprint([text("same"), Data::Float(1.5)])
-        );
-    }
 
     #[test]
     fn standard_epoch_serials_are_unchanged() {

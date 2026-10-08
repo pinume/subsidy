@@ -70,7 +70,6 @@ const COLUMN_TYPES: [ColumnType; 24] = [
 // 24 列固定顺序中的关键索引（0 基）。
 const REFERENCE: usize = 2;
 const MERCHANT_ORDER: usize = 3;
-const INVOICE_NO: usize = 19;
 const OTHER_PAYMENT: usize = 7;
 const SUBSIDY_AMOUNT: usize = 10;
 const RATIO: usize = 11;
@@ -86,8 +85,6 @@ struct RefundConfig {
     field_synonyms: [&'static [&'static str]; 24],
     /// 判定"批次明细表"的基础字段索引；缺失任一项即为待映射异常，终止处理。
     required_indices: &'static [usize],
-    /// 重复分组依据字段的索引，按优先级排列。
-    grouping_priority: [usize; 3],
     /// 只保留`核销商编`精确等于该值的明细行，其余门店编码的记录在读取阶段即排除，
     /// 不参与后续合并、去重或输出。
     dealer_code: &'static str,
@@ -131,7 +128,6 @@ const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年以旧换新补贴明细.xlsx",
     field_synonyms: APPLIANCE_SYNONYMS,
     required_indices: &APPLIANCE_REQUIRED,
-    grouping_priority: [4, MERCHANT_ORDER, INVOICE_NO], // 交易订单号 → 商户订单号 → 发票号
     dealer_code: "89813015722APT1",
 };
 
@@ -171,7 +167,6 @@ const DIGITAL_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年数码补贴明细.xlsx",
     field_synonyms: DIGITAL_SYNONYMS,
     required_indices: &DIGITAL_REQUIRED,
-    grouping_priority: [REFERENCE, MERCHANT_ORDER, INVOICE_NO], // 交易参考号 → 商户订单号 → 发票号
     dealer_code: "89813014812B06R",
 };
 
@@ -312,20 +307,6 @@ fn read_row(
     Ok(values)
 }
 
-/// 分组依据：优先级中首个非空文本字段的`(字段索引, 去首尾空白后的值)`；
-/// 索引本身即代表"字段类型"，天然避免不同字段交叉匹配。
-fn grouping_key(values: &[Value], priority: [usize; 3]) -> Option<(usize, String)> {
-    for index in priority {
-        if let Value::Text(text) = &values[index] {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
-                return Some((index, trimmed.to_string()));
-            }
-        }
-    }
-    None
-}
-
 fn subsidy_amount(values: &[Value]) -> Decimal {
     match &values[SUBSIDY_AMOUNT] {
         Value::Decimal(amount) => *amount,
@@ -335,11 +316,14 @@ fn subsidy_amount(values: &[Value]) -> Decimal {
 
 /// 第 7.5/8.6 节：跨批次统一分组、按补贴金额合计沉底；未沉底记录在前，沉底记录在后，
 /// 两个区域内部均保持合并后的原相对顺序。
-fn classify_and_sink(records: Vec<Vec<Value>>, priority: [usize; 3]) -> Vec<Row> {
-    let mut groups: HashMap<(usize, String), Vec<usize>> = HashMap::new();
+fn classify_and_sink(records: Vec<Vec<Value>>) -> Vec<Row> {
+    let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, values) in records.iter().enumerate() {
-        if let Some(key) = grouping_key(values, priority) {
-            groups.entry(key).or_default().push(index);
+        if let Value::Text(key) = &values[MERCHANT_ORDER] {
+            groups
+                .entry(key.trim().to_string())
+                .or_default()
+                .push(index);
         }
     }
 
@@ -467,43 +451,33 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
             if sheet.cell(row, dealer_col).to_string().trim() != config.dealer_code {
                 continue;
             }
+            let order_col = columns[MERCHANT_ORDER].expect("商户订单号为必需字段");
+            if sheet.cell(row, order_col).to_string().trim().is_empty() {
+                return Err(data_error(
+                    &file_name,
+                    &sheet_name,
+                    row,
+                    "商户订单号",
+                    String::new(),
+                    "筛选后的商户订单号不能为空".to_string(),
+                ));
+            }
             records.push(read_row(sheet, row, &columns, &file_name, &sheet_name)?);
         }
     }
 
-    let reference_lookup =
-        crate::jobs::uploaded::load_reference_lookup(input_dir, config.dealer_code)?;
-    if !reference_lookup.is_empty() {
-        for row in &mut records {
-            let is_ref_empty = match &row[2] {
-                Value::Empty => true,
-                Value::Text(s) => s.trim().is_empty(),
-                _ => false,
-            };
-            if is_ref_empty
-                && let Value::Text(order_no) = &row[3]
-                && let Some(ref_no) = reference_lookup.get(order_no.trim())
-            {
-                row[2] = Value::Text(ref_no.clone());
-            }
-        }
-    }
-
-    let rows = classify_and_sink(records, config.grouping_priority);
+    let rows = classify_and_sink(records);
     Ok(Table {
         columns: output_columns(),
         rows,
     })
 }
 
-/// 按`商户订单号`、`交易参考号`、`发票号`分别汇总回款明细"正常区域"（排除第7.5/8.5节
+/// 按`商户订单号`、`交易参考号`分别汇总回款明细"正常区域"（排除第7.5/8.5节
 /// 沉底的粉色重复记录）全部`补贴金额`（未去重，格式化为两位小数文本以统一比较）。
-pub(super) fn subsidy_indices(
-    refund_table: &Table,
-) -> (MultiValueIndex, MultiValueIndex, MultiValueIndex) {
+pub(super) fn subsidy_indices(refund_table: &Table) -> (MultiValueIndex, MultiValueIndex) {
     let mut by_order: MultiValueIndex = HashMap::new();
     let mut by_reference: MultiValueIndex = HashMap::new();
-    let mut by_invoice_no: MultiValueIndex = HashMap::new();
 
     for row in refund_table
         .rows
@@ -527,14 +501,8 @@ pub(super) fn subsidy_indices(
                 .or_default()
                 .push(subsidy_text.clone());
         }
-        if let Value::Text(invoice_no) = &row.values[INVOICE_NO] {
-            by_invoice_no
-                .entry(invoice_no.clone())
-                .or_default()
-                .push(subsidy_text);
-        }
     }
-    (by_order, by_reference, by_invoice_no)
+    (by_order, by_reference)
 }
 
 #[cfg(test)]
@@ -622,6 +590,116 @@ mod tests {
             Value::Text(text) => text.as_str(),
             _ => panic!("expected text"),
         }
+    }
+
+    #[test]
+    fn groups_only_by_merchant_order_and_preserves_blank_references() {
+        let dir = unique_temp_path("refund-order-only");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_workbook(
+            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &[(
+                "批次",
+                &APPLIANCE_HEADER,
+                &[
+                    appliance_row("first", "ORDER", "T1", "10"),
+                    appliance_row("last", "ORDER", "T2", "20"),
+                    appliance_row("other", "OTHER", "T2", "30"),
+                ],
+            )],
+        );
+        let table = REFUND_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(
+            table.rows.iter().map(label_of).collect::<Vec<_>>(),
+            ["last", "other", "first"]
+        );
+        assert_eq!(table.rows[2].fill, Some(Fill::Pink));
+        assert!(
+            table
+                .rows
+                .iter()
+                .all(|r| r.values[REFERENCE] == Value::Empty)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn requires_merchant_order_only_after_filtering_and_reports_location() {
+        let dir = unique_temp_path("refund-order-required");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut excluded = appliance_row("excluded", "", "T1", "10");
+        excluded[5] = "OTHER".into();
+        let path = dir.join("2026年以旧换新补贴明细.xlsx");
+        write_workbook(
+            &path,
+            &[(
+                "批次甲",
+                &APPLIANCE_HEADER,
+                &[excluded.clone(), appliance_row("valid", "ORDER", "", "10")],
+            )],
+        );
+        assert_eq!(REFUND_APPLIANCE.run(&dir).unwrap().rows.len(), 1);
+        write_workbook(
+            &path,
+            &[(
+                "批次甲",
+                &APPLIANCE_HEADER,
+                &[excluded, appliance_row("invalid", " ", "T2", "10")],
+            )],
+        );
+        let error = REFUND_APPLIANCE.run(&dir).unwrap_err().to_string();
+        assert!(error.contains("2026年以旧换新补贴明细.xlsx"), "{error}");
+        assert!(
+            error.contains("批次甲") && error.contains("3") && error.contains("商户订单号"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn digital_groups_by_order_instead_of_shared_reference_or_invoice() {
+        let dir = unique_temp_path("refund-digital-order");
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |label: &str, order: &str, amount: &str| {
+            let mut row = vec![String::new(); 24];
+            for (index, value) in [
+                (0, label),
+                (2, "SAME-REF"),
+                (3, order),
+                (6, DIGITAL_CONFIG.dealer_code),
+                (10, amount),
+                (19, "SAME-INVOICE"),
+            ] {
+                row[index] = value.into();
+            }
+            row
+        };
+        let path = dir.join("2026年数码补贴明细.xlsx");
+        write_workbook(
+            &path,
+            &[(
+                "批次",
+                &OUTPUT_FIELDS,
+                &[
+                    make("A", "ONE", "10"),
+                    make("B", "TWO", "20"),
+                    make("C", "ONE", "30"),
+                ],
+            )],
+        );
+        let table = REFUND_DIGITAL.run(&dir).unwrap();
+        assert_eq!(
+            table.rows.iter().map(label_of).collect::<Vec<_>>(),
+            ["B", "C", "A"]
+        );
+        assert_eq!(table.rows[2].fill, Some(Fill::Pink));
+        write_workbook(
+            &path,
+            &[("缺单号", &OUTPUT_FIELDS, &[make("bad", "", "10")])],
+        );
+        let error = REFUND_DIGITAL.run(&dir).unwrap_err().to_string();
+        assert!(error.contains("缺单号 第2行 [商户订单号]"), "{error}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -838,18 +916,18 @@ mod tests {
                     "批次一",
                     &APPLIANCE_HEADER,
                     &[
-                        appliance_row("A", "", "DUP1", "10.00"),
-                        appliance_row("B", "", "DUP1", "-20.00"), // 组内合计 -10 <= 0，全部沉底
-                        appliance_row("C", "", "DUP2", "30.00"),
+                        appliance_row("A", "DUP1", "T1", "10.00"),
+                        appliance_row("B", "DUP1", "T2", "-20.00"), // 组内合计 -10 <= 0，全部沉底
+                        appliance_row("C", "DUP2", "T3", "30.00"),
                     ],
                 ),
                 (
                     "批次二",
                     &APPLIANCE_HEADER,
                     &[
-                        appliance_row("D", "", "DUP2", "40.00"), // 跨批次同组，合计 70 > 0，保留最后一次（D）
+                        appliance_row("D", "DUP2", "T4", "40.00"), // 跨批次同组，合计 70 > 0，保留最后一次（D）
                         appliance_row("E", "UNIQUE1", "", "5.00"), // 单条记录不受影响
-                        appliance_row("F", "", "CROSS", "1.00"), // 交易订单号=CROSS
+                        appliance_row("F", "UNIQUE3", "CROSS", "1.00"), // 交易订单号=CROSS
                         appliance_row("G", "CROSS", "", "1.00"), // 商户订单号=CROSS，字段类型不同，不得与 F 同组
                         appliance_row("H", "UNIQUE2", "", "-5.00"), // 未形成重复组的负数记录沉底
                     ],
@@ -1022,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn fills_missing_reference_no_from_uploaded_mer_files_by_merchant_order_no() {
+    fn preserves_blank_reference_even_when_uploaded_source_has_match() {
         let dir = unique_temp_path("refund-fill-ref-match");
         std::fs::create_dir_all(&dir).unwrap();
 
@@ -1041,10 +1119,7 @@ mod tests {
         );
 
         let table = REFUND_APPLIANCE.run(&dir).unwrap();
-        assert_eq!(
-            table.rows[0].values[2],
-            Value::Text("REF-MATCH-123".to_string())
-        );
+        assert_eq!(table.rows[0].values[2], Value::Empty);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

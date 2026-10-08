@@ -1,4 +1,3 @@
-#[cfg(test)]
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::path::Path;
@@ -62,8 +61,6 @@ const COL_BRAND: u32 = 8;
 const COL_FINANCE_CATEGORY: u32 = 15;
 const COL_SUMMARY: u32 = 18;
 const COL_TOTAL: u32 = 28;
-
-const TRIGGER_LETTERS: [char; 10] = ['N', 'n', 'W', 'w', 'M', 'm', 'H', 'h', 'B', 'b'];
 
 struct CouponRecord {
     doc_no: String,
@@ -151,7 +148,7 @@ impl Job for CouponsJob {
         }
 
         // 10.6.1：权威校验集缺失、结构异常或无法完整读取时必须停止，不得绕过校验；
-        // 直接复用 unionpay::load_records 的全部校验（文件发现、表头、首尾结构、重复导出）。
+        // 直接复用 unionpay::load_records 的全部校验（文件发现、表头、首尾结构）。
         let authority = ScopedCache::authority(input_dir)?;
         // 数电发票号码：缺失或结构异常时同样必须停止，直接复用 invoice::load_records
         // 的全部校验（最新文件选择、表头、逐行解析）。
@@ -160,20 +157,28 @@ impl Job for CouponsJob {
         // 校验（表头、末行合计结构）及其已算好的第 9.5 节三阶段备注。
         let receipts_index = ScopedCache::receipts_index(input_dir)?;
         // 备注兜底：缺失或结构异常时同样必须停止，直接复用已上传家电电脑/已上传数码
-        // 两个 Job 各自的全部校验（文件发现、表头、第26列起字段解析、重复UUID）。
-        let (uploaded_by_reference, uploaded_by_invoice_no) = uploaded::status_indices(input_dir)?;
+        // 两个 Job 各自的全部校验（文件发现、表头、第26列起字段解析）。
+        let appliance = uploaded::status_indices(input_dir, &uploaded::UPLOADED_APPLIANCE)?;
+        let digital = uploaded::status_indices(input_dir, &uploaded::UPLOADED_DIGITAL)?;
 
         let mut stats = MatchStats::default();
         let mut rows = Vec::new();
         for row in 3..last_row {
-            let record = read_row(sheet, row, FILE_NAME, &sheet_name)?;
+            let mut record = read_row(sheet, row, FILE_NAME, &sheet_name)?;
+            record.finance_category = normalize_finance_category(record.finance_category);
+            let (uploaded_by_reference, uploaded_by_invoice_no) =
+                if record.finance_category == "数码" {
+                    &digital
+                } else {
+                    &appliance
+                };
             rows.push(to_row(
                 record,
                 &authority,
                 &invoice_index,
                 &receipts_index,
-                &uploaded_by_reference,
-                &uploaded_by_invoice_no,
+                uploaded_by_reference,
+                uploaded_by_invoice_no,
                 &mut stats,
             ));
         }
@@ -271,7 +276,7 @@ fn to_row(
     authority: &HashSet<String>,
     invoice_index: &MultiValueIndex,
     receipts_index: &MultiValueIndex,
-    uploaded_by_reference: &MultiValueIndex,
+    uploaded_by_reference: &HashMap<String, String>,
     uploaded_by_invoice_no: &MultiValueIndex,
     stats: &mut MatchStats,
 ) -> Row {
@@ -294,16 +299,21 @@ fn to_row(
         stats.hits[0] += 1;
         Some(value)
     } else {
-        let (outcome, stage) = match resolve_via(uploaded_by_reference, reference.as_deref()) {
-            PriorityOutcome::NoHit => (
+        if let Some(status) = reference
+            .as_ref()
+            .and_then(|key| uploaded_by_reference.get(key))
+            .filter(|status| !status.is_empty())
+        {
+            stats.hits[1] += 1;
+            Some(status.clone())
+        } else {
+            let value = matched(
                 resolve_via(uploaded_by_invoice_no, invoice_no.as_deref()),
-                2,
-            ),
-            outcome => (outcome, 1),
-        };
-        let value = matched(outcome, &mut stats.ambiguous[3]);
-        stats.hits[if value.is_some() { stage } else { 3 }] += 1;
-        value
+                &mut stats.ambiguous[3],
+            );
+            stats.hits[if value.is_some() { 2 } else { 3 }] += 1;
+            value
+        }
     };
     // 10.12.3 节：两阶段均未命中（含歧义、空键）时，备注固定填“未上传”，不沉底不填色；
     // 空值从不参与前两阶段的匹配，这里只是给最终仍为空的结果一个统一的文本标记。
@@ -314,7 +324,7 @@ fn to_row(
         record.doc_date,
         text_value(record.product_name),
         text_value(normalize_brand(record.brand)),
-        text_value(normalize_finance_category(record.finance_category)),
+        text_value(record.finance_category),
         Value::Decimal(record.subsidy),
         Value::Integer(quantity),
         reference.map_or(Value::Empty, Value::Text),
@@ -396,7 +406,7 @@ fn output_columns() -> Vec<Column> {
 }
 
 // ---------------------------------------------------------------------------
-// 10.6 节：参考号提取（四级优先级，命中即停，同级内先去重再判定）。
+// 10.6 节：参考号提取（两级优先级，命中即停，同级内先去重再判定）。
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
@@ -412,12 +422,14 @@ fn reference_outcome(summary: &str, authority: &HashSet<String>) -> PriorityOutc
         PriorityOutcome::NoHit => {}
         outcome => return outcome,
     }
-    let candidates = digit_candidates(summary);
-    match resolve(zero_edit_hits(&candidates, authority)) {
-        PriorityOutcome::NoHit => {}
-        outcome => return outcome,
-    }
-    resolve(single_edit_hits(&candidates, authority))
+    resolve(
+        maximal_digit_runs(summary)
+            .into_iter()
+            .filter(|(start, end)| end - start == 11)
+            .map(|(start, end)| format!("{}N", &summary[start..end]))
+            .filter(|candidate| authority.contains(candidate))
+            .collect(),
+    )
 }
 
 fn reference_pattern() -> &'static Regex {
@@ -451,86 +463,6 @@ fn maximal_digit_runs(text: &str) -> Vec<(usize, usize)> {
         runs.push((s, bytes.len()));
     }
     runs
-}
-
-/// 第 2 级候选：长度 10-12 的完整连续数字串；若摘要含触发字母，额外把全部数字顺序拼接为一个候选。
-fn digit_candidates(summary: &str) -> Vec<String> {
-    let mut candidates = Vec::new();
-
-    for (start, end) in maximal_digit_runs(summary) {
-        if (10..=12).contains(&(end - start)) {
-            candidates.push(summary[start..end].to_string());
-        }
-    }
-
-    if summary.chars().any(|c| TRIGGER_LETTERS.contains(&c)) {
-        let all_digits: String = summary.chars().filter(char::is_ascii_digit).collect();
-        if (10..=12).contains(&all_digits.len()) {
-            candidates.push(all_digits);
-        }
-    }
-
-    candidates
-}
-
-/// 第 3 级：仅对 11 位候选补上大写`N`后与权威校验集比对，不做任何数字改动。
-fn zero_edit_hits(candidates: &[String], authority: &HashSet<String>) -> Vec<String> {
-    candidates
-        .iter()
-        .filter(|c| c.len() == 11)
-        .map(|c| format!("{c}N"))
-        .filter(|candidate| authority.contains(candidate))
-        .collect()
-}
-
-/// 第 4 级：对 10-12 位候选执行恰好一次插入/替换/删除，纠正为 11 位后补`N`比对。
-fn single_edit_hits(candidates: &[String], authority: &HashSet<String>) -> Vec<String> {
-    let mut hits = Vec::new();
-    for candidate in candidates {
-        for variant in single_edit_variants(candidate) {
-            let with_suffix = format!("{variant}N");
-            if authority.contains(&with_suffix) {
-                hits.push(with_suffix);
-            }
-        }
-    }
-    hits
-}
-
-fn single_edit_variants(candidate: &str) -> Vec<String> {
-    let digits = candidate.as_bytes();
-    let mut variants = Vec::new();
-    match digits.len() {
-        10 => {
-            for pos in 0..=digits.len() {
-                for d in b'0'..=b'9' {
-                    let mut v = digits.to_vec();
-                    v.insert(pos, d);
-                    variants.push(String::from_utf8(v).unwrap());
-                }
-            }
-        }
-        11 => {
-            for pos in 0..digits.len() {
-                for d in b'0'..=b'9' {
-                    if d != digits[pos] {
-                        let mut v = digits.to_vec();
-                        v[pos] = d;
-                        variants.push(String::from_utf8(v).unwrap());
-                    }
-                }
-            }
-        }
-        12 => {
-            for pos in 0..digits.len() {
-                let mut v = digits.to_vec();
-                v.remove(pos);
-                variants.push(String::from_utf8(v).unwrap());
-            }
-        }
-        _ => {}
-    }
-    variants
 }
 
 #[cfg(test)]
@@ -607,67 +539,10 @@ mod tests {
     #[test]
     fn falls_back_to_zero_edit_when_n_suffix_missing() {
         let authority = authority_of(&["16867252734N"]);
-        // 只有 11 位数字，缺少末尾大写 N；原样提取无结果，第三级补上 N 后命中。
+        // 只有 11 位数字，缺少末尾大写 N；原样提取无结果，补上 N 后命中。
         assert_eq!(
             extract_reference("单号16867252734完成", &authority),
             Some("16867252734N".to_string())
-        );
-    }
-
-    #[test]
-    fn trigger_letter_allows_digit_concatenation_across_gaps() {
-        let authority = authority_of(&["16867252734N"]);
-        // 数字被空格分割为两段（6 位+5 位，均不在 10-12 位范围内），
-        // 但摘要含触发字母 N，可将全部数字按原顺序拼接为一个候选。
-        assert_eq!(
-            extract_reference("订单168672 52734N附言", &authority),
-            Some("16867252734N".to_string())
-        );
-    }
-
-    #[test]
-    fn single_digit_insertion_recovers_reference() {
-        let authority = authority_of(&["16867252734N"]);
-        // 缺少末位数字 4（10 位），第四级允许一次插入。
-        assert_eq!(
-            extract_reference("单号1686725273结清", &authority),
-            Some("16867252734N".to_string())
-        );
-    }
-
-    #[test]
-    fn single_digit_substitution_recovers_reference() {
-        let authority = authority_of(&["16867252734N"]);
-        // 末位数字错为 9（应为 4），第四级允许一次替换。
-        assert_eq!(
-            extract_reference("单号16867252739结清", &authority),
-            Some("16867252734N".to_string())
-        );
-    }
-
-    #[test]
-    fn single_digit_deletion_recovers_reference() {
-        let authority = authority_of(&["16867252734N"]);
-        // 多出一位数字（12 位），第四级允许一次删除。
-        assert_eq!(
-            extract_reference("单号168672527340结清", &authority),
-            Some("16867252734N".to_string())
-        );
-    }
-
-    #[test]
-    fn two_edits_are_not_attempted() {
-        let authority = authority_of(&["16867252734N"]);
-        // 两位数字都错误，超出“至多一次改动”的范围，不得纠正。
-        assert_eq!(extract_reference("单号16867252799结清", &authority), None);
-    }
-
-    #[test]
-    fn ambiguous_hits_at_same_priority_leave_reference_blank() {
-        let authority = authority_of(&["11111111111N", "22222222222N"]);
-        assert_eq!(
-            extract_reference("含11111111111N及22222222222N两个编号", &authority),
-            None
         );
     }
 
@@ -824,7 +699,7 @@ mod tests {
         for (index, (uuid, reference, status, invoice_no)) in rows.iter().enumerate() {
             let row = (2 + index) as u32;
             sheet.write_string(row, 0, *uuid).unwrap(); // 实时清分UUID
-            sheet.write_string(row, 1, merchant_no).unwrap(); // 商户号（须与文件名一致）
+            sheet.write_string(row, 1, merchant_no).unwrap(); // 商户号
             sheet.write_string(row, 6, *reference).unwrap(); // 检索参考号
             sheet.write_string(row, 8, *status).unwrap(); // 状态
             sheet.write_string(row, 19, *invoice_no).unwrap(); // 发票号码
@@ -847,7 +722,7 @@ mod tests {
     }
 
     /// 两个已上传数据组各写入一份没有明细的最小合法样本，并同时写入两份空回款明细样本
-    /// （已上传数据内部会按订单号/检索参考号/发票号码匹配回款明细的补贴金额），仅用于
+    /// （已上传数据内部会按订单号/检索参考号匹配回款明细的补贴金额），仅用于
     /// 满足前置依赖存在。
     fn write_empty_uploaded_fixtures(dir: &Path) {
         write_empty_refund_fixture(dir, "2026年以旧换新补贴明细.xlsx");
@@ -893,6 +768,134 @@ mod tests {
             .write_string((2 + rows.len()) as u32, 0, "合计")
             .unwrap();
         workbook.save(dir.join(FILE_NAME)).unwrap();
+    }
+
+    #[test]
+    fn scopes_status_lookup_and_never_guesses_reference_digits() {
+        let dir = unique_temp_path("coupons-scoped-reference");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_invoice_fixture(
+            &dir,
+            &[("销售日期:2026-08-29 单据号:收款ZFFX000009", "INVOICE")],
+        );
+        write_receipts_fixture(&dir, &[]);
+        write_empty_uploaded_fixtures(&dir);
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_APPLIANCE,
+            &uploaded::APPLIANCE_TAIL,
+            &[("A", "16867252734N", "家电状态", "INVOICE")],
+        );
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_DIGITAL,
+            &uploaded::DIGITAL_TAIL,
+            &[("D", "16867252734N", "数码状态", "INVOICE")],
+        );
+        let summaries = [
+            "16867252734N",
+            "16867252734W",
+            "16867252734M",
+            "16867252734n",
+            "16867252734nN",
+            "16867252734H",
+            "16867252734B",
+            "16867252734",
+            "168672 52734N",
+            "1686725273",
+            "16867252739",
+            "168672527340",
+        ];
+        for (category, expected) in [
+            ("家电", "家电状态"),
+            ("数码", "数码状态"),
+            ("新业务类", "数码状态"),
+        ] {
+            let mut rows: Vec<_> = summaries
+                .iter()
+                .map(|summary| {
+                    (
+                        "收款X",
+                        "2026-08-29",
+                        "商品",
+                        "品牌",
+                        category,
+                        *summary,
+                        "10",
+                    )
+                })
+                .collect();
+            rows.push((
+                "收款ZFFX000009",
+                "2026-08-29",
+                "商品",
+                "品牌",
+                category,
+                "",
+                "10",
+            ));
+            write_coupons_workbook(&dir, &rows);
+            let table = CouponsJob.run(&dir).unwrap();
+            for row in &table.rows[..8] {
+                assert_eq!(row.values[7], Value::Text("16867252734N".into()));
+                assert_eq!(row.values[10], Value::Text(expected.into()));
+            }
+            for row in &table.rows[8..12] {
+                assert_eq!(row.values[7], Value::Empty);
+                assert_eq!(row.values[10], Value::Text("未上传".into()));
+            }
+            assert_eq!(table.rows[12].values[10], Value::Text(expected.into()));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_or_blank_reference_status_uses_only_same_group_invoice_status() {
+        let dir = unique_temp_path("coupons-scoped-fallback");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_unionpay_fixture(&dir, "16867252734W");
+        write_invoice_fixture(
+            &dir,
+            &[("销售日期:2026-08-29 单据号:收款ZFFX000009", "INVOICE")],
+        );
+        write_receipts_fixture(&dir, &[]);
+        write_empty_uploaded_fixtures(&dir);
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_DIGITAL,
+            &uploaded::DIGITAL_TAIL,
+            &[("D", "", "数码状态", "INVOICE")],
+        );
+        write_coupons_workbook(
+            &dir,
+            &[(
+                "收款ZFFX000009",
+                "2026-08-29",
+                "商品",
+                "品牌",
+                "家电",
+                "16867252734W",
+                "10",
+            )],
+        );
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[7], Value::Empty);
+        assert_eq!(table.rows[0].values[10], Value::Text("未上传".into()));
+        write_unionpay_fixture(&dir, "16867252734N");
+        write_uploaded_fixture(
+            &dir,
+            MERCHANT_APPLIANCE,
+            &uploaded::APPLIANCE_TAIL,
+            &[
+                ("A", "16867252734N", "", ""),
+                ("B", "", "发票状态", "INVOICE"),
+            ],
+        );
+        let table = CouponsJob.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[7], Value::Text("16867252734N".into()));
+        assert_eq!(table.rows[0].values[10], Value::Text("发票状态".into()));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1244,7 +1247,7 @@ mod tests {
                 "2026-08-29",
                 "商品甲",
                 "品牌甲",
-                "家电",
+                "数码",
                 "无编号",
                 "10.00",
             )],
@@ -1278,14 +1281,12 @@ mod tests {
             &dir,
             MERCHANT_APPLIANCE,
             &uploaded::APPLIANCE_TAIL,
-            &[("U003", "16867252734N", "参考号命中", "")],
+            &[
+                ("U003", "16867252734N", "参考号命中", ""),
+                ("U004", "", "发票号命中", "24312000000000000009"),
+            ],
         );
-        write_uploaded_fixture(
-            &dir,
-            MERCHANT_DIGITAL,
-            &uploaded::DIGITAL_TAIL,
-            &[("U004", "", "发票号命中", "24312000000000000009")],
-        );
+        write_uploaded_fixture(&dir, MERCHANT_DIGITAL, &uploaded::DIGITAL_TAIL, &[]);
         write_coupons_workbook(
             &dir,
             &[(
@@ -1389,58 +1390,6 @@ mod tests {
             Value::Text("退货-退单".to_string())
         );
         assert_eq!(table.rows[2].fill, Some(Fill::Pink));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn falls_through_to_not_uploaded_when_uploaded_reference_match_is_ambiguous() {
-        let dir = unique_temp_path("coupons-uploaded-ambiguous");
-        std::fs::create_dir_all(&dir).unwrap();
-
-        write_unionpay_fixture(&dir, "16867252734N");
-        // 数电发票号码同样能命中，但主键歧义须立即判定未命中，不得降级到次键。
-        write_invoice_fixture(
-            &dir,
-            &[(
-                "销售日期:2026-08-29 单据号:收款ZFFX000003",
-                "24312000000000000009",
-            )],
-        );
-        write_receipts_fixture(&dir, &[]);
-        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
-        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
-        write_uploaded_fixture(
-            &dir,
-            MERCHANT_APPLIANCE,
-            &uploaded::APPLIANCE_TAIL,
-            &[
-                ("U005", "16867252734N", "状态甲", ""),
-                ("U006", "16867252734N", "状态乙", ""),
-            ],
-        );
-        write_uploaded_fixture(
-            &dir,
-            MERCHANT_DIGITAL,
-            &uploaded::DIGITAL_TAIL,
-            &[("U007", "", "发票号命中", "24312000000000000009")],
-        );
-        write_coupons_workbook(
-            &dir,
-            &[(
-                "收款ZFFX000003",
-                "2026-08-29",
-                "商品甲",
-                "品牌甲",
-                "家电",
-                "参考号：16867252734N",
-                "10.00",
-            )],
-        );
-
-        let table = CouponsJob.run(&dir).unwrap();
-        assert_eq!(table.rows[0].values[10], Value::Text("未上传".to_string()));
-        assert_eq!(table.rows[0].fill, None);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1635,19 +1584,25 @@ mod tests {
                 ],
             );
         }
-        let expected = uploaded::status_indices(&dir).unwrap();
-        assert_eq!(expected.0["ref"].len(), 4);
-        assert_eq!(expected.0["ref"], expected.1["inv"]);
+        let expected = uploaded::status_indices(&dir, &uploaded::UPLOADED_APPLIANCE).unwrap();
+        assert_eq!(expected.0["ref"], "审核失败");
+        assert_eq!(expected.1["inv"].len(), 2);
         assert!(!expected.0.contains_key("ignored"));
         let _guard = super::super::ScopedCache::activate();
         // First run takes the uncached path and populates both tables.
-        assert_eq!(uploaded::status_indices(&dir).unwrap(), expected);
+        assert_eq!(
+            uploaded::status_indices(&dir, &uploaded::UPLOADED_APPLIANCE).unwrap(),
+            expected
+        );
         // Removing raw fixtures proves the second run borrows cached tables.
         for merchant in [MERCHANT_APPLIANCE, MERCHANT_DIGITAL] {
             std::fs::remove_file(dir.join(format!("MER_{merchant}_20260914101809_yjhx.xlsx")))
                 .unwrap();
         }
-        assert_eq!(uploaded::status_indices(&dir).unwrap(), expected);
+        assert_eq!(
+            uploaded::status_indices(&dir, &uploaded::UPLOADED_APPLIANCE).unwrap(),
+            expected
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1772,10 +1727,7 @@ mod tests {
         let key = build_match_doc_no(&date, "ZFFX000001");
         let invoices = HashMap::from([(key.clone(), vec!["invoice-a".into(), "invoice-b".into()])]);
         let receipts = HashMap::from([(key, vec!["remark-a".into(), "remark-b".into()])]);
-        let uploaded = HashMap::from([(
-            "11111111111N".into(),
-            vec!["status-a".into(), "status-b".into()],
-        )]);
+        let uploaded = HashMap::from([("11111111111N".into(), "status-a".into())]);
         let mut stats = MatchStats::default();
         for summary in ["11111111111N 22222222222N", "11111111111N"] {
             let row = to_row(
@@ -1795,10 +1747,20 @@ mod tests {
                 &HashMap::new(),
                 &mut stats,
             );
-            assert_eq!(row.values[10], Value::Text("未上传".into()));
+            assert_eq!(
+                row.values[10],
+                Value::Text(
+                    if summary.contains(' ') {
+                        "未上传"
+                    } else {
+                        "status-a"
+                    }
+                    .into()
+                )
+            );
             assert_eq!(row.fill, None);
         }
-        assert_eq!(stats.hits, [0, 0, 0, 2]);
-        assert_eq!(stats.ambiguous, [1, 2, 2, 1]);
+        assert_eq!(stats.hits, [0, 1, 0, 1]);
+        assert_eq!(stats.ambiguous, [1, 2, 2, 0]);
     }
 }

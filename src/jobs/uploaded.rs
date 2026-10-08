@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -12,8 +11,7 @@ use crate::model::{Column, ColumnType, DecimalScale, ProcessError, Row, Table, V
 use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL, subsidy_indices};
 use super::{
     Category, Job, MultiValueIndex, PriorityOutcome, amount_value, cell_amount, cell_date_or_text,
-    cell_datetime_or_text, cell_text, check_duplicate_fingerprint, data_error,
-    resolve_synonym_column, resolve_via, text_value,
+    cell_datetime_or_text, cell_text, data_error, resolve_synonym_column, resolve_via, text_value,
 };
 
 /// 前25列两组数据组结构完全相同，按固定列位置读取。
@@ -290,8 +288,6 @@ pub(crate) const DIGITAL_TAIL: [TailField; TAIL_LEN] = [
 ];
 
 // 固定列位置（1 基）。
-const COL_UUID: u32 = 1;
-const COL_MERCHANT_NO: u32 = 2;
 
 struct UploadedConfig {
     category: Category,
@@ -440,28 +436,6 @@ fn read_row(
     file: &str,
     sheet_name: &str,
 ) -> Result<Row, ProcessError> {
-    let merchant_cell = sheet.cell(row, COL_MERCHANT_NO);
-    let merchant_no = cell_text(&merchant_cell).map_err(|detail| {
-        data_error(
-            file,
-            sheet_name,
-            row,
-            "商户号",
-            merchant_cell.to_string(),
-            detail,
-        )
-    })?;
-    if merchant_no != config.merchant_no {
-        return Err(data_error(
-            file,
-            sheet_name,
-            row,
-            "商户号",
-            merchant_no,
-            format!("与文件名商户号“{}”不一致", config.merchant_no),
-        ));
-    }
-
     let mut values = Vec::with_capacity(FIELD_COUNT);
     for (index, &ty) in FRONT_COLUMN_TYPES.iter().enumerate() {
         values.push(match columns.front_columns[index] {
@@ -513,56 +487,47 @@ const VALUE_COL_REFERENCE: usize = 6; // 检索参考号
 const VALUE_COL_STATUS: usize = 8; // 状态
 const VALUE_COL_INVOICE_NO: usize = 19; // 发票号码
 
-/// 按`检索参考号`和`发票号码`分别汇总已上传家电电脑、已上传数码合并后的全部非空`状态`
-/// （未去重）；两个数据组共用同一对索引，不按财务大类等字段区分数据组。
+/// 按对应类别构建状态索引；参考号是唯一业务键，发票号码可能对应多条记录。
 pub(super) fn status_indices(
     input_dir: &Path,
-) -> Result<(MultiValueIndex, MultiValueIndex), ProcessError> {
-    let mut by_reference: MultiValueIndex = HashMap::new();
+    job: &UploadedJob,
+) -> Result<(HashMap<String, String>, MultiValueIndex), ProcessError> {
+    let mut by_reference = HashMap::new();
     let mut by_invoice_no: MultiValueIndex = HashMap::new();
-
-    for job in [&UPLOADED_APPLIANCE, &UPLOADED_DIGITAL] {
-        let mut accumulate = |table: &Table| {
-            for row in &table.rows {
-                let Value::Text(status) = &row.values[VALUE_COL_STATUS] else {
-                    continue;
-                };
-                if let Value::Text(reference) = &row.values[VALUE_COL_REFERENCE] {
-                    by_reference
-                        .entry(reference.clone())
-                        .or_default()
-                        .push(status.clone());
-                }
-                if let Value::Text(invoice_no) = &row.values[VALUE_COL_INVOICE_NO] {
-                    by_invoice_no
-                        .entry(invoice_no.clone())
-                        .or_default()
-                        .push(status.clone());
-                }
+    let mut accumulate = |table: &Table| {
+        for row in &table.rows {
+            let Value::Text(status) = &row.values[VALUE_COL_STATUS] else {
+                continue;
+            };
+            if status.is_empty() {
+                continue;
             }
-        };
-        if super::ScopedCache::with_table(job.category(), &mut accumulate).is_none() {
-            accumulate(&job.run(input_dir)?);
+            if let Value::Text(reference) = &row.values[VALUE_COL_REFERENCE] {
+                by_reference.insert(reference.clone(), status.clone());
+            }
+            if let Value::Text(invoice_no) = &row.values[VALUE_COL_INVOICE_NO] {
+                by_invoice_no
+                    .entry(invoice_no.clone())
+                    .or_default()
+                    .push(status.clone());
+            }
         }
+    };
+    if super::ScopedCache::with_table(job.category(), &mut accumulate).is_none() {
+        accumulate(&job.run(input_dir)?);
     }
     Ok((by_reference, by_invoice_no))
 }
 
-/// 按`订单号`（主键）→`检索参考号`（次键）→`发票号码`（三键）依次在回款明细索引中查找
+/// 按`订单号`（主键）→`检索参考号`（次键）依次在回款明细索引中查找
 /// 唯一命中的`补贴金额`；命中即停，同级歧义立即停止、不再尝试下一级。
 fn matched_refund_subsidy(
     by_order: &MultiValueIndex,
     by_reference: &MultiValueIndex,
-    by_invoice_no: &MultiValueIndex,
     order_no: &str,
     reference: &str,
-    invoice_no: &str,
 ) -> Option<Decimal> {
-    for (index, key) in [
-        (by_order, order_no),
-        (by_reference, reference),
-        (by_invoice_no, invoice_no),
-    ] {
+    for (index, key) in [(by_order, order_no), (by_reference, reference)] {
         match resolve_via(index, Some(key)) {
             PriorityOutcome::Unique(value) => return Decimal::from_str(&value).ok(),
             PriorityOutcome::Ambiguous => return None,
@@ -594,7 +559,7 @@ fn estimate_subsidy(transaction_amount: &Value, cap: Decimal) -> Option<Decimal>
 fn normalize_status(value: String) -> String {
     match value.as_str() {
         "审核通过" => "审核通过未回款".to_string(),
-        "同步(已上送)" | "暂存" | "待同步" => "待审核".to_string(),
+        "同步(已上送)" | "暂存" | "待同步" | "核销成功" => "待审核".to_string(),
         "核销失败" => "审核失败".to_string(),
         _ => value,
     }
@@ -654,7 +619,7 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
             "UploadedConfig 只用于 UploadedAppliance/UploadedDigital，实际为 {other:?}"
         ),
     };
-    let (by_order, by_reference, by_invoice_no) =
+    let (by_order, by_reference) =
         match super::ScopedCache::with_table(refund_job.category(), subsidy_indices) {
             Some(indices) => indices,
             None => {
@@ -665,8 +630,6 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
     let subsidy_cap = subsidy_cap(config.category);
 
     let mut rows = Vec::new();
-    let mut fingerprints: HashMap<String, String> = HashMap::new();
-    let mut seen_uuid: HashSet<String> = HashSet::new();
 
     for path in &files {
         let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
@@ -684,20 +647,9 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
 
             let last_row = sheet.last_value_row().unwrap_or(2);
 
-            let fingerprint = sheet.fingerprint(1, last_row);
-            check_duplicate_fingerprint(&mut fingerprints, fingerprint, &file_name)?;
-
             for row in 3..=last_row {
                 let mut record_row =
                     read_row(sheet, row, config, &columns, &file_name, &sheet_name)?;
-                if let Value::Text(uuid) = &record_row.values[(COL_UUID - 1) as usize]
-                    && !seen_uuid.insert(uuid.clone())
-                {
-                    return Err(ProcessError::Duplicate {
-                        detail: format!("实时清分UUID重复：{uuid}"),
-                    });
-                }
-
                 if let Value::Text(status) = &record_row.values[VALUE_COL_STATUS] {
                     record_row.values[VALUE_COL_STATUS] =
                         Value::Text(normalize_status(status.clone()));
@@ -706,21 +658,23 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
                 let subsidy = matched_refund_subsidy(
                     &by_order,
                     &by_reference,
-                    &by_invoice_no,
                     value_text(&record_row.values[VALUE_COL_ORDER_NO]),
                     value_text(&record_row.values[VALUE_COL_REFERENCE]),
-                    value_text(&record_row.values[VALUE_COL_INVOICE_NO]),
                 );
                 if subsidy.is_some() {
                     record_row.values[VALUE_COL_STATUS] = Value::Text("已回款".to_string());
                 }
-                // 未命中回款明细时，按“交易金额×15%”估算并封顶（第5.7节）；估算不改变
+                // 普通未命中回款明细时，按“交易金额×15%”估算并封顶（第5.7节）；估算不改变
                 // 状态，只补充补贴金额，避免与真正命中回款明细的“已回款”混淆。
                 let subsidy = subsidy.or_else(|| {
-                    estimate_subsidy(
-                        &record_row.values[VALUE_COL_TRANSACTION_AMOUNT],
-                        subsidy_cap,
-                    )
+                    if value_text(&record_row.values[VALUE_COL_STATUS]) == "审核终止" {
+                        None
+                    } else {
+                        estimate_subsidy(
+                            &record_row.values[VALUE_COL_TRANSACTION_AMOUNT],
+                            subsidy_cap,
+                        )
+                    }
                 });
                 record_row
                     .values
@@ -731,102 +685,14 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
         }
     }
 
+    let (mut rows, terminal): (Vec<_>, Vec<_>) = rows
+        .into_iter()
+        .partition(|row| value_text(&row.values[VALUE_COL_STATUS]) != "审核终止");
+    rows.extend(terminal);
     Ok(Table {
         columns: output_columns(config),
         rows,
     })
-}
-
-pub(crate) fn load_reference_lookup(
-    input_dir: &Path,
-    merchant_no: &str,
-) -> Result<HashMap<String, String>, ProcessError> {
-    let files = collect_merchant_files(input_dir, merchant_no)?;
-    if files.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut intermediate: HashMap<String, HashSet<String>> = HashMap::new();
-    for path in &files {
-        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
-        let sheets = open_sheets(path)?;
-        for sheet in &sheets {
-            let sheet_name = sheet.name().to_string();
-            let header = sheet.row_texts(2);
-            validate_front_header(&header).map_err(|detail| ProcessError::Structure {
-                file: file_name.clone(),
-                sheet: sheet_name.clone(),
-                detail,
-            })?;
-
-            let last_row = sheet.last_value_row().unwrap_or(2);
-            for row in 3..=last_row {
-                let merchant_cell = sheet.cell(row, COL_MERCHANT_NO);
-                let row_merchant_no = cell_text(&merchant_cell).map_err(|detail| {
-                    data_error(
-                        &file_name,
-                        &sheet_name,
-                        row,
-                        "商户号",
-                        merchant_cell.to_string(),
-                        detail,
-                    )
-                })?;
-                if row_merchant_no != merchant_no {
-                    return Err(data_error(
-                        &file_name,
-                        &sheet_name,
-                        row,
-                        "商户号",
-                        row_merchant_no,
-                        format!("与文件名商户号“{}”不一致", merchant_no),
-                    ));
-                }
-
-                let order_cell = sheet.cell(row, 4);
-                let order_no = cell_text(&order_cell).map_err(|detail| {
-                    data_error(
-                        &file_name,
-                        &sheet_name,
-                        row,
-                        "订单号",
-                        order_cell.to_string(),
-                        detail,
-                    )
-                })?;
-
-                let ref_cell = sheet.cell(row, 7);
-                let reference = cell_text(&ref_cell).map_err(|detail| {
-                    data_error(
-                        &file_name,
-                        &sheet_name,
-                        row,
-                        "检索参考号",
-                        ref_cell.to_string(),
-                        detail,
-                    )
-                })?;
-
-                let order_no_trimmed = order_no.trim();
-                let reference_trimmed = reference.trim();
-                if !order_no_trimmed.is_empty() && !reference_trimmed.is_empty() {
-                    intermediate
-                        .entry(order_no_trimmed.to_string())
-                        .or_default()
-                        .insert(reference_trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    let mut lookup = HashMap::new();
-    for (order_no, refs) in intermediate {
-        if refs.len() == 1 {
-            let ref_no = refs.into_iter().next().unwrap();
-            lookup.insert(order_no, ref_no);
-        }
-    }
-    Ok(lookup)
 }
 
 #[cfg(test)]
@@ -1100,6 +966,76 @@ mod tests {
     }
 
     #[test]
+    fn terminal_unpaid_rows_are_blank_and_stably_last_while_paid_rows_count_as_repaid() {
+        let dir = unique_temp_path("uploaded-terminal");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_refund_appliance_fixture(&dir, &[("REF-PAID", "PAID", "", "23.45")]);
+        let mut unpaid = appliance_row("U1", "89813015722APT1", "UNPAID");
+        unpaid[8] = "审核终止";
+        let mut paid = appliance_row("U2", "89813015722APT1", "PAID");
+        paid[8] = "审核终止";
+        let mut ordinary = appliance_row("U3", "89813015722APT1", "NORMAL");
+        ordinary[8] = "核销成功";
+        let mut unpaid2 = appliance_row("U4", "89813015722APT1", "UNPAID2");
+        unpaid2[8] = "审核终止";
+        write_workbook(
+            &dir.join("MER_89813015722APT1_test.xlsx"),
+            "家电",
+            &standard_headers(&APPLIANCE_TAIL),
+            &[unpaid, paid, ordinary, unpaid2],
+        );
+        let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(
+            table
+                .rows
+                .iter()
+                .map(|r| value_text(&r.values[3]))
+                .collect::<Vec<_>>(),
+            ["PAID", "NORMAL", "UNPAID", "UNPAID2"]
+        );
+        assert_eq!(table.rows[0].values[8], Value::Text("已回款".into()));
+        assert_eq!(
+            table.rows[0].values[58],
+            Value::Decimal("23.45".parse().unwrap())
+        );
+        assert_eq!(table.rows[1].values[8], Value::Text("待审核".into()));
+        for row in &table.rows[2..] {
+            assert_eq!(row.values[8], Value::Text("审核终止".into()));
+            assert_eq!(row.values[58], Value::Empty);
+            assert_eq!(row.fill, None);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_reference_amount_does_not_use_invoice_and_terminal_stays_blank() {
+        let dir = unique_temp_path("uploaded-reference-ambiguity");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_refund_appliance_fixture(
+            &dir,
+            &[
+                ("REF001", "ONE", "INV001", "10"),
+                ("REF001", "TWO", "INV002", "20"),
+            ],
+        );
+        let ordinary = appliance_row("U1", "89813015722APT1", "NOHIT");
+        let mut terminal = appliance_row("U2", "89813015722APT1", "NOHIT2");
+        terminal[8] = "审核终止";
+        write_workbook(
+            &dir.join("MER_89813015722APT1_test.xlsx"),
+            "家电",
+            &standard_headers(&APPLIANCE_TAIL),
+            &[terminal, ordinary],
+        );
+        let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows[0].values[8], Value::Text("已上传".into()));
+        assert_eq!(table.rows[0].values[58], Value::Decimal(Decimal::from(15)));
+        assert_eq!(table.rows[1].values[8], Value::Text("审核终止".into()));
+        assert_eq!(table.rows[1].values[58], Value::Empty);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn matches_filename_checks_merchant_prefix_and_extension() {
         assert!(matches_filename(
             "MER_89813014812B06R_20260914101809_yjhx.xlsx",
@@ -1237,7 +1173,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_merchant_mismatch_between_filename_and_row() {
+    fn preserves_merchant_mismatch_between_filename_and_row() {
         let dir = unique_temp_path("uploaded-merchant-mismatch");
         std::fs::create_dir_all(&dir).unwrap();
         write_refund_appliance_fixture(&dir, &[]);
@@ -1248,8 +1184,8 @@ mod tests {
             &[appliance_row("UUID-5", "89813014812B06R", "ORDER-5")],
         );
 
-        let error = UPLOADED_APPLIANCE.run(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Data { .. }));
+        let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1275,7 +1211,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_uuid_across_files() {
+    fn preserves_duplicate_uuid_across_files() {
         let dir = unique_temp_path("uploaded-duplicate-uuid");
         std::fs::create_dir_all(&dir).unwrap();
         write_refund_appliance_fixture(&dir, &[]);
@@ -1292,14 +1228,14 @@ mod tests {
             &[appliance_row("UUID-SAME", "89813015722APT1", "ORDER-9")],
         );
 
-        let error = UPLOADED_APPLIANCE.run(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Duplicate { .. }));
+        let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 2);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn rejects_whole_sheet_duplicate_export_across_files() {
+    fn preserves_whole_sheet_duplicate_export_across_files() {
         let dir = unique_temp_path("uploaded-duplicate-sheet");
         std::fs::create_dir_all(&dir).unwrap();
         write_refund_appliance_fixture(&dir, &[]);
@@ -1317,8 +1253,8 @@ mod tests {
             &rows,
         );
 
-        let error = UPLOADED_APPLIANCE.run(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Duplicate { .. }));
+        let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 2);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1574,10 +1510,10 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_invoice_no_when_order_no_and_reference_have_no_hit() {
+    fn does_not_use_invoice_no_for_refund_matching() {
         let dir = unique_temp_path("uploaded-refund-invoice-fallback");
         std::fs::create_dir_all(&dir).unwrap();
-        // 订单号和检索参考号均查无，须降级到发票号码（三键）；INV001 是固定写入的发票号码。
+        // 仅发票号命中时仍按未匹配处理。
         write_refund_appliance_fixture(
             &dir,
             &[("NOMATCH-REF", "NOMATCH-ORDER", "INV001", "56.70")],
@@ -1591,8 +1527,8 @@ mod tests {
 
         let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
         let values = &table.rows[0].values;
-        assert_eq!(values[VALUE_COL_STATUS], Value::Text("已回款".to_string()));
-        assert_eq!(values[58], Value::Decimal("56.70".parse().unwrap()));
+        assert_eq!(values[VALUE_COL_STATUS], Value::Text("已上传".to_string()));
+        assert_eq!(values[58], Value::Decimal("15.00".parse().unwrap()));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1627,12 +1563,10 @@ mod tests {
     }
 
     #[test]
-    fn ambiguous_order_no_match_stops_without_falling_through() {
+    fn uses_last_normal_refund_after_merchant_order_grouping() {
         let dir = unique_temp_path("uploaded-refund-ambiguous");
         std::fs::create_dir_all(&dir).unwrap();
-        // 两条回款明细各自的交易订单号不同（因此不属于同一回款内部重复分组、均保留在
-        // 正常区域），但商户订单号相同、补贴金额不同：对本任务的匹配索引而言构成歧义，
-        // 须立即判定未命中，不得降级到检索参考号（即使 REF001 本可命中第三条记录）。
+        // 同商户订单号先由回款任务归组，只有最后一条进入正常匹配区域。
         let mut workbook = Workbook::new();
         let sheet = workbook.add_worksheet();
         for (col, name) in REFUND_APPLIANCE_HEADER.iter().enumerate() {
@@ -1721,9 +1655,8 @@ mod tests {
 
         let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
         let values = &table.rows[0].values;
-        assert_eq!(values[VALUE_COL_STATUS], Value::Text("已上传".to_string())); // 状态保持原值
-        // 歧义按未命中处理，按“交易金额×15%”估算补贴金额；appliance_row 交易金额为 100.00 → 15.00。
-        assert_eq!(values[58], Value::Decimal("15.00".parse().unwrap()));
+        assert_eq!(values[VALUE_COL_STATUS], Value::Text("已回款".to_string()));
+        assert_eq!(values[58], Value::Decimal("2.00".parse().unwrap()));
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -1776,7 +1709,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_row_merchant_mismatch_with_config() {
+    fn preserves_row_merchant_mismatch_with_config() {
         let dir = unique_temp_path("uploaded-merchant-mismatch-row");
         std::fs::create_dir_all(&dir).unwrap();
         write_refund_digital_fixture(&dir, &[]);
@@ -1787,8 +1720,8 @@ mod tests {
             &[digital_row("UUID-1", "89813015722APT1", "ORDER-1")],
         );
 
-        let error = UPLOADED_DIGITAL.run(&dir).unwrap_err();
-        assert!(matches!(error, ProcessError::Data { .. }));
+        let table = UPLOADED_DIGITAL.run(&dir).unwrap();
+        assert_eq!(table.rows.len(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

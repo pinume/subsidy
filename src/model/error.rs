@@ -25,9 +25,6 @@ pub enum ProcessError {
         detail: String,
     },
 
-    #[error("疑似重复导出：{detail}")]
-    Duplicate { detail: String },
-
     #[error("读取失败：{0}")]
     Read(String),
 
