@@ -18,8 +18,8 @@ pub const STD_CATEGORIES: [(&str, &[&str]); 7] = [
         "洗衣机",
         &["博世", "小鸭", "海尔", "美的", "美菱", "西门子"],
     ),
-    ("冰箱", &["博世", "海尔", "美的", "美菱", "西门子"]),
-    ("彩电", &["TCL", "创维", "海信", "海尔"]),
+    ("冰箱", &["博世", "海信", "海尔", "美的", "美菱", "西门子"]),
+    ("彩电", &["TCL", "创维", "华为（终端）", "海信", "海尔"]),
     (
         "空调",
         &["TCL", "奥克斯", "格力", "海信", "海尔", "科龙", "美的"],
@@ -112,14 +112,14 @@ impl SummaryMetrics {
             )
         };
         [
-            // 发生额合计占比沿用报表固定值，零金额时也为 100%。
+            // 合计占比也遵循零分母为零的规则。
             (
                 self.occur.app_amt,
                 div_pct(self.occur.app_amt, total),
                 self.occur.dig_amt,
                 div_pct(self.occur.dig_amt, total),
                 total,
-                1.0,
+                div_pct(total, total),
             ),
             ratio(&self.paid, &self.occur),
             ratio(&combined, &self.occur),
@@ -380,7 +380,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn zero_amount_ratios_keep_fixed_occurrence_share_and_zero_other_rates() {
+    fn zero_amount_ratios_are_zero() {
         let zero = MetricRow::default();
         let metrics = SummaryMetrics {
             occur: zero,
@@ -391,17 +391,10 @@ mod tests {
             fail: zero,
             unup: zero,
         };
-        for (index, row) in metrics.amount_ratios().into_iter().enumerate() {
+        for row in metrics.amount_ratios() {
             assert_eq!(
                 row,
-                (
-                    Decimal::ZERO,
-                    0.0,
-                    Decimal::ZERO,
-                    0.0,
-                    Decimal::ZERO,
-                    if index == 0 { 1.0 } else { 0.0 },
-                )
+                (Decimal::ZERO, 0.0, Decimal::ZERO, 0.0, Decimal::ZERO, 0.0,)
             );
         }
     }

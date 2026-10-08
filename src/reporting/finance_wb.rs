@@ -7,6 +7,15 @@ use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
 use super::reader::{HeaderMap, UploadColumns, cell_to_string};
 use super::styles::StylePool;
 
+fn finance_upload_status(cell: &Data) -> String {
+    let status = cell_to_string(cell);
+    if status == "审核终止" {
+        "审核失败".into()
+    } else {
+        status
+    }
+}
+
 /// Generate Workbook 2: 26年国补门店财务统筹表.xlsx (4 Sheets)
 pub fn generate_store_finance_workbook(input_dir: &Path, output_path: &Path) -> Result<(), String> {
     let inputs = CommonInputs::load(input_dir)?;
@@ -22,7 +31,7 @@ pub(crate) fn generate_with_inputs(
     let styles = StylePool::default();
 
     // 1. Load source data
-    let store_occ_rows = SheetData::load(&input_dir.join("银联交易明细门店.xlsx"), false)?;
+    let store_occ_rows = SheetData::load(&input_dir.join("银联交易明细门店.xlsx"))?;
     let sales_rows = &inputs.sales;
     let app_upload_rows = &inputs.app_upload;
     let dig_upload_rows = &inputs.dig_upload;
@@ -157,7 +166,7 @@ fn build_final_match_sheet(
                 upload_map.insert(
                     r_no,
                     (
-                        cell_to_string(&row[cols.status]),
+                        finance_upload_status(&row[cols.status]),
                         cell_to_string(&row[cols.invoice]),
                     ),
                 );
@@ -545,9 +554,14 @@ fn build_store_upload_sheet(
             ws.set_row_height(*cur_row, 22.0)
                 .map_err(|e| e.to_string())?;
             for (col, column) in col_map.iter().enumerate() {
-                column
-                    .kind
-                    .write(ws, s, *cur_row, col as u16, column.cell(row))?;
+                if col_defs[col].0 == "状态" {
+                    let status = Data::String(finance_upload_status(column.cell(row)));
+                    column.kind.write(ws, s, *cur_row, col as u16, &status)?;
+                } else {
+                    column
+                        .kind
+                        .write(ws, s, *cur_row, col as u16, column.cell(row))?;
+                }
             }
             *cur_row += 1;
         }
@@ -564,6 +578,63 @@ fn build_store_upload_sheet(
 mod tests {
     use super::*;
     use calamine::{Reader, open_workbook_auto};
+
+    #[test]
+    fn finance_keeps_terminal_status_as_failed_without_mutating_shared_inputs() {
+        use crate::jobs::uploaded;
+        let root = finance_fixture("finance-terminal-status");
+        let headers: Vec<_> = uploaded::FRONT_HEADERS
+            .iter()
+            .copied()
+            .chain(
+                uploaded::APPLIANCE_TAIL
+                    .iter()
+                    .map(|field| field.synonyms[0]),
+            )
+            .chain(["补贴金额"])
+            .collect();
+        write_fixture(
+            &root,
+            "已上传家电电脑.xlsx",
+            &headers,
+            &[&[
+                ("商户号", "89813015722APT1"),
+                ("状态", "审核终止"),
+                ("检索参考号", "N123"),
+            ]],
+        );
+        write_fixture(
+            &root,
+            "银联交易明细门店.xlsx",
+            &crate::jobs::unionpay::HEADERS,
+            &[&[("检索号", "N123")]],
+        );
+        let inputs = CommonInputs::load(&root).unwrap();
+        let path = root.join("finance.xlsx");
+        generate_with_inputs(&root, &path, &inputs).unwrap();
+        let mut book = open_workbook_auto(&path).unwrap();
+        let first = book.sheet_names()[0].clone();
+        let final_rows = book.worksheet_range(&first).unwrap();
+        assert_eq!(
+            cell_to_string(final_rows.get_value((1, 24)).unwrap()),
+            "审核失败"
+        );
+        let name = book.sheet_names()[3].clone();
+        let range = book.worksheet_range(&name).unwrap();
+        let rows: Vec<_> = range.rows().collect();
+        let header = HeaderMap::from_header_row(rows[0]);
+        assert_eq!(
+            cell_to_string(&rows[1][header.require("状态", "output").unwrap()]),
+            "审核失败"
+        );
+        assert_eq!(
+            cell_to_string(
+                &inputs.app_upload[1][inputs.app_upload.header.require("状态", "input").unwrap()]
+            ),
+            "审核终止"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn finance_fixture(label: &str) -> std::path::PathBuf {
         use crate::jobs::{refund::OUTPUT_FIELDS, unionpay::HEADERS, uploaded};

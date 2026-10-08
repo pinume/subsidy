@@ -1,4 +1,4 @@
-use super::reader::{HeaderMap, cell_to_string, extract_unique_merchant_code, read_sheet_rows};
+use super::reader::{HeaderMap, extract_unique_merchant_code, read_sheet_rows};
 use calamine::Data;
 use std::ops::Deref;
 use std::path::Path;
@@ -92,19 +92,8 @@ impl SheetData {
         let header = HeaderMap::from_header_row(&rows[0]);
         Self { rows, header }
     }
-    pub fn load(path: &Path, uploaded: bool) -> Result<Self, String> {
-        let mut sheet = Self::new(read_sheet_rows(path)?);
-        if uploaded {
-            let status = sheet.header.require("状态", &path.display().to_string())?;
-            for row in sheet.rows.iter_mut().skip(1) {
-                if let Some(cell) = row.get_mut(status)
-                    && cell_to_string(cell) == "审核终止"
-                {
-                    *cell = Data::String("审核失败".into());
-                }
-            }
-        }
-        Ok(sheet)
+    pub fn load(path: &Path) -> Result<Self, String> {
+        Ok(Self::new(read_sheet_rows(path)?))
     }
 }
 
@@ -128,12 +117,12 @@ pub(crate) struct CommonInputs {
 
 impl CommonInputs {
     pub fn load(input: &Path) -> Result<Self, String> {
-        let sales = SheetData::load(&input.join("销售用券情况统计.xlsx"), false)?;
-        let app_upload = SheetData::load(&input.join("已上传家电电脑.xlsx"), true)?;
-        let dig_upload = SheetData::load(&input.join("已上传数码.xlsx"), true)?;
-        let invoices = SheetData::load(&input.join("发票明细.xlsx"), false)?;
-        let app_refund = SheetData::load(&input.join("回款明细家电电脑.xlsx"), false)?;
-        let dig_refund = SheetData::load(&input.join("回款明细数码.xlsx"), false)?;
+        let sales = SheetData::load(&input.join("销售用券情况统计.xlsx"))?;
+        let app_upload = SheetData::load(&input.join("已上传家电电脑.xlsx"))?;
+        let dig_upload = SheetData::load(&input.join("已上传数码.xlsx"))?;
+        let invoices = SheetData::load(&input.join("发票明细.xlsx"))?;
+        let app_refund = SheetData::load(&input.join("回款明细家电电脑.xlsx"))?;
+        let dig_refund = SheetData::load(&input.join("回款明细数码.xlsx"))?;
         let app_store_code =
             extract_unique_merchant_code(&app_upload, &app_upload.header, "已上传家电电脑.xlsx")?;
         let dig_store_code =
@@ -158,7 +147,7 @@ mod tests {
     use std::cell::OnceCell;
 
     #[test]
-    fn shared_inputs_are_loaded_once_and_normalize_uploads_without_changing_sources() {
+    fn shared_inputs_are_loaded_once_and_preserve_upload_statuses() {
         let root = unique_temp_path("shared-reports");
         std::fs::create_dir(&root).unwrap();
         for name in [
@@ -183,7 +172,7 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(inputs.app_store_code, "001");
-        assert_eq!(inputs.app_upload[1][1], "审核失败");
+        assert_eq!(inputs.app_upload[1][1], "审核终止");
         assert_eq!(
             read_sheet_rows(&root.join("已上传家电电脑.xlsx")).unwrap()[1][1],
             "审核终止"

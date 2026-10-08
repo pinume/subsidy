@@ -39,11 +39,6 @@ pub(crate) fn take_read_paths() -> Vec<std::path::PathBuf> {
     READ_PATHS.with(|paths| std::mem::take(&mut *paths.borrow_mut()))
 }
 
-#[cfg(test)]
-pub fn read_upload_rows(path: &Path) -> Result<Vec<Vec<Data>>, String> {
-    super::data::SheetData::load(path, true).map(|sheet| sheet.to_vec())
-}
-
 /// Dynamic header mapper for finding columns by name or alias.
 #[derive(Debug, Clone)]
 pub struct HeaderMap {

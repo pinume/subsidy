@@ -13,7 +13,7 @@ use super::styles::StylePool;
 
 use super::data::{CommonInputs, ReportColumn, SheetData};
 #[cfg(test)]
-use super::reader::{read_sheet_rows, read_upload_rows};
+use super::reader::read_sheet_rows;
 use super::summary_data::{
     AnomalyColors, MetricRow, STD_CATEGORIES, SalesMatrix, SummaryMetrics, SummaryRecords,
     build_invoice_name_map, build_sales_matrix,
@@ -317,7 +317,7 @@ fn build_summary_sheet(wb: &mut Workbook, s: &StylePool, m: &SummaryMetrics) -> 
     let notes = [
         "1. 国补发生额及发生数量取自《销售用券情况统计.xlsx》；数量按“数量”字段净额统计，包含退货负数冲减。",
         "2. “财务大类=数码”计入数码，其余财务大类计入家电电脑。",
-        "3. 已回款、审核通过未回款、待审核、审核失败取自两份“已上传”明细；金额汇总“补贴金额”，数量按明细记录数；审核失败包含审核终止。",
+        "3. 已回款、审核通过未回款、待审核、审核失败取自两份“已上传”明细；金额汇总“补贴金额”，数量按明细记录数；审核终止不计入上述金额、笔数及失败明细。",
         "4. 未回款=国补发生额-国补回款额；未上传=未回款-审核通过未回款-待审核-审核失败。",
         "5. 回款率=国补回款额/国补发生额；综合回款率=(国补回款额+审核通过未回款额)/国补发生额。",
     ];
@@ -952,20 +952,62 @@ mod status_tests {
                 sheet
                     .write_string(1, merchant as u16, "89813015722APT1")
                     .unwrap();
-                sheet.write_string(1, status as u16, "待审核").unwrap();
+                sheet.write_string(1, status as u16, "审核终止").unwrap();
+            }
+            if name == "销售用券情况统计.xlsx" {
+                for (index, (category, brand)) in [
+                    ("冰箱", "海尔"),
+                    ("冰箱", "海信"),
+                    ("冰箱", "博世"),
+                    ("彩电", "海信"),
+                    ("彩电", "华为（终端）"),
+                    ("彩电", "创维"),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let row = index as u32 + 1;
+                    sheet.write_string(row, 0, category).unwrap();
+                    sheet.write_string(row, 1, brand).unwrap();
+                    sheet.write_number(row, 2, 0.0).unwrap();
+                    sheet.write_number(row, 3, 0.0).unwrap();
+                    sheet.write_string(row, 4, "未上传").unwrap();
+                }
             }
             book.save(input.join(name)).unwrap();
         }
         let path = output.join("summary.xlsx");
         generate_summary_workbook(&input, &path).unwrap();
-        assert_eq!(open_workbook_auto(&path).unwrap().sheet_names().len(), 5);
+        let mut book = open_workbook_auto(&path).unwrap();
+        assert_eq!(book.sheet_names().len(), 5);
+        let summary = book.worksheet_range("汇总").unwrap();
+        assert_eq!(summary.get_value((18, 6)), Some(&Data::Float(0.0)));
+        assert_eq!(summary.get_value((12, 2)), Some(&Data::Float(0.0)));
+        assert_eq!(summary.get_value((12, 4)), Some(&Data::Float(0.0)));
+        let failed = book.worksheet_range("审核失败明细").unwrap();
+        assert!(
+            !failed
+                .rows()
+                .flatten()
+                .any(|cell| cell_to_string(cell) == "审核终止")
+        );
+        let brands = book.worksheet_range("品类品牌汇总").unwrap();
+        let names: Vec<_> = brands
+            .rows()
+            .skip(5)
+            .map(|row| cell_to_string(&row[1]))
+            .collect();
+        assert_eq!(
+            names,
+            ["博世", "海信", "海尔", "创维", "华为（终端）", "海信"]
+        );
         assert!(!path.with_extension("md").exists());
         assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn terminated_uploads_are_failed_in_metrics_and_records() {
+    fn terminated_uploads_are_excluded_from_metrics_and_failure_records() {
         let root = std::env::temp_dir().join(format!("subsidy-status-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let source = root.join("uploads.xlsx");
@@ -1007,8 +1049,8 @@ mod status_tests {
         }
         wb.save(&source).unwrap();
         let original = std::fs::read(&source).unwrap();
-        let uploads = SheetData::new(read_upload_rows(&source).unwrap());
-        assert_eq!(cell_to_string(&uploads[1][2]), "审核失败");
+        let uploads = SheetData::load(&source).unwrap();
+        assert_eq!(cell_to_string(&uploads[1][2]), "审核终止");
         assert_eq!(cell_to_string(&uploads[1][0]), "审核终止");
         assert_eq!(cell_to_string(&uploads[3][2]), "已回款");
         assert_eq!(cell_to_string(&uploads[4][2]), "");
@@ -1022,12 +1064,12 @@ mod status_tests {
         ];
         let metrics =
             SummaryMetrics::calculate(&SheetData::new(sales), &uploads, &uploads).unwrap();
-        assert_eq!(metrics.fail.app_amt, Decimal::new(3055, 2));
-        assert_eq!(metrics.fail.app_cnt, 2);
-        assert_eq!(metrics.fail.dig_amt, Decimal::new(3055, 2));
-        assert_eq!(metrics.fail.dig_cnt, 2);
-        assert_eq!(metrics.unup.app_amt, Decimal::new(6445, 2));
-        assert_eq!(metrics.unup.app_cnt, 2);
+        assert_eq!(metrics.fail.app_amt, Decimal::new(1000, 2));
+        assert_eq!(metrics.fail.app_cnt, 1);
+        assert_eq!(metrics.fail.dig_amt, Decimal::new(1000, 2));
+        assert_eq!(metrics.fail.dig_cnt, 1);
+        assert_eq!(metrics.unup.app_amt, Decimal::new(8500, 2));
+        assert_eq!(metrics.unup.app_cnt, 3);
         let mut failures = Workbook::new();
         build_failed_records_sheet(
             &mut failures,
@@ -1054,7 +1096,7 @@ mod status_tests {
             })
             .map(|row| cell_to_string(&row[1]))
             .collect();
-        assert_eq!(refs, ["ref-0", "ref-1", "ref-0", "ref-1"]);
+        assert_eq!(refs, ["ref-1", "ref-1"]);
         assert_eq!(std::fs::read(&source).unwrap(), original);
         assert_eq!(
             cell_to_string(&read_sheet_rows(&source).unwrap()[1][2]),
