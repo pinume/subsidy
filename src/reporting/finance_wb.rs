@@ -7,15 +7,6 @@ use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
 use super::reader::{HeaderMap, UploadColumns, cell_to_string};
 use super::styles::StylePool;
 
-fn finance_upload_status(cell: &Data) -> String {
-    let status = cell_to_string(cell);
-    if status == "审核终止" {
-        "审核失败".into()
-    } else {
-        status
-    }
-}
-
 /// Generate Workbook 2: 26年国补门店财务统筹表.xlsx (4 Sheets)
 pub fn generate_store_finance_workbook(input_dir: &Path, output_path: &Path) -> Result<(), String> {
     let inputs = CommonInputs::load(input_dir)?;
@@ -166,7 +157,7 @@ fn build_final_match_sheet(
                 upload_map.insert(
                     r_no,
                     (
-                        finance_upload_status(&row[cols.status]),
+                        cell_to_string(&row[cols.status]),
                         cell_to_string(&row[cols.invoice]),
                     ),
                 );
@@ -265,8 +256,6 @@ fn build_final_match_sheet(
         } else if let Some((inv_type, inv_status)) = invoice_map.get(invoice_no) {
             if inv_type == "红票" || inv_status == "已红冲" {
                 "是"
-            } else if inv_type == "蓝票" && inv_status == "开票完成" {
-                "否"
             } else {
                 ""
             }
@@ -554,14 +543,9 @@ fn build_store_upload_sheet(
             ws.set_row_height(*cur_row, 22.0)
                 .map_err(|e| e.to_string())?;
             for (col, column) in col_map.iter().enumerate() {
-                if col_defs[col].0 == "状态" {
-                    let status = Data::String(finance_upload_status(column.cell(row)));
-                    column.kind.write(ws, s, *cur_row, col as u16, &status)?;
-                } else {
-                    column
-                        .kind
-                        .write(ws, s, *cur_row, col as u16, column.cell(row))?;
-                }
+                column
+                    .kind
+                    .write(ws, s, *cur_row, col as u16, column.cell(row))?;
             }
             *cur_row += 1;
         }
@@ -580,7 +564,7 @@ mod tests {
     use calamine::{Reader, open_workbook_auto};
 
     #[test]
-    fn finance_keeps_terminal_status_as_failed_without_mutating_shared_inputs() {
+    fn finance_preserves_terminal_status_without_mutating_shared_inputs() {
         use crate::jobs::uploaded;
         let root = finance_fixture("finance-terminal-status");
         let headers: Vec<_> = uploaded::FRONT_HEADERS
@@ -617,7 +601,7 @@ mod tests {
         let final_rows = book.worksheet_range(&first).unwrap();
         assert_eq!(
             cell_to_string(final_rows.get_value((1, 24)).unwrap()),
-            "审核失败"
+            "审核终止"
         );
         let name = book.sheet_names()[3].clone();
         let range = book.worksheet_range(&name).unwrap();
@@ -625,7 +609,7 @@ mod tests {
         let header = HeaderMap::from_header_row(rows[0]);
         assert_eq!(
             cell_to_string(&rows[1][header.require("状态", "output").unwrap()]),
-            "审核失败"
+            "审核终止"
         );
         assert_eq!(
             cell_to_string(
@@ -633,6 +617,179 @@ mod tests {
             ),
             "审核终止"
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn finance_invoice_flags_and_return_status_follow_confirmed_rules() {
+        use crate::jobs::{unionpay, uploaded};
+        let root = finance_fixture("finance-confirmed-states");
+        let app_headers: Vec<_> = uploaded::FRONT_HEADERS
+            .iter()
+            .copied()
+            .chain(
+                uploaded::APPLIANCE_TAIL
+                    .iter()
+                    .map(|field| field.synonyms[0]),
+            )
+            .chain(["补贴金额"])
+            .collect();
+        write_fixture(
+            &root,
+            "已上传家电电脑.xlsx",
+            &app_headers,
+            &[
+                &[
+                    ("商户号", "001"),
+                    ("检索参考号", "A"),
+                    ("状态", "审核终止"),
+                    ("发票号码", "blue"),
+                ],
+                &[
+                    ("商户号", "001"),
+                    ("检索参考号", "B"),
+                    ("状态", "已回款"),
+                    ("发票号码", "red"),
+                ],
+                &[
+                    ("商户号", "001"),
+                    ("检索参考号", "C"),
+                    ("状态", "待审核"),
+                    ("发票号码", "flushed"),
+                ],
+                &[
+                    ("商户号", "001"),
+                    ("检索参考号", "D"),
+                    ("状态", "审核失败"),
+                    ("发票号码", "failed"),
+                ],
+                &[
+                    ("商户号", "001"),
+                    ("检索参考号", "E"),
+                    ("状态", "审核终止"),
+                    ("发票号码", "missing"),
+                ],
+                &[("商户号", "001"), ("检索参考号", "F"), ("状态", "审核终止")],
+            ],
+        );
+        let dig_headers: Vec<_> = uploaded::FRONT_HEADERS
+            .iter()
+            .copied()
+            .chain(uploaded::DIGITAL_TAIL.iter().map(|field| field.synonyms[0]))
+            .chain(["补贴金额"])
+            .collect();
+        write_fixture(
+            &root,
+            "已上传数码.xlsx",
+            &dig_headers,
+            &[&[
+                ("商户号", "002"),
+                ("检索参考号", "G"),
+                ("状态", "审核终止"),
+                ("发票号码", "blue"),
+            ]],
+        );
+        write_fixture(
+            &root,
+            "银联交易明细门店.xlsx",
+            &unionpay::HEADERS,
+            &[
+                &[("检索号", "A")],
+                &[("检索号", "B")],
+                &[("检索号", "C")],
+                &[("检索号", "D")],
+                &[("检索号", "E"), ("备注", "已退货")],
+                &[("检索号", "F")],
+                &[("检索号", "G")],
+                &[("检索号", "H")],
+            ],
+        );
+        write_fixture(
+            &root,
+            "发票明细.xlsx",
+            &["数电发票号码", "匹配单据号", "开票类型", "开票状态"],
+            &[
+                &[
+                    ("数电发票号码", "blue"),
+                    ("开票类型", "蓝票"),
+                    ("开票状态", "开票完成"),
+                ],
+                &[
+                    ("数电发票号码", "red"),
+                    ("开票类型", "红票"),
+                    ("开票状态", "开票完成"),
+                ],
+                &[
+                    ("数电发票号码", "flushed"),
+                    ("开票类型", "蓝票"),
+                    ("开票状态", "已红冲"),
+                ],
+                &[
+                    ("数电发票号码", "failed"),
+                    ("开票类型", "蓝票"),
+                    ("开票状态", "开票失败"),
+                ],
+            ],
+        );
+        write_fixture(
+            &root,
+            "销售用券情况统计.xlsx",
+            &["匹配单据号", "数电发票号码", "财务大类", "品牌", "商品名称"],
+            &[],
+        );
+        let source = root.join("已上传家电电脑.xlsx");
+        let original = std::fs::read(&source).unwrap();
+        let path = root.join("finance.xlsx");
+        generate_store_finance_workbook(&root, &path).unwrap();
+        let mut book = open_workbook_auto(&path).unwrap();
+        let names = book.sheet_names();
+        let final_rows = book.worksheet_range(&names[0]).unwrap();
+        assert_eq!(final_rows.height(), 9);
+        for (index, (status, flag)) in [
+            ("审核终止", ""),
+            ("已回款", "是"),
+            ("待审核", "是"),
+            ("审核失败", ""),
+            ("已退货", ""),
+            ("审核终止", ""),
+            ("审核终止", ""),
+            ("未提交", ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = index as u32 + 1;
+            assert_eq!(
+                cell_to_string(final_rows.get_value((row, 24)).unwrap()),
+                status
+            );
+            assert_eq!(
+                final_rows
+                    .get_value((row, 26))
+                    .map(cell_to_string)
+                    .unwrap_or_default(),
+                flag
+            );
+        }
+        let uploads = book.worksheet_range(&names[3]).unwrap();
+        let states: Vec<_> = uploads
+            .rows()
+            .skip(1)
+            .map(|row| cell_to_string(&row[8]))
+            .collect();
+        assert_eq!(
+            states,
+            [
+                "审核终止",
+                "已回款",
+                "待审核",
+                "审核失败",
+                "审核终止",
+                "审核终止",
+                "审核终止"
+            ]
+        );
+        assert_eq!(std::fs::read(source).unwrap(), original);
         std::fs::remove_dir_all(root).unwrap();
     }
 
