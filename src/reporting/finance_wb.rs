@@ -1,10 +1,10 @@
 use calamine::Data;
 use rust_xlsxwriter::{Workbook, Worksheet};
-use std::collections::HashMap;
 use std::path::Path;
 
 use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
-use super::reader::{HeaderMap, UploadColumns, cell_to_string};
+use super::reader::{HeaderMap, cell_to_string};
+use super::reconciler::TransactionReconciler;
 use super::styles::StylePool;
 
 /// Generate Workbook 2: 26年国补门店财务统筹表.xlsx (4 Sheets)
@@ -132,64 +132,10 @@ fn build_final_match_sheet(
             .map_err(|e| e.to_string())?;
     }
 
-    // 1. Index the unique sales record by its document number.
-    let sales_h = &sales.header;
-    let sales_doc_idx = sales_h.require("匹配单据号", "销售用券情况统计.xlsx")?;
-    let sales_cat_idx = sales_h.require("财务大类", "销售用券情况统计.xlsx")?;
-    let sales_brand_idx = sales_h.require("品牌", "销售用券情况统计.xlsx")?;
-    let sales_name_idx = sales_h.require("商品名称", "销售用券情况统计.xlsx")?;
-    let mut product_map = HashMap::new();
-    for row in &sales[1..] {
-        let document = cell_to_string(&row[sales_doc_idx]);
-        if !document.is_empty() {
-            product_map.insert(document, row);
-        }
-    }
+    // 1. Initialize TransactionReconciler to index products, uploads, and invoices
+    let reconciler = TransactionReconciler::from_inputs(sales, app_up, dig_up, invoices)?;
 
-    // 2. Build Index for 门店上传明细 (appliance + digital)
-    let mut upload_map: HashMap<String, (String, String)> = HashMap::new();
-    for (rows, label) in [(app_up, "已上传家电电脑.xlsx"), (dig_up, "已上传数码.xlsx")]
-    {
-        let cols = UploadColumns::from_header(&rows.header, label)?;
-        for row in &rows[1..] {
-            let r_no = cell_to_string(&row[cols.reference]);
-            if !r_no.is_empty() {
-                upload_map.insert(
-                    r_no,
-                    (
-                        cell_to_string(&row[cols.status]),
-                        cell_to_string(&row[cols.invoice]),
-                    ),
-                );
-            }
-        }
-    }
-
-    // 3. Build Index for 发票明细
-    let inv_h = &invoices.header;
-    let inv_no_idx = inv_h
-        .find(&["数电发票号码"])
-        .ok_or("发票明细缺少数电发票号码")?;
-    let inv_type_idx = inv_h.find(&["开票类型"]).ok_or("发票明细缺少开票类型")?;
-    let inv_st_idx = inv_h.find(&["开票状态"]).ok_or("发票明细缺少开票状态")?;
-
-    let inv_doc_idx = inv_h.require("匹配单据号", "发票明细.xlsx")?;
-    let mut invoice_map = HashMap::new();
-    for row in &invoices[1..] {
-        let no = cell_to_string(&row[inv_no_idx]);
-        if !no.is_empty() {
-            invoice_map.insert(
-                no,
-                (
-                    cell_to_string(&row[inv_type_idx]),
-                    cell_to_string(&row[inv_st_idx]),
-                    cell_to_string(&row[inv_doc_idx]),
-                ),
-            );
-        }
-    }
-
-    // 4. Pre-resolve store occurrence column mappings for final match
+    // 2. Pre-resolve store occurrence column mappings for final match
     let store_h = &store_occ.header;
     let s_ref_idx = store_h.find(&["检索号"]).ok_or("门店发生表缺少检索号")?;
     let s_rem_idx = store_h.find(&["备注"]).ok_or("门店发生表缺少备注")?;
@@ -214,59 +160,27 @@ fn build_final_match_sheet(
         }
 
         let ref_num = cell_to_string(&row[s_ref_idx]);
-        let up_info = upload_map.get(&ref_num);
-        let invoice_no = match up_info {
-            Some((_, inv)) if !inv.is_empty() => inv.as_str(),
-            _ => "",
-        };
+        let remark = cell_to_string(&row[s_rem_idx]);
+        let rec = reconciler.reconcile(&ref_num, &remark);
 
         // Col 21, 22, 23: bridge the final invoice to the sales document number.
-        let invoice_info = invoice_map.get(invoice_no);
-        let product = invoice_info.and_then(|(_, _, document)| product_map.get(document));
-        let (cat, brand, model) = match product {
-            Some(r) => (
-                cell_to_string(&r[sales_cat_idx]),
-                cell_to_string(&r[sales_brand_idx]),
-                cell_to_string(&r[sales_name_idx]),
-            ),
-            None => (String::new(), String::new(), String::new()),
-        };
-        ws.write_string_with_format(cur_row, 21, cat, &s.text_center)
+        ws.write_string_with_format(cur_row, 21, rec.category(), &s.text_center)
             .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 22, brand, &s.text_left)
+        ws.write_string_with_format(cur_row, 22, rec.brand(), &s.text_left)
             .map_err(|e| e.to_string())?;
-        ws.write_string_with_format(cur_row, 23, model, &s.text_left)
+        ws.write_string_with_format(cur_row, 23, rec.model(), &s.text_left)
             .map_err(|e| e.to_string())?;
 
         // Col 24: 状态
-        let remark = cell_to_string(&row[s_rem_idx]);
-        let status = if remark == "已退货" {
-            "已退货"
-        } else if let Some((st, _)) = up_info {
-            st.as_str()
-        } else {
-            "未提交"
-        };
-        ws.write_string_with_format(cur_row, 24, status, &s.text_center)
+        ws.write_string_with_format(cur_row, 24, rec.status, &s.text_center)
             .map_err(|e| e.to_string())?;
 
         // Col 25: 发票号
-        ws.write_string_with_format(cur_row, 25, invoice_no, &s.text_left)
+        ws.write_string_with_format(cur_row, 25, rec.invoice_no, &s.text_left)
             .map_err(|e| e.to_string())?;
 
         // Col 26: 发票是否红冲
-        let red_flush = if invoice_no.is_empty() {
-            ""
-        } else if let Some((inv_type, inv_status, _)) = invoice_info {
-            if inv_type == "红票" || inv_status == "已红冲" {
-                "是"
-            } else {
-                ""
-            }
-        } else {
-            ""
-        };
-        ws.write_string_with_format(cur_row, 26, red_flush, &s.text_center)
+        ws.write_string_with_format(cur_row, 26, rec.red_flush_text(), &s.text_center)
             .map_err(|e| e.to_string())?;
     }
 
