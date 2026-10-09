@@ -13,8 +13,8 @@ use crate::utils::{numbers, text};
 
 use super::uploaded;
 use super::{
-    Category, Job, MatchStats, MultiValueIndex, PriorityOutcome, ScopedCache, build_match_doc_no,
-    cell_text, data_error, parse_date_field, resolve, resolve_via, text_value,
+    Category, Job, MatchStats, MultiValueIndex, PipelineContext, PriorityOutcome,
+    build_match_doc_no, cell_text, data_error, parse_date_field, resolve, resolve_via, text_value,
 };
 #[cfg(test)]
 use std::rc::Rc;
@@ -98,7 +98,11 @@ impl Job for CouponsJob {
         "销售用券情况统计"
     }
 
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError> {
         // 10.1 节：先校验本任务自身输入文件的结构，再进入依赖外部数据源的字段生成步骤，
         // 确保输入文件本身的问题不会被外部依赖缺失的错误提示掩盖。
         let path = input_dir.join(FILE_NAME);
@@ -149,17 +153,19 @@ impl Job for CouponsJob {
 
         // 10.6.1：权威校验集缺失、结构异常或无法完整读取时必须停止，不得绕过校验；
         // 直接复用 unionpay::load_records 的全部校验（文件发现、表头、首尾结构）。
-        let authority = ScopedCache::authority(input_dir)?;
+        let authority = ctx.authority(input_dir)?;
         // 数电发票号码：缺失或结构异常时同样必须停止，直接复用 invoice::load_records
         // 的全部校验（最新文件选择、表头、逐行解析）。
-        let invoice_index = ScopedCache::invoice_index(input_dir)?;
+        let invoice_index = ctx.invoice_index(input_dir)?;
         // 备注：缺失或结构异常时同样必须停止，直接复用 receipts::load_records 的全部
         // 校验（表头、末行合计结构）及其已算好的第 9.5 节三阶段备注。
-        let receipts_index = ScopedCache::receipts_index(input_dir)?;
+        let receipts_index = ctx.receipts_index(input_dir)?;
         // 备注兜底：缺失或结构异常时同样必须停止，直接复用已上传家电电脑/已上传数码
         // 两个 Job 各自的全部校验（文件发现、表头、第26列起字段解析）。
-        let appliance = uploaded::status_indices(input_dir, &uploaded::UPLOADED_APPLIANCE)?;
-        let digital = uploaded::status_indices(input_dir, &uploaded::UPLOADED_DIGITAL)?;
+        let appliance =
+            uploaded::status_indices_in_context(input_dir, &uploaded::UPLOADED_APPLIANCE, ctx)?;
+        let digital =
+            uploaded::status_indices_in_context(input_dir, &uploaded::UPLOADED_DIGITAL, ctx)?;
 
         let mut stats = MatchStats::default();
         let mut rows = Vec::new();
@@ -189,7 +195,7 @@ impl Job for CouponsJob {
         top.extend(bottom);
 
         assert_eq!(stats.hits.iter().sum::<usize>(), top.len());
-        ScopedCache::record_stats(stats);
+        ctx.record_stats(stats);
         Ok(Table {
             columns: output_columns(),
             rows: top,
@@ -470,7 +476,7 @@ mod tests {
     use rust_xlsxwriter::Workbook;
 
     use super::*;
-    use crate::jobs::{invoice, receipts, refund, unionpay, uploaded};
+    use crate::jobs::{ScopedCache, invoice, receipts, refund, unionpay, uploaded};
 
     const MERCHANT_DIGITAL: &str = "89813014812B06R";
     const MERCHANT_APPLIANCE: &str = "89813015722APT1";

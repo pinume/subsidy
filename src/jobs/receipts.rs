@@ -5,7 +5,8 @@ use crate::io::xlsx_reader::{SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, build_match_doc_no, cell_text, data_error, parse_date_field, text_value,
+    Category, Job, PipelineContext, build_match_doc_no, cell_text, data_error, parse_date_field,
+    text_value,
 };
 
 const FILE_NAME: &str = "收款单统计.xlsx";
@@ -107,8 +108,13 @@ impl Job for ReceiptsJob {
         "收款单统计"
     }
 
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError> {
         let records = load_records(input_dir)?;
+        ctx.store_receipts(&records);
         let rows = records.into_iter().map(to_row).collect();
         Ok(Table {
             columns: output_columns(),
@@ -164,7 +170,6 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<ReceiptRecord>, Proce
 
     compute_remarks(&mut records);
 
-    super::ScopedCache::store_receipts(&records);
     Ok(records)
 }
 

@@ -9,8 +9,8 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, MultiValueIndex, amount_value, cell_amount, cell_text, data_error,
-    pick_unique_latest, resolve_synonym_column, text_value,
+    Category, Job, MultiValueIndex, PipelineContext, amount_value, cell_amount, cell_text,
+    data_error, pick_unique_latest, resolve_synonym_column, text_value,
 };
 
 pub(crate) const OUTPUT_FIELDS: [&str; 24] = [
@@ -188,12 +188,16 @@ impl Job for RefundJob {
         self.0.output_stem
     }
 
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
-        if let Some(cached) = super::ScopedCache::get(self.0.category) {
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError> {
+        if let Some(cached) = ctx.get_table(self.0.category) {
             return Ok(cached);
         }
         let table = run_refund(self.0, input_dir)?;
-        super::ScopedCache::put(self.0.category, &table);
+        ctx.store_table(self.0.category, table.clone());
         Ok(table)
     }
 }

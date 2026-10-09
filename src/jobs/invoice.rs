@@ -9,7 +9,8 @@ use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
 use crate::utils::{dates, doc_no};
 
 use super::{
-    Category, Job, cell_text, data_error, parse_datetime_field, pick_unique_latest, text_value,
+    Category, Job, PipelineContext, cell_text, data_error, parse_datetime_field,
+    pick_unique_latest, text_value,
 };
 
 pub(crate) const SOURCE_HEADERS: [&str; 30] = [
@@ -133,8 +134,13 @@ impl Job for InvoiceJob {
         "发票明细"
     }
 
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError> {
         let records = load_records(input_dir)?;
+        ctx.store_invoices(&records);
         Ok(classify_and_build_table(records))
     }
 }
@@ -211,7 +217,6 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
         });
     }
 
-    super::ScopedCache::store_invoices(&records);
     Ok(records)
 }
 

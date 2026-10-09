@@ -10,8 +10,9 @@ use crate::model::{Column, ColumnType, DecimalScale, ProcessError, Row, Table, V
 
 use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL, subsidy_indices};
 use super::{
-    Category, Job, MultiValueIndex, PriorityOutcome, amount_value, cell_amount, cell_date_or_text,
-    cell_datetime_or_text, cell_text, data_error, resolve_synonym_column, resolve_via, text_value,
+    Category, Job, MultiValueIndex, PipelineContext, PriorityOutcome, amount_value, cell_amount,
+    cell_date_or_text, cell_datetime_or_text, cell_text, data_error, resolve_synonym_column,
+    resolve_via, text_value,
 };
 
 /// 前25列两组数据组结构完全相同，按固定列位置读取。
@@ -342,12 +343,16 @@ impl Job for UploadedJob {
         self.0.output_stem
     }
 
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
-        if let Some(cached) = super::ScopedCache::get(self.0.category) {
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError> {
+        if let Some(cached) = ctx.get_table(self.0.category) {
             return Ok(cached);
         }
-        let table = run_uploaded(self.0, input_dir)?;
-        super::ScopedCache::put(self.0.category, &table);
+        let table = run_uploaded(self.0, input_dir, ctx)?;
+        ctx.store_table(self.0.category, table.clone());
         Ok(table)
     }
 }
@@ -488,9 +493,23 @@ const VALUE_COL_STATUS: usize = 8; // 状态
 const VALUE_COL_INVOICE_NO: usize = 19; // 发票号码
 
 /// 按对应类别构建状态索引；参考号是唯一业务键，发票号码可能对应多条记录。
+#[allow(dead_code)]
 pub(super) fn status_indices(
     input_dir: &Path,
     job: &UploadedJob,
+) -> Result<(HashMap<String, String>, MultiValueIndex), ProcessError> {
+    if super::ScopedCache::is_active() {
+        super::ScopedCache::with_context_mut(|ctx| status_indices_in_context(input_dir, job, ctx))
+    } else {
+        let mut ctx = PipelineContext::new();
+        status_indices_in_context(input_dir, job, &mut ctx)
+    }
+}
+
+pub(super) fn status_indices_in_context(
+    input_dir: &Path,
+    job: &UploadedJob,
+    ctx: &mut PipelineContext,
 ) -> Result<(HashMap<String, String>, MultiValueIndex), ProcessError> {
     let mut by_reference = HashMap::new();
     let mut by_invoice_no: MultiValueIndex = HashMap::new();
@@ -513,8 +532,8 @@ pub(super) fn status_indices(
             }
         }
     };
-    if super::ScopedCache::with_table(job.category(), &mut accumulate).is_none() {
-        accumulate(&job.run(input_dir)?);
+    if ctx.with_table(job.category(), &mut accumulate).is_none() {
+        accumulate(&job.run_in_context(input_dir, ctx)?);
     }
     Ok((by_reference, by_invoice_no))
 }
@@ -602,7 +621,11 @@ fn collect_merchant_files(
     Ok(files)
 }
 
-fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, ProcessError> {
+fn run_uploaded(
+    config: &UploadedConfig,
+    input_dir: &Path,
+    ctx: &mut PipelineContext,
+) -> Result<Table, ProcessError> {
     let files = collect_merchant_files(input_dir, config.merchant_no)?;
     if files.is_empty() {
         return Err(ProcessError::NoInput {
@@ -619,14 +642,13 @@ fn run_uploaded(config: &UploadedConfig, input_dir: &Path) -> Result<Table, Proc
             "UploadedConfig 只用于 UploadedAppliance/UploadedDigital，实际为 {other:?}"
         ),
     };
-    let (by_order, by_reference) =
-        match super::ScopedCache::with_table(refund_job.category(), subsidy_indices) {
-            Some(indices) => indices,
-            None => {
-                let refund_table = refund_job.run(input_dir)?;
-                subsidy_indices(&refund_table)
-            }
-        };
+    let (by_order, by_reference) = match ctx.with_table(refund_job.category(), subsidy_indices) {
+        Some(indices) => indices,
+        None => {
+            let refund_table = refund_job.run_in_context(input_dir, ctx)?;
+            subsidy_indices(&refund_table)
+        }
+    };
     let subsidy_cap = subsidy_cap(config.category);
 
     let mut rows = Vec::new();

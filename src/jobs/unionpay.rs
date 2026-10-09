@@ -8,8 +8,8 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, amount_value, cell_amount, cell_date_or_text, cell_datetime_or_text, cell_text,
-    data_error, text_value,
+    Category, Job, PipelineContext, amount_value, cell_amount, cell_date_or_text,
+    cell_datetime_or_text, cell_text, data_error, text_value,
 };
 
 pub(crate) const HEADERS: [&str; 26] = [
@@ -236,7 +236,6 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
         }
     }
 
-    super::ScopedCache::store_authority(&records);
     Ok(records)
 }
 
@@ -320,8 +319,13 @@ impl Job for UnionPayJob {
         "银联交易明细门店"
     }
 
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError> {
         let records = load_records(input_dir)?;
+        ctx.store_authority(&records);
         let returned_original_refs = returned_original_refs(&records);
 
         // 稳定分区：退单及其唯一原消费一并沉底，两个区域各自保持原相对顺序。

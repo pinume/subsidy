@@ -21,13 +21,27 @@ pub enum Category {
 }
 
 mod cache;
-pub(crate) use cache::{MatchStats, ScopedCache};
+pub(crate) mod context;
+pub(crate) use cache::ScopedCache;
+pub use context::{MatchStats, PipelineContext};
 
 pub trait Job {
     fn category(&self) -> Category;
     fn title(&self) -> &'static str;
     fn output_stem(&self) -> &'static str;
-    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError>;
+    fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
+        if ScopedCache::is_active() {
+            ScopedCache::with_context_mut(|ctx| self.run_in_context(input_dir, ctx))
+        } else {
+            let mut ctx = PipelineContext::new();
+            self.run_in_context(input_dir, &mut ctx)
+        }
+    }
+    fn run_in_context(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Table, ProcessError>;
 }
 
 /// 文本字段：保留原值（包括纯空白），仅数值型单元格需还原为完整整数文本。

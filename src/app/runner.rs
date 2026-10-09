@@ -19,13 +19,13 @@ pub fn run_all(input_dir: &Path) -> Result<bool, ProcessError> {
 }
 
 fn clean_all(input_dir: &Path) -> HashSet<Category> {
-    let _guard = jobs::ScopedCache::activate();
+    let mut ctx = jobs::PipelineContext::new();
     let registry = jobs::registry();
     let mut success = HashSet::new();
     let mut failure_count = 0;
 
     for job in registry {
-        if execute(*job, input_dir) {
+        if execute(*job, input_dir, &mut ctx) {
             success.insert(job.category());
         } else {
             failure_count += 1;
@@ -42,15 +42,15 @@ fn clean_all(input_dir: &Path) -> HashSet<Category> {
     success
 }
 
-fn execute(job: &dyn Job, input_dir: &Path) -> bool {
+fn execute(job: &dyn Job, input_dir: &Path, ctx: &mut jobs::PipelineContext) -> bool {
     let title = job.title();
-    let outcome = process(job, input_dir);
+    let outcome = process(job, input_dir, ctx);
 
     match outcome {
         Ok(path) => {
             println!("[{title}] 处理成功：{}", path.display());
             if job.category() == jobs::Category::Coupons {
-                jobs::ScopedCache::print_stats();
+                ctx.print_stats();
             }
             true
         }
@@ -61,10 +61,14 @@ fn execute(job: &dyn Job, input_dir: &Path) -> bool {
     }
 }
 
-fn process(job: &dyn Job, input_dir: &Path) -> Result<PathBuf, ProcessError> {
+fn process(
+    job: &dyn Job,
+    input_dir: &Path,
+    ctx: &mut jobs::PipelineContext,
+) -> Result<PathBuf, ProcessError> {
     // 用 catch_unwind 隔离单个任务的 panic，避免其中断批量执行或整个程序。
     panic::catch_unwind(AssertUnwindSafe(|| {
-        let table = job.run(input_dir)?;
+        let table = job.run_in_context(input_dir, ctx)?;
         publish(job, input_dir, &table)
     }))
     .unwrap_or_else(|payload| {
@@ -130,7 +134,11 @@ mod tests {
         fn output_stem(&self) -> &'static str {
             if self.0 { "first" } else { "second" }
         }
-        fn run(&self, _: &Path) -> Result<Table, ProcessError> {
+        fn run_in_context(
+            &self,
+            _: &Path,
+            _: &mut jobs::PipelineContext,
+        ) -> Result<Table, ProcessError> {
             #[cfg(test)]
             publisher::fault("business")?;
             Ok(Table {
@@ -157,11 +165,16 @@ mod tests {
                 let old = output.join("first.xlsx");
                 std::fs::write(&old, b"old").unwrap();
                 publisher::inject(&[(stage, panic)]);
-                let error = process(&SampleJob(true), &input).unwrap_err();
+                let mut ctx = jobs::PipelineContext::new();
+                let error = process(&SampleJob(true), &input, &mut ctx).unwrap_err();
                 assert!(error.to_string().contains(stage), "{error}");
                 assert_eq!(std::fs::read(&old).unwrap(), b"old");
                 assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
-                assert!(process(&SampleJob(false), &input).unwrap().is_file());
+                assert!(
+                    process(&SampleJob(false), &input, &mut ctx)
+                        .unwrap()
+                        .is_file()
+                );
                 assert_eq!(std::fs::read_dir(&output).unwrap().count(), 2);
                 std::fs::remove_dir_all(base).unwrap();
             }
