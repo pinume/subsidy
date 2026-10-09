@@ -58,7 +58,7 @@ struct InvoiceEntry {
     match_doc_no: String,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct TransactionReconciler {
     product_map: HashMap<String, ProductEntry>,
     upload_map: HashMap<String, UploadEntry>,
@@ -182,13 +182,9 @@ impl TransactionReconciler {
             "未提交"
         };
 
-        let is_red_flush = if invoice_no.is_empty() {
-            false
-        } else if let Some(entry) = invoice_entry {
-            entry.invoice_type == "红票" || entry.invoice_status == "已红冲"
-        } else {
-            false
-        };
+        let is_red_flush = !invoice_no.is_empty()
+            && invoice_entry
+                .is_some_and(|e| e.invoice_type == "红票" || e.invoice_status == "已红冲");
 
         ReconciledTransaction {
             product,
@@ -203,17 +199,9 @@ impl TransactionReconciler {
 mod tests {
     use super::*;
 
-    fn empty_reconciler() -> TransactionReconciler {
-        TransactionReconciler {
-            product_map: HashMap::new(),
-            upload_map: HashMap::new(),
-            invoice_map: HashMap::new(),
-        }
-    }
-
     #[test]
     fn reconciles_product_through_document_chain() {
-        let mut reconciler = empty_reconciler();
+        let mut reconciler = TransactionReconciler::default();
 
         // upload: ref-1 -> status "待审核", invoice "inv-101"
         reconciler.upload_map.insert(
@@ -265,7 +253,7 @@ mod tests {
 
     #[test]
     fn returns_overridden_status_when_store_remark_is_returned() {
-        let mut reconciler = empty_reconciler();
+        let mut reconciler = TransactionReconciler::default();
         reconciler.upload_map.insert(
             "ref-ret".to_string(),
             UploadEntry {
@@ -282,7 +270,7 @@ mod tests {
 
     #[test]
     fn defaults_to_unsubmitted_when_unmatched() {
-        let reconciler = empty_reconciler();
+        let reconciler = TransactionReconciler::default();
         let result = reconciler.reconcile("ref-unsubmitted", "");
         assert_eq!(result.status, "未提交");
         assert_eq!(result.invoice_no, "");
@@ -296,7 +284,7 @@ mod tests {
 
     #[test]
     fn flags_red_ticket_or_flushed_invoice_as_red_flush() {
-        let mut reconciler = empty_reconciler();
+        let mut reconciler = TransactionReconciler::default();
 
         // Red invoice type
         reconciler.upload_map.insert(

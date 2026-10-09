@@ -211,7 +211,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
             buyer_name,
             product_name: clean_product_name(&raw_product_name),
             match_doc_no: doc_no::MatchDocNo::from_remark(&remark)
-                .map_or(Value::Empty, Value::from),
+                .map_or(Value::Empty, |m| Value::Text(m.into_string())),
             remark,
             invoice_status,
         });

@@ -20,9 +20,7 @@ pub enum Category {
     Coupons,
 }
 
-mod cache;
 pub(crate) mod context;
-pub(crate) use cache::ScopedCache;
 pub use context::{MatchStats, PipelineContext};
 
 pub trait Job {
@@ -30,12 +28,7 @@ pub trait Job {
     fn title(&self) -> &'static str;
     fn output_stem(&self) -> &'static str;
     fn run(&self, input_dir: &Path) -> Result<Table, ProcessError> {
-        if ScopedCache::is_active() {
-            ScopedCache::with_context_mut(|ctx| self.run_in_context(input_dir, ctx))
-        } else {
-            let mut ctx = PipelineContext::new();
-            self.run_in_context(input_dir, &mut ctx)
-        }
+        self.run_in_context(input_dir, &mut PipelineContext::new())
     }
     fn run_in_context(
         &self,
@@ -383,36 +376,5 @@ mod tests {
         assert_eq!(text_value(String::new()), Value::Empty);
         assert_eq!(text_value("x".to_string()), Value::Text("x".to_string()));
         assert_eq!(amount_value(None), Value::Empty);
-    }
-
-    #[test]
-    fn scoped_cache_lifecycle() {
-        let sample_table = Table {
-            columns: vec![],
-            rows: vec![crate::model::Row {
-                values: vec![],
-                fill: None,
-            }],
-        };
-
-        // Outside ScopedCache::activate(), get returns None and put is a no-op.
-        assert!(ScopedCache::get(Category::Invoice).is_none());
-        ScopedCache::put(Category::Invoice, &sample_table);
-        assert!(ScopedCache::get(Category::Invoice).is_none());
-
-        // With let _guard = ScopedCache::activate(), put stores the table and get retrieves it.
-        {
-            let _guard = ScopedCache::activate();
-            assert!(ScopedCache::get(Category::Invoice).is_none());
-            ScopedCache::put(Category::Invoice, &sample_table);
-            let retrieved = ScopedCache::get(Category::Invoice);
-            assert_eq!(retrieved.map(|t| t.rows.len()), Some(1));
-            let row_count = ScopedCache::with_table(Category::Invoice, |table| table.rows.len());
-            assert_eq!(row_count, Some(1));
-        }
-
-        // When _guard drops, get and with_table return None again.
-        assert!(ScopedCache::get(Category::Invoice).is_none());
-        assert!(ScopedCache::with_table(Category::Invoice, |_| ()).is_none());
     }
 }

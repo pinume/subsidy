@@ -493,19 +493,6 @@ const VALUE_COL_STATUS: usize = 8; // 状态
 const VALUE_COL_INVOICE_NO: usize = 19; // 发票号码
 
 /// 按对应类别构建状态索引；参考号是唯一业务键，发票号码可能对应多条记录。
-#[allow(dead_code)]
-pub(super) fn status_indices(
-    input_dir: &Path,
-    job: &UploadedJob,
-) -> Result<(HashMap<String, String>, MultiValueIndex), ProcessError> {
-    if super::ScopedCache::is_active() {
-        super::ScopedCache::with_context_mut(|ctx| status_indices_in_context(input_dir, job, ctx))
-    } else {
-        let mut ctx = PipelineContext::new();
-        status_indices_in_context(input_dir, job, &mut ctx)
-    }
-}
-
 pub(super) fn status_indices_in_context(
     input_dir: &Path,
     job: &UploadedJob,

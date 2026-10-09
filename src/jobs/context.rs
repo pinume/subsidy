@@ -42,7 +42,10 @@ impl PipelineContext {
         self.tables.get(&category).map(f)
     }
 
-    pub fn authority(&mut self, input_dir: &Path) -> Result<Rc<HashSet<String>>, ProcessError> {
+    pub(crate) fn authority(
+        &mut self,
+        input_dir: &Path,
+    ) -> Result<Rc<HashSet<String>>, ProcessError> {
         if let Some(index) = &self.authority {
             return Ok(Rc::clone(index));
         }
@@ -142,7 +145,7 @@ impl PipelineContext {
         self.stats = Some(stats);
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn stats(&self) -> Option<MatchStats> {
         self.stats
     }

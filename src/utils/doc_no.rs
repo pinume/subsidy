@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fmt;
 use std::ops::Deref;
 use std::sync::LazyLock;
 
@@ -11,14 +10,13 @@ use regex::Regex;
 pub struct MatchDocNo(String);
 
 impl MatchDocNo {
-    /// 由日期与单据号构造：剥离“收款”前缀并执行 10/11/9 位规范化。
+    /// 由日期与单据号构造（收款单第9.4节、销售用券第10.5节）：剥离“收款”前缀，空值返回 None。
     pub fn from_date_and_code(date: NaiveDate, raw_code: &str) -> Option<Self> {
         let stripped = strip_receipt_prefix(raw_code.trim());
         if stripped.is_empty() {
             return None;
         }
-        let normalized = normalize_document_no(stripped).unwrap_or_else(|| stripped.to_string());
-        Some(Self(format!("{}{}", date.format("%y%m%d"), normalized)))
+        Some(Self(format!("{}{}", date.format("%y%m%d"), stripped)))
     }
 
     /// 从备注文本中按正则提取唯一的销售日期与单据号，生成匹配单据号；
@@ -26,32 +24,26 @@ impl MatchDocNo {
     pub fn from_remark(remark: &str) -> Option<Self> {
         let fixed = apply_known_remark_fixes(remark);
 
-        let mut dates_found = HashSet::new();
-        for caps in date_label_regex().captures_iter(&fixed) {
-            if let Some(date) = parse_labeled_date(&caps[1], &caps[2], &caps[3]) {
-                dates_found.insert(date);
-            }
-        }
+        let dates_found: HashSet<NaiveDate> = date_label_regex()
+            .captures_iter(&fixed)
+            .filter_map(|caps| parse_labeled_date(&caps[1], &caps[2], &caps[3]))
+            .collect();
         if dates_found.len() != 1 {
             return None;
         }
         let date = *dates_found.iter().next().unwrap();
 
-        let mut raw_doc_nos = HashSet::new();
-        for caps in doc_no_label_regex().captures_iter(&fixed) {
-            raw_doc_nos.insert(caps[1].to_string());
-        }
+        let raw_doc_nos: HashSet<&str> = doc_no_label_regex()
+            .captures_iter(&fixed)
+            .map(|caps| caps.get(1).unwrap().as_str())
+            .collect();
         if raw_doc_nos.len() != 1 {
             return None;
         }
-        let raw_doc_no = raw_doc_nos.into_iter().next().unwrap();
-        let stripped = strip_receipt_prefix(&raw_doc_no);
+        let raw_doc_no = *raw_doc_nos.iter().next().unwrap();
+        let stripped = strip_receipt_prefix(raw_doc_no);
         let normalized = normalize_document_no(stripped)?;
         Some(Self(format!("{}{}", date.format("%y%m%d"), normalized)))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
     }
 
     pub fn into_string(self) -> String {
@@ -99,12 +91,6 @@ impl Deref for MatchDocNo {
     }
 }
 
-impl fmt::Display for MatchDocNo {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// 标准化并校验单据号：10 位直接使用；11 位从首个补零段删除一个 0；
 /// `ZFP300008`定向修正为`ZFP3000008`；其余情况判定无效。
 fn normalize_document_no(raw: &str) -> Option<String> {
@@ -144,15 +130,13 @@ mod tests {
     fn constructs_match_doc_no_from_date_and_code() {
         let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
         let doc = MatchDocNo::from_date_and_code(date, "收款ZFFX000003").unwrap();
-        assert_eq!(doc.as_str(), "260101ZFFX000003");
         assert_eq!(&*doc, "260101ZFFX000003");
-        assert_eq!(doc.to_string(), "260101ZFFX000003");
 
-        // 11-character code with padding zero is normalized
-        let doc11 = MatchDocNo::from_date_and_code(date, "收款ZHLT0000524").unwrap();
-        assert_eq!(doc11.as_str(), "260101ZHLT000524");
+        // 收款单第9.4节与销售用券第10.5节：保留原始单据号除“收款”前缀外的原值，不进行 11 位去零
+        let doc11 = MatchDocNo::from_date_and_code(date, "收款0023000002").unwrap();
+        assert_eq!(&*doc11, "2601010023000002");
 
-        // Empty code returns None
+        // 空单据号返回 None
         assert!(MatchDocNo::from_date_and_code(date, "").is_none());
     }
 

@@ -476,7 +476,7 @@ mod tests {
     use rust_xlsxwriter::Workbook;
 
     use super::*;
-    use crate::jobs::{ScopedCache, invoice, receipts, refund, unionpay, uploaded};
+    use crate::jobs::{invoice, receipts, refund, unionpay, uploaded};
 
     const MERCHANT_DIGITAL: &str = "89813014812B06R";
     const MERCHANT_APPLIANCE: &str = "89813015722APT1";
@@ -1590,14 +1590,22 @@ mod tests {
                 ],
             );
         }
-        let expected = uploaded::status_indices(&dir, &uploaded::UPLOADED_APPLIANCE).unwrap();
+        let mut ctx = super::super::PipelineContext::new();
+        let expected =
+            uploaded::status_indices_in_context(&dir, &uploaded::UPLOADED_APPLIANCE, &mut ctx)
+                .unwrap();
         assert_eq!(expected.0["ref"], "审核失败");
         assert_eq!(expected.1["inv"].len(), 2);
         assert!(!expected.0.contains_key("ignored"));
-        let _guard = super::super::ScopedCache::activate();
+        let mut shared_ctx = super::super::PipelineContext::new();
         // First run takes the uncached path and populates both tables.
         assert_eq!(
-            uploaded::status_indices(&dir, &uploaded::UPLOADED_APPLIANCE).unwrap(),
+            uploaded::status_indices_in_context(
+                &dir,
+                &uploaded::UPLOADED_APPLIANCE,
+                &mut shared_ctx
+            )
+            .unwrap(),
             expected
         );
         // Removing raw fixtures proves the second run borrows cached tables.
@@ -1606,7 +1614,12 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(
-            uploaded::status_indices(&dir, &uploaded::UPLOADED_APPLIANCE).unwrap(),
+            uploaded::status_indices_in_context(
+                &dir,
+                &uploaded::UPLOADED_APPLIANCE,
+                &mut shared_ctx
+            )
+            .unwrap(),
             expected
         );
         std::fs::remove_dir_all(dir).unwrap();
@@ -1620,55 +1633,36 @@ mod tests {
         write_invoice_fixture(&dir, &[("销售日期2026-08-29 单据号ZFFX000003", "123")]);
         write_receipts_fixture(&dir, &[("2026-08-29", "收款ZFFX000003", "退货", "")]);
         {
-            let _guard = super::super::ScopedCache::activate();
-            unionpay::UnionPayJob.run(&dir).unwrap();
-            invoice::InvoiceJob.run(&dir).unwrap();
-            receipts::ReceiptsJob.run(&dir).unwrap();
-            let authority = ScopedCache::authority(&dir).unwrap();
-            let invoices = ScopedCache::invoice_index(&dir).unwrap();
-            let receipts = ScopedCache::receipts_index(&dir).unwrap();
-            assert!(Rc::ptr_eq(
-                &authority,
-                &ScopedCache::authority(&dir).unwrap()
-            ));
-            assert!(Rc::ptr_eq(
-                &invoices,
-                &ScopedCache::invoice_index(&dir).unwrap()
-            ));
-            assert!(Rc::ptr_eq(
-                &receipts,
-                &ScopedCache::receipts_index(&dir).unwrap()
-            ));
+            let mut ctx = super::super::PipelineContext::new();
+            unionpay::UnionPayJob
+                .run_in_context(&dir, &mut ctx)
+                .unwrap();
+            invoice::InvoiceJob.run_in_context(&dir, &mut ctx).unwrap();
+            receipts::ReceiptsJob
+                .run_in_context(&dir, &mut ctx)
+                .unwrap();
+            let authority = ctx.authority(&dir).unwrap();
+            let invoices = ctx.invoice_index(&dir).unwrap();
+            let receipts = ctx.receipts_index(&dir).unwrap();
+            assert!(Rc::ptr_eq(&authority, &ctx.authority(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&invoices, &ctx.invoice_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&receipts, &ctx.receipts_index(&dir).unwrap()));
             write_unionpay_fixture(&dir, "99999999999N");
             write_invoice_fixture(&dir, &[]);
             write_receipts_fixture(&dir, &[]);
-            assert!(Rc::ptr_eq(
-                &authority,
-                &ScopedCache::authority(&dir).unwrap()
-            ));
-            assert!(Rc::ptr_eq(
-                &invoices,
-                &ScopedCache::invoice_index(&dir).unwrap()
-            ));
-            assert!(Rc::ptr_eq(
-                &receipts,
-                &ScopedCache::receipts_index(&dir).unwrap()
-            ));
+            assert!(Rc::ptr_eq(&authority, &ctx.authority(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&invoices, &ctx.invoice_index(&dir).unwrap()));
+            assert!(Rc::ptr_eq(&receipts, &ctx.receipts_index(&dir).unwrap()));
         }
-        let _guard = super::super::ScopedCache::activate();
-        assert!(
-            ScopedCache::authority(&dir)
-                .unwrap()
-                .contains("99999999999N")
-        );
-        assert!(ScopedCache::invoice_index(&dir).unwrap().is_empty());
-        assert!(ScopedCache::receipts_index(&dir).unwrap().is_empty());
+        let mut ctx = super::super::PipelineContext::new();
+        assert!(ctx.authority(&dir).unwrap().contains("99999999999N"));
+        assert!(ctx.invoice_index(&dir).unwrap().is_empty());
+        assert!(ctx.receipts_index(&dir).unwrap().is_empty());
         // 失败读取不能留下部分成功索引。
         std::fs::write(dir.join("发票_20261001.xlsx"), b"corrupt workbook").unwrap();
-        drop(_guard);
-        let _guard = ScopedCache::activate();
-        assert!(ScopedCache::invoice_index(&dir).is_err());
-        assert!(ScopedCache::invoice_index(&dir).is_err());
+        let mut fresh_ctx = super::super::PipelineContext::new();
+        assert!(fresh_ctx.invoice_index(&dir).is_err());
+        assert!(fresh_ctx.invoice_index(&dir).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1714,14 +1708,14 @@ mod tests {
                 ("收款ZFFX000004", "2026-08-29", "D", "D", "D", "", "1.00"),
             ],
         );
-        let _guard = super::super::ScopedCache::activate();
-        let table = CouponsJob.run(&dir).unwrap();
+        let mut ctx = super::super::PipelineContext::new();
+        let table = CouponsJob.run_in_context(&dir, &mut ctx).unwrap();
         assert_eq!(table.rows.len(), 4);
         assert_eq!(table.rows[3].fill, Some(Fill::Pink));
         assert_eq!(table.rows[0].values[10], Value::Text("参考号状态".into()));
         assert_eq!(table.rows[1].values[10], Value::Text("发票号状态".into()));
         assert_eq!(table.rows[2].values[10], Value::Text("未上传".into()));
-        let stats = ScopedCache::stats().unwrap();
+        let stats = ctx.stats().unwrap();
         assert_eq!(stats.hits, [1, 1, 1, 1]);
         assert_eq!(stats.ambiguous, [0; 4]);
         std::fs::remove_dir_all(dir).unwrap();

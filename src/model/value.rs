@@ -13,23 +13,3 @@ pub enum Value {
     Date(NaiveDate),
     DateTime(NaiveDateTime),
 }
-
-impl From<crate::utils::doc_no::MatchDocNo> for Value {
-    fn from(doc: crate::utils::doc_no::MatchDocNo) -> Self {
-        Value::Text(doc.into_string())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::utils::doc_no::MatchDocNo;
-
-    #[test]
-    fn converts_match_doc_no_to_text_value() {
-        let date = NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
-        let doc = MatchDocNo::from_date_and_code(date, "ZFFX000003").unwrap();
-        let val: Value = doc.into();
-        assert_eq!(val, Value::Text("260101ZFFX000003".to_string()));
-    }
-}
