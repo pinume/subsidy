@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
 
 use chrono::NaiveDate;
-use regex::Regex;
 
 use crate::io::paths::list_xlsx_files;
 use crate::io::xlsx_reader::open_sheets;
@@ -114,85 +112,6 @@ fn clean_product_name(raw: &str) -> String {
         .to_string()
 }
 
-/// project.md 3.4 节已确认的定向修正，作用于整条备注文本。
-fn apply_known_remark_fixes(remark: &str) -> String {
-    remark
-        .replace("2026-0101", "2026-01-01")
-        .replace("202601-04", "2026-01-04")
-        .replace("2026-26-29", "2026-06-29")
-}
-
-fn date_label_regex() -> &'static Regex {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(
-            r"(?:销售日期|购机日期)[：:、\s]*([0-9]{2,4})[-./年]([0-9]{1,2})[-./月]([0-9]{1,2})日?",
-        )
-        .unwrap()
-    });
-    &RE
-}
-
-fn doc_no_label_regex() -> &'static Regex {
-    static RE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?:单据号收款号|单据号收款|单据收款号|单据号)[：:、\s]*((?:收款)?[A-Za-z]*[0-9][A-Za-z0-9]*)").unwrap()
-    });
-    &RE
-}
-
-fn parse_labeled_date(year: &str, month: &str, day: &str) -> Option<NaiveDate> {
-    let mut year: i32 = year.parse().ok()?;
-    if year < 100 {
-        year += 2000;
-    }
-    NaiveDate::from_ymd_opt(year, month.parse().ok()?, day.parse().ok()?)
-}
-
-/// 标准化并校验单据号：10 位直接使用；11 位从首个补零段删除一个 0；
-/// `ZFP300008`定向修正为`ZFP3000008`；其余情况判定无效。
-fn normalize_document_no(raw: &str) -> Option<String> {
-    match raw.len() {
-        10 => Some(raw.to_string()),
-        11 => {
-            let zero = raw.find('0')?;
-            let mut corrected = raw.to_string();
-            corrected.remove(zero);
-            Some(corrected)
-        }
-        9 if raw == "ZFP300008" => Some("ZFP3000008".to_string()),
-        _ => None,
-    }
-}
-
-/// 从备注文本中按正则提取唯一的销售日期与单据号，生成匹配单据号；
-/// 任一字段未命中或存在歧义（多个不同候选值）时返回`None`。
-fn build_match_doc_no(remark: &str) -> Option<String> {
-    let fixed = apply_known_remark_fixes(remark);
-
-    let mut dates_found = std::collections::HashSet::new();
-    for caps in date_label_regex().captures_iter(&fixed) {
-        if let Some(date) = parse_labeled_date(&caps[1], &caps[2], &caps[3]) {
-            dates_found.insert(date);
-        }
-    }
-    if dates_found.len() != 1 {
-        return None;
-    }
-    let date = *dates_found.iter().next().unwrap();
-
-    let mut raw_doc_nos = std::collections::HashSet::new();
-    for caps in doc_no_label_regex().captures_iter(&fixed) {
-        raw_doc_nos.insert(caps[1].to_string());
-    }
-    if raw_doc_nos.len() != 1 {
-        return None;
-    }
-    let raw_doc_no = raw_doc_nos.into_iter().next().unwrap();
-    let stripped = doc_no::strip_receipt_prefix(&raw_doc_no);
-    let normalized = normalize_document_no(stripped)?;
-
-    Some(doc_no::build_match_doc_no(date, &normalized))
-}
-
 fn is_abnormal(record: &InvoiceRecord) -> bool {
     record.invoice_type == "红票"
         || record.invoice_status == "已红冲"
@@ -285,7 +204,8 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
             invoice_no,
             buyer_name,
             product_name: clean_product_name(&raw_product_name),
-            match_doc_no: build_match_doc_no(&remark).map_or(Value::Empty, Value::Text),
+            match_doc_no: doc_no::MatchDocNo::from_remark(&remark)
+                .map_or(Value::Empty, Value::from),
             remark,
             invoice_status,
         });
@@ -391,95 +311,6 @@ mod tests {
             "小天鹅-洗衣机-TG12TP3"
         );
         assert_eq!(clean_product_name("无星号商品"), "无星号商品");
-    }
-
-    #[test]
-    fn normalizes_document_no_lengths() {
-        assert_eq!(
-            normalize_document_no("ZEXQ000062"),
-            Some("ZEXQ000062".to_string())
-        );
-        assert_eq!(
-            normalize_document_no("ZHLT0000524"),
-            Some("ZHLT000524".to_string())
-        );
-        assert_eq!(
-            normalize_document_no("ZFTY0000027"),
-            Some("ZFTY000027".to_string())
-        );
-        assert_eq!(
-            normalize_document_no("ZFP300008"),
-            Some("ZFP3000008".to_string())
-        );
-        assert_eq!(normalize_document_no("ZFP300009"), None); // 其他 9 位内容判定无效
-        assert_eq!(normalize_document_no("ZABC12345678"), None); // 12 位无法处理
-    }
-
-    #[test]
-    fn builds_match_doc_no_from_labeled_remark() {
-        assert_eq!(
-            build_match_doc_no("销售日期:2026-07-28 单据号:收款ZEXQ000062"),
-            Some("260728ZEXQ000062".to_string())
-        );
-    }
-
-    #[test]
-    fn builds_match_doc_no_with_directed_date_fixes() {
-        assert_eq!(
-            build_match_doc_no("购机日期：2026-8-9 单据收款号：ZHLT0000524"),
-            Some("260809ZHLT000524".to_string())
-        );
-        assert_eq!(
-            build_match_doc_no("销售日期2026-26-29 单据号ZEXQ000062"),
-            Some("260629ZEXQ000062".to_string())
-        );
-    }
-
-    #[test]
-    fn builds_match_doc_no_with_dotted_two_digit_year_and_chinese_month() {
-        assert_eq!(
-            build_match_doc_no("销售日期：26.02.16、单据号：ZEXQ000062"),
-            Some("260216ZEXQ000062".to_string())
-        );
-        assert_eq!(
-            build_match_doc_no("销售日期：2026-2月21日 单据号：ZEXQ000062"),
-            Some("260221ZEXQ000062".to_string())
-        );
-    }
-
-    #[test]
-    fn ignores_invoice_issue_date_label() {
-        // “开具购物发票日期”不得被误当作销售/购机日期使用；缺少销售/购机日期时留空。
-        assert_eq!(
-            build_match_doc_no("开具购物发票日期：2026-07-28 单据号：ZEXQ000062"),
-            None
-        );
-    }
-
-    #[test]
-    fn blank_or_unrelated_remark_yields_none() {
-        assert_eq!(build_match_doc_no(""), None);
-        assert_eq!(build_match_doc_no("红冲"), None);
-    }
-
-    #[test]
-    fn multiple_different_dates_or_doc_numbers_yield_none() {
-        assert_eq!(
-            build_match_doc_no("销售日期：2026-07-28 购机日期：2026-07-29 单据号：ZEXQ000062"),
-            None
-        );
-        assert_eq!(
-            build_match_doc_no("销售日期：2026-07-28 单据号：ZEXQ000062 单据号：ZEXQ000063"),
-            None
-        );
-    }
-
-    #[test]
-    fn repeated_identical_date_or_doc_number_is_not_ambiguous() {
-        assert_eq!(
-            build_match_doc_no("销售日期：2026-07-28 销售日期：2026-07-28 单据号：ZEXQ000062"),
-            Some("260728ZEXQ000062".to_string())
-        );
     }
 
     fn write_invoice_workbook(path: &Path, sheet_name: &str, rows: &[[&str; 30]]) {

@@ -228,13 +228,12 @@ pub(crate) fn resolve_synonym_column(
 /// 由`Value::Date`与去“收款”前缀的单据号拼接匹配单据号；`doc_no_value`为空或`date`不是
 /// `Value::Date`时留空（第9、10节共用）。
 pub(crate) fn build_match_doc_no(date: &Value, doc_no_value: &str) -> String {
-    if doc_no_value.is_empty() {
+    let Value::Date(d) = date else {
         return String::new();
-    }
-    match date {
-        Value::Date(d) => doc_no::build_match_doc_no(*d, doc_no_value),
-        _ => String::new(),
-    }
+    };
+    doc_no::MatchDocNo::from_date_and_code(*d, doc_no_value)
+        .map(|m| m.into_string())
+        .unwrap_or_default()
 }
 
 /// `字段值 → 该值下全部候选（未去重）`，供`resolve`/`resolve_via`统一做歧义判定；
