@@ -6,6 +6,7 @@ use rust_xlsxwriter::{
 use std::collections::HashMap;
 use std::path::Path;
 
+use super::excel::write_report_row;
 use super::reader::{
     cell_to_decimal, cell_to_string, get_colored_row_indices, get_colored_row_indices_multi,
 };
@@ -268,13 +269,9 @@ fn build_summary_sheet(wb: &mut Workbook, s: &StylePool, m: &SummaryMetrics) -> 
         "审核失败",
         "未上传",
     ];
-    let ratios = m.amount_ratios();
-    let t2_data: [_; 8] = std::array::from_fn(|index| {
-        let (a, ap, d, dp, t, tp) = ratios[index];
-        (names[index], a, ap, d, dp, t, tp)
-    });
-
-    for (i, (name, a_amt, a_pct, d_amt, d_pct, t_amt, t_pct)) in t2_data.iter().enumerate() {
+    for (i, (name, (a_amt, a_pct, d_amt, d_pct, t_amt, t_pct))) in
+        names.iter().zip(m.amount_ratios()).enumerate()
+    {
         if i == 4 {
             // Row 23 (0-based 22): Tip row
             ws.set_row_height(cur_row, 22.0)
@@ -288,17 +285,17 @@ fn build_summary_sheet(wb: &mut Workbook, s: &StylePool, m: &SummaryMetrics) -> 
             .map_err(|e| e.to_string())?;
         ws.write_string_with_format(cur_row, 0, *name, &s.text_left)
             .map_err(|e| e.to_string())?;
-        ws.write_with_format(cur_row, 1, to_wan(*a_amt), &s.money)
+        ws.write_with_format(cur_row, 1, to_wan(a_amt), &s.money)
             .map_err(|e| e.to_string())?;
-        ws.write_number_with_format(cur_row, 2, *a_pct, &s.percent)
+        ws.write_number_with_format(cur_row, 2, a_pct, &s.percent)
             .map_err(|e| e.to_string())?;
-        ws.write_with_format(cur_row, 3, to_wan(*d_amt), &s.money)
+        ws.write_with_format(cur_row, 3, to_wan(d_amt), &s.money)
             .map_err(|e| e.to_string())?;
-        ws.write_number_with_format(cur_row, 4, *d_pct, &s.percent)
+        ws.write_number_with_format(cur_row, 4, d_pct, &s.percent)
             .map_err(|e| e.to_string())?;
-        ws.write_with_format(cur_row, 5, to_wan(*t_amt), &s.money)
+        ws.write_with_format(cur_row, 5, to_wan(t_amt), &s.money)
             .map_err(|e| e.to_string())?;
-        ws.write_number_with_format(cur_row, 6, *t_pct, &s.percent)
+        ws.write_number_with_format(cur_row, 6, t_pct, &s.percent)
             .map_err(|e| e.to_string())?;
         cur_row += 1;
     }
@@ -760,13 +757,7 @@ fn build_refund_anomaly_sheet(
 
         let data_start_row = *start_row;
         for row in matched_rows {
-            ws.set_row_height(*start_row, 22.0)
-                .map_err(|e| e.to_string())?;
-            for (col, column) in columns.iter().enumerate() {
-                column
-                    .kind
-                    .write(ws, s, *start_row, col as u16, column.cell(row))?;
-            }
+            write_report_row(ws, s, *start_row, row, &columns)?;
             *start_row += 1;
         }
 
@@ -880,13 +871,7 @@ fn build_invoice_anomaly_sheet(
     });
 
     for (cur_row, row) in (5_u32..).zip(collected) {
-        ws.set_row_height(cur_row, 22.0)
-            .map_err(|e| e.to_string())?;
-        for (col, column) in columns.iter().enumerate() {
-            column
-                .kind
-                .write(ws, s, cur_row, col as u16, column.cell(row))?;
-        }
+        write_report_row(ws, s, cur_row, row, &columns)?;
     }
 
     Ok(())

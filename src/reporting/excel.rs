@@ -1,7 +1,7 @@
 use calamine::{Data, DataType};
 use rust_xlsxwriter::{ExcelDateTime, Format, Worksheet};
 
-use super::data::CellKind;
+use super::data::{CellKind, ReportColumn};
 use super::reader::{cell_to_decimal, cell_to_string};
 use super::styles::StylePool;
 
@@ -89,4 +89,20 @@ impl CellKind {
             }
         }
     }
+}
+
+pub(super) fn write_report_row(
+    ws: &mut Worksheet,
+    styles: &StylePool,
+    index: u32,
+    row: &[Data],
+    columns: &[ReportColumn],
+) -> Result<(), String> {
+    ws.set_row_height(index, 22.0).map_err(|e| e.to_string())?;
+    for (col, column) in columns.iter().enumerate() {
+        column
+            .kind
+            .write(ws, styles, index, col as u16, column.cell(row))?;
+    }
+    Ok(())
 }

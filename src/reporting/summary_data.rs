@@ -5,7 +5,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::{HashMap, HashSet};
 
-type UploadTotals = (HashMap<String, Decimal>, HashMap<String, i64>);
+type UploadTotals = HashMap<String, (Decimal, i64)>;
 
 pub type SalesMatrix = HashMap<(String, String), HashMap<String, (Decimal, i64)>>;
 
@@ -69,6 +69,15 @@ impl MetricRow {
             dig_amt,
             dig_cnt,
         }
+    }
+
+    fn subtract(self, other: Self) -> Self {
+        Self::new(
+            self.app_amt - other.app_amt,
+            self.app_cnt - other.app_cnt,
+            self.dig_amt - other.dig_amt,
+            self.dig_cnt - other.dig_cnt,
+        )
     }
 
     pub fn tot_amt(&self) -> Decimal {
@@ -162,73 +171,44 @@ impl SummaryMetrics {
 
         let count_uploaded = |rows: &SheetData, label: &str| -> Result<UploadTotals, String> {
             let cols = UploadColumns::from_header(&rows.header, label)?;
-            let mut amt_map = HashMap::new();
-            let mut cnt_map = HashMap::new();
-
+            let mut totals = UploadTotals::new();
             for row in &rows[1..] {
-                let st = cell_to_string(&row[cols.status]);
-                let amt = cell_to_decimal(&row[cols.subsidy]).unwrap_or(Decimal::ZERO);
-                *amt_map.entry(st.clone()).or_insert(Decimal::ZERO) += amt;
-                *cnt_map.entry(st).or_insert(0) += 1;
+                let status = cell_to_string(&row[cols.status]);
+                let amount = cell_to_decimal(&row[cols.subsidy]).unwrap_or(Decimal::ZERO);
+                let entry = totals.entry(status).or_default();
+                entry.0 += amount;
+                entry.1 += 1;
             }
-            Ok((amt_map, cnt_map))
+            Ok(totals)
         };
 
-        let (app_amt, app_cnt) = count_uploaded(app_up, "已上传家电电脑.xlsx")?;
-        let (dig_amt, dig_cnt) = count_uploaded(dig_up, "已上传数码.xlsx")?;
-
-        let get_val =
-            |map: &HashMap<String, Decimal>, k: &str| *map.get(k).unwrap_or(&Decimal::ZERO);
-        let get_cnt = |map: &HashMap<String, i64>, k: &str| *map.get(k).unwrap_or(&0);
-
-        let app_paid_amt = get_val(&app_amt, "已回款");
-        let app_paid_cnt = get_cnt(&app_cnt, "已回款");
-        let dig_paid_amt = get_val(&dig_amt, "已回款");
-        let dig_paid_cnt = get_cnt(&dig_cnt, "已回款");
-
-        let app_unpaid_amt = app_gen_amt - app_paid_amt;
-        let app_unpaid_cnt = app_gen_cnt.to_i64().unwrap_or(0) - app_paid_cnt;
-        let dig_unpaid_amt = dig_gen_amt - dig_paid_amt;
-        let dig_unpaid_cnt = dig_gen_cnt.to_i64().unwrap_or(0) - dig_paid_cnt;
-
-        let app_pass_amt = get_val(&app_amt, "审核通过未回款");
-        let app_pass_cnt = get_cnt(&app_cnt, "审核通过未回款");
-        let dig_pass_amt = get_val(&dig_amt, "审核通过未回款");
-        let dig_pass_cnt = get_cnt(&dig_cnt, "审核通过未回款");
-
-        let app_wait_amt = get_val(&app_amt, "待审核");
-        let app_wait_cnt = get_cnt(&app_cnt, "待审核");
-        let dig_wait_amt = get_val(&dig_amt, "待审核");
-        let dig_wait_cnt = get_cnt(&dig_cnt, "待审核");
-
-        let app_fail_amt = get_val(&app_amt, "审核失败");
-        let app_fail_cnt = get_cnt(&app_cnt, "审核失败");
-        let dig_fail_amt = get_val(&dig_amt, "审核失败");
-        let dig_fail_cnt = get_cnt(&dig_cnt, "审核失败");
-
-        let app_unup_amt = app_unpaid_amt - app_pass_amt - app_wait_amt - app_fail_amt;
-        let app_unup_cnt = app_unpaid_cnt - app_pass_cnt - app_wait_cnt - app_fail_cnt;
-        let dig_unup_amt = dig_unpaid_amt - dig_pass_amt - dig_wait_amt - dig_fail_amt;
-        let dig_unup_cnt = dig_unpaid_cnt - dig_pass_cnt - dig_wait_cnt - dig_fail_cnt;
-
+        let app = count_uploaded(app_up, "已上传家电电脑.xlsx")?;
+        let dig = count_uploaded(dig_up, "已上传数码.xlsx")?;
+        let by_status = |status: &str| {
+            let (app_amt, app_cnt) = app.get(status).copied().unwrap_or_default();
+            let (dig_amt, dig_cnt) = dig.get(status).copied().unwrap_or_default();
+            MetricRow::new(app_amt, app_cnt, dig_amt, dig_cnt)
+        };
+        let occur = MetricRow::new(
+            app_gen_amt,
+            app_gen_cnt.to_i64().unwrap_or(0),
+            dig_gen_amt,
+            dig_gen_cnt.to_i64().unwrap_or(0),
+        );
+        let paid = by_status("已回款");
+        let unpaid = occur.subtract(paid);
+        let pass = by_status("审核通过未回款");
+        let wait = by_status("待审核");
+        let fail = by_status("审核失败");
+        let unup = unpaid.subtract(pass).subtract(wait).subtract(fail);
         Ok(Self {
-            occur: MetricRow::new(
-                app_gen_amt,
-                app_gen_cnt.to_i64().unwrap_or(0),
-                dig_gen_amt,
-                dig_gen_cnt.to_i64().unwrap_or(0),
-            ),
-            paid: MetricRow::new(app_paid_amt, app_paid_cnt, dig_paid_amt, dig_paid_cnt),
-            unpaid: MetricRow::new(
-                app_unpaid_amt,
-                app_unpaid_cnt,
-                dig_unpaid_amt,
-                dig_unpaid_cnt,
-            ),
-            pass: MetricRow::new(app_pass_amt, app_pass_cnt, dig_pass_amt, dig_pass_cnt),
-            wait: MetricRow::new(app_wait_amt, app_wait_cnt, dig_wait_amt, dig_wait_cnt),
-            fail: MetricRow::new(app_fail_amt, app_fail_cnt, dig_fail_amt, dig_fail_cnt),
-            unup: MetricRow::new(app_unup_amt, app_unup_cnt, dig_unup_amt, dig_unup_cnt),
+            occur,
+            paid,
+            unpaid,
+            pass,
+            wait,
+            fail,
+            unup,
         })
     }
 }

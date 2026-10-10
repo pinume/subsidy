@@ -3,6 +3,7 @@ use rust_xlsxwriter::{Workbook, Worksheet};
 use std::path::Path;
 
 use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
+use super::excel::write_report_row;
 use super::reader::{HeaderMap, cell_to_string};
 use super::reconciler::TransactionReconciler;
 use super::styles::StylePool;
@@ -223,13 +224,7 @@ fn build_store_occurrence_sheet(
         .collect();
     for (r_idx, row) in store_occ.iter().enumerate().skip(1) {
         let cur_row = r_idx as u32;
-        ws.set_row_height(cur_row, 22.0)
-            .map_err(|e| e.to_string())?;
-        for (col, column) in columns.iter().enumerate() {
-            column
-                .kind
-                .write(ws, s, cur_row, col as u16, column.cell(row))?;
-        }
+        write_report_row(ws, s, cur_row, row, &columns)?;
     }
 
     Ok(())
@@ -281,13 +276,7 @@ fn build_store_refund_sheet(
 
         for row in &rows[1..] {
             if cell_to_string(&row[mch_idx]) == store_code {
-                ws.set_row_height(*cur_row, 22.0)
-                    .map_err(|e| e.to_string())?;
-                for (col, column) in columns.iter().enumerate() {
-                    column
-                        .kind
-                        .write(ws, s, *cur_row, col as u16, column.cell(row))?;
-                }
+                write_report_row(ws, s, *cur_row, row, &columns)?;
                 *cur_row += 1;
             }
         }
@@ -403,39 +392,19 @@ fn build_store_upload_sheet(
                 .map(|col| {
                     let optional =
                         (!is_dig && matches!(col, 25 | 26)) || (is_dig && matches!(col, 44 | 58));
+                    if optional {
+                        return Ok(ReportColumn::new(None, col_defs[col].0));
+                    }
                     let index = match col {
                         22 => h.find_occurrence("图片1", 1),
-                        25 | 26 => {
-                            if is_dig {
-                                h.find(&[col_defs[col].0])
-                            } else {
-                                None
-                            }
-                        }
                         27 => h.find_occurrence("图片1", 2),
                         31 => h.find(&["img5", "图片5"]),
                         32 => h.find(&["img6", "图片6"]),
-                        44 => {
-                            if is_dig {
-                                None
-                            } else {
-                                h.find(&["EEG"])
-                            }
-                        }
                         56 => h.find(&["交旧品类", "oldExchangeType"]),
-                        58 => {
-                            if is_dig {
-                                None
-                            } else {
-                                h.find(&["airConditionerKitInfo"])
-                            }
-                        }
                         _ => h.find(&[col_defs[col].0]),
-                    };
-                    if index.is_none() && !optional {
-                        return Err(format!("{}: 缺少必要列 [{}]", label, col_defs[col].0));
                     }
-                    let mut column = ReportColumn::new(index, col_defs[col].0);
+                    .ok_or_else(|| format!("{}: 缺少必要列 [{}]", label, col_defs[col].0))?;
+                    let mut column = ReportColumn::new(Some(index), col_defs[col].0);
                     if col_defs[col].0 == "状态" {
                         column.kind = CellKind::CenteredText;
                     }
@@ -455,13 +424,7 @@ fn build_store_upload_sheet(
                          cur_row: &mut u32|
      -> Result<(), String> {
         for row in &rows[1..] {
-            ws.set_row_height(*cur_row, 22.0)
-                .map_err(|e| e.to_string())?;
-            for (col, column) in col_map.iter().enumerate() {
-                column
-                    .kind
-                    .write(ws, s, *cur_row, col as u16, column.cell(row))?;
-            }
+            write_report_row(ws, s, *cur_row, row, col_map)?;
             *cur_row += 1;
         }
         Ok(())
