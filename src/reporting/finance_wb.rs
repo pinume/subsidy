@@ -40,6 +40,7 @@ pub(crate) fn generate_with_inputs(
         app_upload_rows,
         dig_upload_rows,
         invoice_rows,
+        &inputs.sales,
     )?;
 
     // Build Sheet 2: 1.门店国补发生表（银联系统直接导出，不需要加工）
@@ -72,6 +73,7 @@ fn build_final_match_sheet(
     app_up: &SheetData,
     dig_up: &SheetData,
     invoices: &SheetData,
+    sales: &SheetData,
 ) -> Result<(), String> {
     let ws = wb.add_worksheet();
     ws.set_name("最终匹配表（全部的国补发生数据上匹配）")
@@ -131,7 +133,7 @@ fn build_final_match_sheet(
     }
 
     // 1. Initialize TransactionReconciler to index products, uploads, and invoices
-    let reconciler = TransactionReconciler::from_inputs(app_up, dig_up, invoices)?;
+    let reconciler = TransactionReconciler::from_inputs(app_up, dig_up, invoices, sales)?;
 
     // 2. Pre-resolve store occurrence column mappings for final match
     let store_h = &store_occ.header;
@@ -161,7 +163,7 @@ fn build_final_match_sheet(
         let remark = cell_to_string(&row[s_rem_idx]);
         let rec = reconciler.reconcile(&ref_num, &remark);
 
-        // Col 21, 22, 23: read category, brand, and cleaned product name by invoice number.
+        // Col 21, 22, 23: prefer complete, unique sales products; fall back to invoices as a group.
         ws.write_string_with_format(cur_row, 21, rec.category(), &s.text_center)
             .map_err(|e| e.to_string())?;
         ws.write_string_with_format(cur_row, 22, rec.brand(), &s.text_left)
@@ -620,7 +622,14 @@ mod tests {
         write_fixture(
             &root,
             "销售用券情况统计.xlsx",
-            &["匹配单据号", "数电发票号码", "财务大类", "品牌", "商品名称"],
+            &[
+                "参考号",
+                "匹配单据号",
+                "数电发票号码",
+                "财务大类",
+                "品牌",
+                "商品名称",
+            ],
             &[],
         );
         let source = root.join("已上传家电电脑.xlsx");
@@ -680,7 +689,7 @@ mod tests {
     }
 
     #[test]
-    fn finance_products_follow_invoice_number_without_sales_fallbacks() {
+    fn finance_products_prefer_sales_and_fall_back_to_invoice_number() {
         use crate::jobs::{unionpay, uploaded};
         let root = finance_fixture("finance-product-chain");
         write_fixture(
@@ -696,25 +705,28 @@ mod tests {
             ],
             &[
                 &[
+                    ("参考号", "A"),
                     ("匹配单据号", "sale-a"),
-                    ("商品名称", "海尔 冰箱 完整名称"),
-                    ("品牌", "海尔"),
+                    ("商品名称", "美的 冰箱 销售完整名称"),
+                    ("品牌", "美的"),
                     ("财务大类", "冰箱"),
                 ],
                 &[
                     ("匹配单据号", "sale-g"),
+                    ("参考号", "H"),
                     ("商品名称", "华为 手机 完整名称"),
                     ("品牌", "华为（终端）"),
                     ("财务大类", "数码"),
                 ],
                 &[
                     ("匹配单据号", "decoy"),
-                    ("商品名称", "不应匹配"),
-                    ("品牌", "错误品牌"),
-                    ("财务大类", "错误大类"),
+                    ("商品名称", "小天鹅-洗衣机-TG12TP3"),
+                    ("品牌", "美的"),
+                    ("财务大类", "洗衣机"),
                     ("参考号", "E"),
                     ("数电发票号码", "missing"),
                 ],
+                &[("参考号", "F"), ("匹配单据号", "sale-g")],
                 &[
                     ("商品名称", "空单据号不应匹配"),
                     ("数电发票号码", "blank-document"),
@@ -760,6 +772,8 @@ mod tests {
                 &[
                     ("匹配单据号", "sale-g"),
                     ("数电发票号码", "digital"),
+                    ("开票类型", "蓝票"),
+                    ("开票状态", "开票完成"),
                     ("大类", "数码"),
                     ("品牌", "华为（终端）"),
                     ("主要商品名称", "华为 手机 完整名称"),
@@ -842,15 +856,29 @@ mod tests {
         let range = book.worksheet_range(&name).unwrap();
         let rows: Vec<_> = range.rows().collect();
         assert_eq!(rows.len(), 9);
-        for row in [rows[1], rows[2]] {
-            assert_eq!(cell_to_string(&row[21]), "冰箱");
-            assert_eq!(cell_to_string(&row[22]), "海尔");
-            assert_eq!(cell_to_string(&row[23]), "海尔 冰箱 完整名称");
-        }
+        assert_eq!(cell_to_string(&rows[2][21]), "冰箱");
+        assert_eq!(cell_to_string(&rows[2][22]), "海尔");
+        assert_eq!(cell_to_string(&rows[2][23]), "海尔 冰箱 完整名称");
+        assert_eq!(cell_to_string(&rows[1][21]), "冰箱");
+        assert_eq!(cell_to_string(&rows[1][22]), "美的");
+        assert_eq!(cell_to_string(&rows[1][23]), "美的 冰箱 销售完整名称");
+        assert_eq!(cell_to_string(&rows[8][21]), "数码");
+        assert_eq!(cell_to_string(&rows[8][22]), "华为（终端）");
+        assert_eq!(cell_to_string(&rows[8][23]), "华为 手机 完整名称");
+        assert_eq!(cell_to_string(&rows[8][24]), "未提交");
+        assert_eq!(cell_to_string(&rows[8][25]), "digital");
+        assert_eq!(cell_to_string(&rows[6][21]), "数码");
+        assert_eq!(cell_to_string(&rows[6][22]), "华为（终端）");
+        assert_eq!(cell_to_string(&rows[6][23]), "华为 手机 完整名称");
+        assert_eq!(cell_to_string(&rows[6][25]), "digital");
         assert_eq!(cell_to_string(&rows[7][21]), "数码");
         assert_eq!(cell_to_string(&rows[7][22]), "华为（终端）");
         assert_eq!(cell_to_string(&rows[7][23]), "华为 手机 完整名称");
-        for row in [rows[3], rows[4], rows[5], rows[6], rows[8]] {
+        assert_eq!(cell_to_string(&rows[5][21]), "洗衣机");
+        assert_eq!(cell_to_string(&rows[5][22]), "美的");
+        assert_eq!(cell_to_string(&rows[5][23]), "小天鹅-洗衣机-TG12TP3");
+        assert_eq!(cell_to_string(&rows[5][25]), "missing");
+        for row in [rows[3], rows[4]] {
             assert!(
                 row[21..24]
                     .iter()
@@ -905,7 +933,7 @@ mod tests {
         write_fixture(
             &root,
             "销售用券情况统计.xlsx",
-            &["匹配单据号", "财务大类", "品牌", "商品名称"],
+            &["参考号", "匹配单据号", "财务大类", "品牌", "商品名称"],
             &[],
         );
         write_fixture(
@@ -1151,6 +1179,7 @@ mod tests {
                 "大类",
                 "品牌",
                 "主要商品名称",
+                "匹配单据号",
             ]),
             strings(&[
                 "invoice-a",
@@ -1177,6 +1206,13 @@ mod tests {
             &SheetData::new(uploads.clone()),
             &SheetData::new(digital.clone()),
             &SheetData::new(invoices.clone()),
+            &SheetData::new(vec![strings(&[
+                "参考号",
+                "财务大类",
+                "品牌",
+                "商品名称",
+                "匹配单据号",
+            ])]),
         )
         .unwrap();
         let path =
@@ -1216,6 +1252,13 @@ mod tests {
             &SheetData::new(uploads.clone()),
             &SheetData::new(digital.clone()),
             &SheetData::new(invalid_invoices.clone()),
+            &SheetData::new(vec![strings(&[
+                "参考号",
+                "财务大类",
+                "品牌",
+                "商品名称",
+                "匹配单据号",
+            ])]),
         )
         .unwrap_err();
         assert!(error.contains("发票明细.xlsx: 缺少必要列 [大类]"));
