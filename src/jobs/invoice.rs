@@ -121,16 +121,100 @@ fn clean_product_name(raw: &str) -> String {
 /// Unknown categories and names without a confirmed brand remain blank.
 fn split_product_name(name: &str) -> (String, String) {
     let Some((brand, remainder)) = name.split_once('-') else {
-        let category = match name {
-            "手机" | "平板" | "手表" | "家用平板电脑" | "小天才" => "数码",
-            "空调" => "空调",
-            _ => "",
-        };
+        let category = unseparated_finance_category(name).unwrap_or_default();
         return (category.to_string(), brand_from_unseparated_name(name));
     };
     let (category_token, _) = remainder.split_once('-').unwrap_or((remainder, ""));
     let category = invoice_finance_category(category_token).unwrap_or_default();
     (category.to_string(), normalize_invoice_brand(brand))
+}
+
+fn unseparated_finance_category(name: &str) -> Option<&'static str> {
+    match name {
+        "OPPO手机"
+        | "vivo手机"
+        | "IQOO手机"
+        | "华为手机"
+        | "一加手机"
+        | "小天才手表"
+        | "荣耀手机"
+        | "小天才电话手表"
+        | "学而思学习机"
+        | "作业帮学习机"
+        | "华为手表"
+        | "小米手机"
+        | "手机"
+        | "华为平板"
+        | "OPPO平板电脑"
+        | "平板"
+        | "苹果平板电脑"
+        | "苹果手机"
+        | "荣耀平板电脑"
+        | "手表"
+        | "一加平板"
+        | "红米手机"
+        | "OPPO手表"
+        | "华为手环"
+        | "VIVO手表"
+        | "OPPO电话手表"
+        | "苹果手表"
+        | "小天才学习机"
+        | "OPPO智能手表"
+        | "家用平板电脑"
+        | "小天才"
+        | "华为数码"
+        | "OPPO手机手机"
+        | "VIVO手机"
+        | "OPPO 平板"
+        | "华为 平板"
+        | "荣耀电话手表"
+        | "oppo手表"
+        | "vivo平板"
+        | "IQ手机"
+        | "华为智能穿戴"
+        | "vivo Y60i 6GB+128GB"
+        | "iQ手机"
+        | "ViVO手机"
+        | "HUAWEI平板电脑"
+        | "荣耀手环"
+        | "苹果平板"
+        | "长城电源"
+        | "IQOO手机手机"
+        | "VIXO手机"
+        | "iqoo手机"
+        | "手机vivo"
+        | "步步高学习机"
+        | "荣耀"
+        | "IQ00国产手机"
+        | "OPPO数码"
+        | "Reno手机" => Some("数码"),
+        "海尔空调" | "美的空调" | "卡萨帝空调" | "TCL空调" | "晶弘空调" | "奥克斯空调"
+        | "格力空调" | "海尔你空调" | "空调" | "统帅空调" | "美的中央空调" | "COLMO空调" => {
+            Some("空调")
+        }
+        "海尔冰箱" | "美菱冰箱" | "卡萨帝冰箱" | "美的冰箱" | "海尔冷柜" | "西门子电冰箱"
+        | "西门子冰箱" | "美菱电冰箱" | "美的冰柜" => Some("冰箱"),
+        "海尔洗衣机" | "卡萨帝洗衣机" | "小天鹅洗衣机" | "美菱洗衣机" | "西门子洗衣机"
+        | "西门子干衣机" => Some("洗衣机"),
+        "海尔热水器"
+        | "海尔电热水器"
+        | "卡萨帝电热水器"
+        | "海尔燃气热水器"
+        | "COLMO电热水器"
+        | "烟机灶具套餐"
+        | "卡萨帝燃气热水器"
+        | "欧意欧式烟机"
+        | "方太灶具"
+        | "COLMO燃气热水器"
+        | "卡萨帝热水器"
+        | "老板烟机"
+        | "老板灶具" => Some("厨卫"),
+        "创维电视" | "海信电视" | "TCL电视" | "海尔电视" => Some("彩电"),
+        "美的油汀" | "沁园净水类" | "美的小电风扇" | "沁园净水机" => {
+            Some("小电")
+        }
+        _ => None,
+    }
 }
 
 fn normalize_invoice_brand(brand: &str) -> String {
@@ -729,21 +813,21 @@ mod tests {
         let dir = unique_temp_path("invoice-product-fields");
         std::fs::create_dir_all(&dir).unwrap();
         let cases = [
-            ("OPPO手机", "", "OPPO"),
-            ("vivo手机", "", "vivo"),
-            ("卡萨帝冰箱", "", "海尔"),
-            ("Reno手机", "", "OPPO"),
-            ("VIXO手机", "", "vivo"),
-            ("IQ手机", "", "iqoo"),
-            ("iQ手机", "", "iqoo"),
-            ("IQ00国产手机", "", "iqoo"),
+            ("OPPO手机", "数码", "OPPO"),
+            ("vivo手机", "数码", "vivo"),
+            ("卡萨帝冰箱", "冰箱", "海尔"),
+            ("Reno手机", "数码", "OPPO"),
+            ("VIXO手机", "数码", "vivo"),
+            ("IQ手机", "数码", "iqoo"),
+            ("iQ手机", "数码", "iqoo"),
+            ("IQ00国产手机", "数码", "iqoo"),
             ("手机", "数码", ""),
             ("平板", "数码", ""),
             ("手表", "数码", ""),
             ("家用平板电脑", "数码", ""),
             ("小天才", "数码", "小天才"),
             ("空调", "空调", ""),
-            ("烟机灶具套餐", "", ""),
+            ("烟机灶具套餐", "厨卫", ""),
             ("美的（微清）-炉具-微波炉C237", "小电", "美的"),
             ("COLMO厨热JX水系统-CWS-F08", "厨卫", "美的"),
             ("小天鹅-干衣机-TH12B5", "洗衣机", "美的"),
