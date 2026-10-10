@@ -46,7 +46,7 @@ pub(crate) const SOURCE_HEADERS: [&str; 30] = [
     "打印状态",
 ];
 
-const OUTPUT_HEADERS: [&str; 8] = [
+const OUTPUT_HEADERS: [&str; 10] = [
     "开票时间",
     "开票类型",
     "数电发票号码",
@@ -55,6 +55,8 @@ const OUTPUT_HEADERS: [&str; 8] = [
     "备注信息",
     "开票状态",
     "匹配单据号",
+    "大类",
+    "品牌",
 ];
 
 pub(crate) struct InvoiceRecord {
@@ -63,6 +65,8 @@ pub(crate) struct InvoiceRecord {
     pub invoice_no: String,
     buyer_name: String,
     product_name: String,
+    finance_category: String,
+    brand: String,
     remark: String,
     invoice_status: String,
     pub match_doc_no: Value,
@@ -111,6 +115,148 @@ fn clean_product_name(raw: &str) -> String {
     raw.rsplit_once('*')
         .map_or(raw, |(_, name)| name)
         .to_string()
+}
+
+/// Extract the brand and category from invoice names; keep the full cleaned name intact.
+/// Unknown categories and names without a confirmed brand remain blank.
+fn split_product_name(name: &str) -> (String, String) {
+    let Some((brand, remainder)) = name.split_once('-') else {
+        return (String::new(), brand_from_unseparated_name(name));
+    };
+    let (category_token, _) = remainder.split_once('-').unwrap_or((remainder, ""));
+    let category = invoice_finance_category(category_token).unwrap_or_default();
+    (category.to_string(), normalize_invoice_brand(brand))
+}
+
+fn normalize_invoice_brand(brand: &str) -> String {
+    match brand.to_ascii_lowercase().as_str() {
+        "vivo" => "vivo".to_string(),
+        "iqoo" => "iqoo".to_string(),
+        "huawei" => "华为".to_string(),
+        "oppo" => "OPPO".to_string(),
+        "美的（小电）" | "美的（微清）" | "colmo厨热jx水系统" => {
+            "美的".to_string()
+        }
+        _ => super::coupons::normalize_brand(brand.to_string()),
+    }
+}
+
+fn brand_from_unseparated_name(name: &str) -> String {
+    match name {
+        "VIXO手机" | "手机vivo" => return "vivo".to_string(),
+        "IQ手机" | "iQ手机" | "IQ00国产手机" => return "iqoo".to_string(),
+        "Reno手机" => return "OPPO".to_string(),
+        _ => {}
+    }
+    let lower_name = name.to_ascii_lowercase();
+    [
+        "OPPO",
+        "vivo",
+        "iqoo",
+        "HUAWEI",
+        "华为",
+        "荣耀",
+        "一加",
+        "小米",
+        "红米",
+        "苹果",
+        "小天才",
+        "学而思",
+        "作业帮",
+        "海尔",
+        "卡萨帝",
+        "美的",
+        "美菱",
+        "小天鹅",
+        "创维",
+        "TCL",
+        "海信",
+        "晶弘",
+        "奥克斯",
+        "格力",
+        "西门子",
+        "欧意",
+        "沁园",
+        "方太",
+        "长城",
+        "COLMO",
+        "统帅",
+        "步步高",
+        "老板",
+    ]
+    .into_iter()
+    .find(|brand| lower_name.starts_with(&brand.to_ascii_lowercase()))
+    .map(normalize_invoice_brand)
+    .unwrap_or_default()
+}
+
+fn invoice_finance_category(token: &str) -> Option<&'static str> {
+    Some(match token {
+        "国产手机" | "合资手机" | "学习机" | "电话手表" | "手表" => "数码",
+        "空调"
+        | "家用挂机直流无氟变频1.5P35"
+        | "家用柜机直流无氟变频3P72"
+        | "风管机"
+        | "中央空调多联机"
+        | "家用挂机直流无氟变频2P50"
+        | "家用柜机直流无氟变频4P"
+        | "家用多联机外机"
+        | "家用挂机直流无氟变频1P26"
+        | "家用挂机直流无氟变频3P"
+        | "家用柜机直流无氟变频5P" => "空调",
+        "洗衣机" | "洗鞋一体机" => "洗衣机",
+        "干衣机" => "洗衣机",
+        "冰箱" | "冷柜" | "冰吧" | "冰柜" => "冰箱",
+        "电热水器"
+        | "燃气热水器"
+        | "欧式烟机"
+        | "嵌入式灶"
+        | "热水器其他"
+        | "欧式烟机CXW"
+        | "水系统"
+        | "电器"
+        | "进吸式烟机"
+        | "洗碗机cw"
+        | "洗碗机（厨卫）"
+        | "岛式烟机"
+        | "即热式热水器"
+        | "CWS"
+        | "嵌入式消毒柜"
+        | "嵌入式蒸箱\\烤箱\\微波炉" => "厨卫",
+        "彩电"
+        | "国产普通LED75寸"
+        | "国产普通LED85寸"
+        | "国产普通"
+        | "国产普通LED100寸"
+        | "国产普通LED98寸"
+        | "激光投影"
+        | "彩电艺术显示"
+        | "国产普通LED86寸"
+        | "国产激光4K88寸"
+        | "国产激光4K80寸"
+        | "国产激光LED100寸"
+        | "国产激光LED86寸"
+        | "国产艺术电视LED75寸"
+        | "壁纸电视"
+        | "国产壁纸电视LED85寸"
+        | "艺术显示彩电" => "彩电",
+        "投影仪" => "彩电",
+        "净水类"
+        | "净水类（小电）"
+        | "净水机"
+        | "洁净类"
+        | "其他生活小电"
+        | "电解水机"
+        | "锅具"
+        | "炉具"
+        | "加工机"
+        | "智能锁" => "小电",
+        "多联空调" | "多联内机" | "厨房空调器" | "厨房空调" | "多联机配件（控制器）" => {
+            "空调"
+        }
+        "国产艺术电视LED85寸" => "彩电",
+        _ => return None,
+    })
 }
 
 fn is_abnormal(record: &InvoiceRecord) -> bool {
@@ -201,6 +347,8 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
         let invoice_no = text_at(9, "数电发票号码")?;
         let buyer_name = text_at(10, "购方名称")?;
         let raw_product_name = text_at(16, "主要商品名称")?;
+        let product_name = clean_product_name(&raw_product_name);
+        let (finance_category, brand) = split_product_name(&product_name);
         let remark = text_at(21, "备注信息")?;
         let invoice_status = text_at(28, "开票状态")?;
 
@@ -209,7 +357,9 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
             invoice_type,
             invoice_no,
             buyer_name,
-            product_name: clean_product_name(&raw_product_name),
+            product_name,
+            finance_category,
+            brand,
             match_doc_no: doc_no::MatchDocNo::from_remark(&remark)
                 .map_or(Value::Empty, |m| Value::Text(m.into_string())),
             remark,
@@ -271,8 +421,10 @@ fn classify_and_build_table(records: Vec<InvoiceRecord>) -> Table {
 }
 
 fn output_columns() -> Vec<Column> {
-    const TYPES: [ColumnType; 8] = [
+    const TYPES: [ColumnType; 10] = [
         ColumnType::DateTime,
+        ColumnType::Text,
+        ColumnType::Text,
         ColumnType::Text,
         ColumnType::Text,
         ColumnType::Text,
@@ -298,6 +450,8 @@ fn to_row(record: InvoiceRecord, fill: Option<Fill>) -> Row {
         text_value(record.remark),
         text_value(record.invoice_status),
         record.match_doc_no,
+        text_value(record.finance_category),
+        text_value(record.brand),
     ];
     Row { values, fill }
 }
@@ -566,6 +720,55 @@ mod tests {
     }
 
     #[test]
+    fn product_fields_survive_cleaning_without_changing_full_names() {
+        let dir = unique_temp_path("invoice-product-fields");
+        std::fs::create_dir_all(&dir).unwrap();
+        let cases = [
+            ("OPPO手机", "", "OPPO"),
+            ("vivo手机", "", "vivo"),
+            ("卡萨帝冰箱", "", "海尔"),
+            ("Reno手机", "", "OPPO"),
+            ("VIXO手机", "", "vivo"),
+            ("IQ手机", "", "iqoo"),
+            ("iQ手机", "", "iqoo"),
+            ("IQ00国产手机", "", "iqoo"),
+            ("手机", "", ""),
+            ("平板", "", ""),
+            ("手表", "", ""),
+            ("家用平板电脑", "", ""),
+            ("空调", "", ""),
+            ("烟机灶具套餐", "", ""),
+            ("美的（微清）-炉具-微波炉C237", "小电", "美的"),
+            ("COLMO厨热JX水系统-CWS-F08", "厨卫", "美的"),
+            ("小天鹅-干衣机-TH12B5", "洗衣机", "美的"),
+            (
+                "美的厨热JX-嵌入式蒸箱\\烤箱\\微波炉-BG50T5W",
+                "厨卫",
+                "美的",
+            ),
+            ("海尔-未知类别-型号-A", "", "海尔"),
+        ];
+        let raw_names: Vec<_> = cases
+            .iter()
+            .map(|(name, _, _)| format!("*商品*{name}"))
+            .collect();
+        let rows: Vec<_> = raw_names
+            .iter()
+            .map(|name| sample_source_row("2026-09-14 10:00:00", "蓝票", "开票完成", "", name))
+            .collect();
+        write_invoice_workbook(&dir.join("发票_20260914.xlsx"), "发票_20260914", &rows);
+        let table = InvoiceJob.run(&dir).unwrap();
+        assert_eq!(table.columns.len(), 10);
+        assert_eq!(table.rows.len(), cases.len());
+        for (row, (name, category, brand)) in table.rows.iter().zip(cases) {
+            assert_eq!(row.values[4], Value::Text(name.into()));
+            assert_eq!(row.values[8], text_value(category.into()), "{name}");
+            assert_eq!(row.values[9], text_value(brand.into()), "{name}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn selects_latest_file_validates_and_classifies_records() {
         let dir = unique_temp_path("invoice-happy-path");
         std::fs::create_dir_all(&dir).unwrap();
@@ -621,7 +824,7 @@ mod tests {
         let job = InvoiceJob;
         let table = job.run(&dir).unwrap();
 
-        assert_eq!(table.columns.len(), 8);
+        assert_eq!(table.columns.len(), 10);
         assert_eq!(table.rows.len(), 4);
 
         // 正常记录：星号清洗后的商品名称，唯一匹配单据号，且不含旧文件数据。
@@ -629,6 +832,8 @@ mod tests {
             table.rows[0].values[4],
             Value::Text("小天鹅-洗衣机-TG12TP3".to_string())
         );
+        assert_eq!(table.rows[0].values[8], Value::Text("洗衣机".into()));
+        assert_eq!(table.rows[0].values[9], Value::Text("美的".into()));
         assert_eq!(table.rows[0].fill, None);
         assert_eq!(
             table.rows[0].values[7],

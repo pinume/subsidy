@@ -342,7 +342,7 @@ fn to_row(
 }
 
 /// 10.11 节品牌归并：仅替换列出的原值，其余原样保留。
-fn normalize_brand(value: String) -> String {
+pub(crate) fn normalize_brand(value: String) -> String {
     match value.as_str() {
         "COLMO厨热JX" | "美的厨热JX" | "东芝JX" | "华凌" | "小天鹅" | "COLMO" => {
             "美的".to_string()

@@ -23,7 +23,6 @@ pub(crate) fn generate_with_inputs(
 
     // 1. Load source data
     let store_occ_rows = SheetData::load(&input_dir.join("银联交易明细门店.xlsx"))?;
-    let sales_rows = &inputs.sales;
     let app_upload_rows = &inputs.app_upload;
     let dig_upload_rows = &inputs.dig_upload;
     let app_refund_rows = &inputs.app_refund;
@@ -37,7 +36,6 @@ pub(crate) fn generate_with_inputs(
         &mut workbook,
         &styles,
         &store_occ_rows,
-        sales_rows,
         app_upload_rows,
         dig_upload_rows,
         invoice_rows,
@@ -70,7 +68,6 @@ fn build_final_match_sheet(
     wb: &mut Workbook,
     s: &StylePool,
     store_occ: &SheetData,
-    sales: &SheetData,
     app_up: &SheetData,
     dig_up: &SheetData,
     invoices: &SheetData,
@@ -133,7 +130,7 @@ fn build_final_match_sheet(
     }
 
     // 1. Initialize TransactionReconciler to index products, uploads, and invoices
-    let reconciler = TransactionReconciler::from_inputs(sales, app_up, dig_up, invoices)?;
+    let reconciler = TransactionReconciler::from_inputs(app_up, dig_up, invoices)?;
 
     // 2. Pre-resolve store occurrence column mappings for final match
     let store_h = &store_occ.header;
@@ -163,7 +160,7 @@ fn build_final_match_sheet(
         let remark = cell_to_string(&row[s_rem_idx]);
         let rec = reconciler.reconcile(&ref_num, &remark);
 
-        // Col 21, 22, 23: bridge the final invoice to the sales document number.
+        // Col 21, 22, 23: read category, brand, and cleaned product name by invoice number.
         ws.write_string_with_format(cur_row, 21, rec.category(), &s.text_center)
             .map_err(|e| e.to_string())?;
         ws.write_string_with_format(cur_row, 22, rec.brand(), &s.text_left)
@@ -625,7 +622,15 @@ mod tests {
         write_fixture(
             &root,
             "发票明细.xlsx",
-            &["数电发票号码", "匹配单据号", "开票类型", "开票状态"],
+            &[
+                "数电发票号码",
+                "匹配单据号",
+                "开票类型",
+                "开票状态",
+                "大类",
+                "品牌",
+                "主要商品名称",
+            ],
             &[
                 &[
                     ("数电发票号码", "blue"),
@@ -712,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn finance_products_follow_invoice_document_chain_without_fallbacks() {
+    fn finance_products_follow_invoice_number_without_sales_fallbacks() {
         use crate::jobs::{unionpay, uploaded};
         let root = finance_fixture("finance-product-chain");
         write_fixture(
@@ -756,17 +761,31 @@ mod tests {
         write_fixture(
             &root,
             "发票明细.xlsx",
-            &["开票状态", "匹配单据号", "数电发票号码", "开票类型"],
+            &[
+                "开票状态",
+                "匹配单据号",
+                "数电发票号码",
+                "开票类型",
+                "大类",
+                "品牌",
+                "主要商品名称",
+            ],
             &[
                 &[
                     ("匹配单据号", "sale-a"),
                     ("数电发票号码", "old"),
+                    ("大类", "冰箱"),
+                    ("品牌", "海尔"),
+                    ("主要商品名称", "海尔 冰箱 完整名称"),
                     ("开票类型", "蓝票"),
                     ("开票状态", "已红冲"),
                 ],
                 &[
                     ("匹配单据号", "sale-a"),
                     ("数电发票号码", "new"),
+                    ("大类", "冰箱"),
+                    ("品牌", "海尔"),
+                    ("主要商品名称", "海尔 冰箱 完整名称"),
                     ("开票类型", "蓝票"),
                     ("开票状态", "开票完成"),
                 ],
@@ -775,7 +794,13 @@ mod tests {
                     ("匹配单据号", "absent-sale"),
                     ("数电发票号码", "absent-document"),
                 ],
-                &[("匹配单据号", "sale-g"), ("数电发票号码", "digital")],
+                &[
+                    ("匹配单据号", "sale-g"),
+                    ("数电发票号码", "digital"),
+                    ("大类", "数码"),
+                    ("品牌", "华为（终端）"),
+                    ("主要商品名称", "华为 手机 完整名称"),
+                ],
             ],
         );
         let headers = |tail: &[crate::jobs::uploaded::TailField]| {
@@ -923,7 +948,15 @@ mod tests {
         write_fixture(
             &root,
             "发票明细.xlsx",
-            &["数电发票号码", "匹配单据号", "开票类型", "开票状态"],
+            &[
+                "数电发票号码",
+                "匹配单据号",
+                "开票类型",
+                "开票状态",
+                "大类",
+                "品牌",
+                "主要商品名称",
+            ],
             &[],
         );
         write_fixture(&root, "银联交易明细门店.xlsx", &HEADERS, &[]);
@@ -1096,7 +1129,7 @@ mod tests {
     }
 
     #[test]
-    fn final_products_use_invoice_document_number_and_full_name() {
+    fn final_products_use_invoice_number_and_cleaned_full_name() {
         let strings = |values: &[&str]| {
             values
                 .iter()
@@ -1139,34 +1172,7 @@ mod tests {
             row[20] = Data::String(remark.to_string());
             store.push(row);
         }
-        // A reissued invoice joins through its document number despite a blank sales invoice.
-        let sales = vec![
-            strings(&[
-                "商品名称",
-                "品牌",
-                "匹配单据号",
-                "财务大类",
-                "参考号",
-                "数电发票号码",
-            ]),
-            strings(&[
-                "海尔 冰箱 BCD-123 完整商品名称",
-                "海尔",
-                "document-a",
-                "冰箱",
-                "different-ref",
-                "",
-            ]),
-            strings(&["blank document product", "decoy", "", "decoy", "ref-b", ""]),
-            strings(&[
-                "reference decoy",
-                "decoy",
-                "another-document",
-                "decoy",
-                "ref-c",
-                "unmatched-invoice",
-            ]),
-        ];
+        // Reissued invoices provide their cleaned product fields directly.
         let uploads = vec![
             strings(&["检索参考号", "状态", "发票号码", "补贴金额"]),
             strings(&["ref-a", "审核通过未回款", "invoice-a", "1"]),
@@ -1175,16 +1181,36 @@ mod tests {
         ];
         let digital = vec![uploads[0].clone()];
         let invoices = vec![
-            strings(&["数电发票号码", "匹配单据号", "开票类型", "开票状态"]),
-            strings(&["invoice-a", "document-a", "蓝票", "开票完成"]),
-            strings(&["old-invoice-a", "document-a", "蓝票", "已红冲"]),
+            strings(&[
+                "数电发票号码",
+                "开票类型",
+                "开票状态",
+                "大类",
+                "品牌",
+                "主要商品名称",
+            ]),
+            strings(&[
+                "invoice-a",
+                "蓝票",
+                "开票完成",
+                "冰箱",
+                "海尔",
+                "海尔 冰箱 BCD-123 完整商品名称",
+            ]),
+            strings(&[
+                "old-invoice-a",
+                "蓝票",
+                "已红冲",
+                "冰箱",
+                "海尔",
+                "海尔 冰箱 BCD-123 完整商品名称",
+            ]),
         ];
         let mut workbook = Workbook::new();
         build_final_match_sheet(
             &mut workbook,
             &StylePool::default(),
             &SheetData::new(store.clone()),
-            &SheetData::new(sales.clone()),
             &SheetData::new(uploads.clone()),
             &SheetData::new(digital.clone()),
             &SheetData::new(invoices.clone()),
@@ -1218,18 +1244,17 @@ mod tests {
         assert_eq!(rows[4][24], "未提交");
         std::fs::remove_file(path).unwrap();
 
-        let mut invalid_sales = sales.clone();
-        invalid_sales[0][2] = Data::String("wrong document column".to_string());
+        let mut invalid_invoices = invoices.clone();
+        invalid_invoices[0][3] = Data::String("wrong category column".to_string());
         let error = build_final_match_sheet(
             &mut Workbook::new(),
             &StylePool::default(),
             &SheetData::new(store.clone()),
-            &SheetData::new(invalid_sales.clone()),
             &SheetData::new(uploads.clone()),
             &SheetData::new(digital.clone()),
-            &SheetData::new(invoices.clone()),
+            &SheetData::new(invalid_invoices.clone()),
         )
         .unwrap_err();
-        assert!(error.contains("销售用券情况统计.xlsx: 缺少必要列 [匹配单据号]"));
+        assert!(error.contains("发票明细.xlsx: 缺少必要列 [大类]"));
     }
 }

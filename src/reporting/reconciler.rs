@@ -55,12 +55,11 @@ struct UploadEntry {
 struct InvoiceEntry {
     invoice_type: String,
     invoice_status: String,
-    match_doc_no: String,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct TransactionReconciler {
-    product_map: HashMap<String, ProductEntry>,
+    invoice_product_map: HashMap<String, ProductEntry>,
     upload_map: HashMap<String, UploadEntry>,
     invoice_map: HashMap<String, InvoiceEntry>,
 }
@@ -68,18 +67,10 @@ pub(crate) struct TransactionReconciler {
 impl TransactionReconciler {
     /// 校验必要表头并构建哈希索引；缺列时立即 Fail-Fast 报错。
     pub fn from_inputs(
-        sales: &SheetData,
         app_upload: &SheetData,
         dig_upload: &SheetData,
         invoices: &SheetData,
     ) -> Result<Self, String> {
-        // 1. Upfront header validation across all 4 input sheets (fail-fast)
-        let sales_h = &sales.header;
-        let sales_doc_idx = sales_h.require("匹配单据号", "销售用券情况统计.xlsx")?;
-        let sales_cat_idx = sales_h.require("财务大类", "销售用券情况统计.xlsx")?;
-        let sales_brand_idx = sales_h.require("品牌", "销售用券情况统计.xlsx")?;
-        let sales_name_idx = sales_h.require("商品名称", "销售用券情况统计.xlsx")?;
-
         let app_cols = UploadColumns::from_header(&app_upload.header, "已上传家电电脑.xlsx")?;
         let dig_cols = UploadColumns::from_header(&dig_upload.header, "已上传数码.xlsx")?;
 
@@ -89,25 +80,11 @@ impl TransactionReconciler {
             .ok_or("发票明细缺少数电发票号码")?;
         let inv_type_idx = inv_h.find(&["开票类型"]).ok_or("发票明细缺少开票类型")?;
         let inv_st_idx = inv_h.find(&["开票状态"]).ok_or("发票明细缺少开票状态")?;
-        let inv_doc_idx = inv_h.require("匹配单据号", "发票明细.xlsx")?;
+        let inv_category_idx = inv_h.require("大类", "发票明细.xlsx")?;
+        let inv_brand_idx = inv_h.require("品牌", "发票明细.xlsx")?;
+        let inv_product_name_idx = inv_h.require("主要商品名称", "发票明细.xlsx")?;
 
-        // 2. Index the sales record by its document number (匹配单据号)
-        let mut product_map = HashMap::new();
-        for row in &sales[1..] {
-            let document = cell_to_string(&row[sales_doc_idx]);
-            if !document.is_empty() {
-                product_map.insert(
-                    document,
-                    ProductEntry {
-                        category: cell_to_string(&row[sales_cat_idx]),
-                        brand: cell_to_string(&row[sales_brand_idx]),
-                        model: cell_to_string(&row[sales_name_idx]),
-                    },
-                );
-            }
-        }
-
-        // 3. Build index for uploaded records (appliance + digital)
+        // Build index for uploaded records (appliance + digital).
         let mut upload_map = HashMap::new();
         for (rows, cols) in [(app_upload, app_cols), (dig_upload, dig_cols)] {
             for row in &rows[1..] {
@@ -124,24 +101,32 @@ impl TransactionReconciler {
             }
         }
 
-        // 4. Build index for invoice records
+        // Index invoices and their parsed product fields by invoice number.
         let mut invoice_map = HashMap::new();
+        let mut invoice_product_map = HashMap::new();
         for row in &invoices[1..] {
             let invoice_no = cell_to_string(&row[inv_no_idx]);
             if !invoice_no.is_empty() {
+                invoice_product_map.insert(
+                    invoice_no.clone(),
+                    ProductEntry {
+                        category: cell_to_string(&row[inv_category_idx]),
+                        brand: cell_to_string(&row[inv_brand_idx]),
+                        model: cell_to_string(&row[inv_product_name_idx]),
+                    },
+                );
                 invoice_map.insert(
                     invoice_no,
                     InvoiceEntry {
                         invoice_type: cell_to_string(&row[inv_type_idx]),
                         invoice_status: cell_to_string(&row[inv_st_idx]),
-                        match_doc_no: cell_to_string(&row[inv_doc_idx]),
                     },
                 );
             }
         }
 
         Ok(Self {
-            product_map,
+            invoice_product_map,
             upload_map,
             invoice_map,
         })
@@ -153,7 +138,7 @@ impl TransactionReconciler {
     /// - `docs/reporting-rules.md` 第 5.1.1 节规则 2：门店备注为“已退货”时，状态固定为“已退货”。
     /// - `docs/reporting-rules.md` 第 5.1.1 节规则 3：未命中已上传记录时，状态填“未提交”。
     /// - `docs/reporting-rules.md` 第 5.1.1 节规则 4：发票开票类型为“红票”或开票状态为“已红冲”时，标记为“是”，否则留空。
-    /// - `docs/reporting-rules.md` 第 5.1.1 节规则 5：通过已上传发票号关联发票明细匹配单据号，再命中销售用券商品信息（品类、品牌、型号）。
+    /// - `docs/reporting-rules.md` 第 5.1.1 节规则 5：通过已上传发票号关联发票明细，读取发票清洗时生成的商品信息。
     pub fn reconcile<'a>(
         &'a self,
         reference_no: &str,
@@ -166,8 +151,9 @@ impl TransactionReconciler {
         };
 
         let invoice_entry = self.invoice_map.get(invoice_no);
-        let product = invoice_entry
-            .and_then(|entry| self.product_map.get(&entry.match_doc_no))
+        let product = self
+            .invoice_product_map
+            .get(invoice_no)
             .map(|entry| ProductInfo {
                 category: entry.category.as_str(),
                 brand: entry.brand.as_str(),
@@ -200,7 +186,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reconciles_product_through_document_chain() {
+    fn reconciles_product_through_invoice_number() {
         let mut reconciler = TransactionReconciler::default();
 
         // upload: ref-1 -> status "待审核", invoice "inv-101"
@@ -212,23 +198,22 @@ mod tests {
             },
         );
 
-        // invoice: inv-101 -> type "蓝票", status "开票完成", doc "doc-999"
+        // invoice: inv-101 -> type "蓝票", status "开票完成"
         reconciler.invoice_map.insert(
             "inv-101".to_string(),
             InvoiceEntry {
                 invoice_type: "蓝票".to_string(),
                 invoice_status: "开票完成".to_string(),
-                match_doc_no: "doc-999".to_string(),
             },
         );
 
-        // product: doc-999 -> ("冰箱", "海尔", "BCD-500")
-        reconciler.product_map.insert(
-            "doc-999".to_string(),
+        // product: inv-101 -> ("冰箱", "海尔", "海尔-冰箱-BCD-500")
+        reconciler.invoice_product_map.insert(
+            "inv-101".to_string(),
             ProductEntry {
                 category: "冰箱".to_string(),
                 brand: "海尔".to_string(),
-                model: "BCD-500".to_string(),
+                model: "海尔-冰箱-BCD-500".to_string(),
             },
         );
 
@@ -240,13 +225,13 @@ mod tests {
         assert_eq!(result.red_flush_text(), "");
         assert_eq!(result.category(), "冰箱");
         assert_eq!(result.brand(), "海尔");
-        assert_eq!(result.model(), "BCD-500");
+        assert_eq!(result.model(), "海尔-冰箱-BCD-500");
         assert_eq!(
             result.product,
             Some(ProductInfo {
                 category: "冰箱",
                 brand: "海尔",
-                model: "BCD-500",
+                model: "海尔-冰箱-BCD-500",
             })
         );
     }
@@ -299,7 +284,6 @@ mod tests {
             InvoiceEntry {
                 invoice_type: "红票".to_string(),
                 invoice_status: "开票完成".to_string(),
-                match_doc_no: "doc-1".to_string(),
             },
         );
 
@@ -316,7 +300,6 @@ mod tests {
             InvoiceEntry {
                 invoice_type: "蓝票".to_string(),
                 invoice_status: "已红冲".to_string(),
-                match_doc_no: "doc-2".to_string(),
             },
         );
 
@@ -333,7 +316,6 @@ mod tests {
             InvoiceEntry {
                 invoice_type: "蓝票".to_string(),
                 invoice_status: "开票完成".to_string(),
-                match_doc_no: "doc-3".to_string(),
             },
         );
 
@@ -351,12 +333,8 @@ mod tests {
     }
 
     #[test]
-    fn from_inputs_fails_when_sales_missing_required_column() {
+    fn from_inputs_fails_when_invoice_missing_required_column() {
         use calamine::Data;
-        let sales = SheetData::new(vec![vec![
-            Data::String("商品名称".to_string()),
-            Data::String("品牌".to_string()),
-        ]]);
         let app_upload = SheetData::new(vec![vec![
             Data::String("检索参考号".to_string()),
             Data::String("状态".to_string()),
@@ -376,28 +354,14 @@ mod tests {
             Data::String("匹配单据号".to_string()),
         ]]);
 
-        let err = TransactionReconciler::from_inputs(&sales, &app_upload, &dig_upload, &invoices)
-            .unwrap_err();
-        assert!(err.contains("销售用券情况统计.xlsx: 缺少必要列 [匹配单据号]"));
+        let err =
+            TransactionReconciler::from_inputs(&app_upload, &dig_upload, &invoices).unwrap_err();
+        assert!(err.contains("发票明细.xlsx: 缺少必要列 [大类]"));
     }
 
     #[test]
     fn from_inputs_builds_indexes_and_reconciles() {
         use calamine::Data;
-        let sales = SheetData::new(vec![
-            vec![
-                Data::String("匹配单据号".to_string()),
-                Data::String("财务大类".to_string()),
-                Data::String("品牌".to_string()),
-                Data::String("商品名称".to_string()),
-            ],
-            vec![
-                Data::String("doc-100".to_string()),
-                Data::String("彩电".to_string()),
-                Data::String("创维".to_string()),
-                Data::String("75A3D 4K超高清".to_string()),
-            ],
-        ]);
         let app_upload = SheetData::new(vec![
             vec![
                 Data::String("检索参考号".to_string()),
@@ -423,32 +387,35 @@ mod tests {
                 Data::String("数电发票号码".to_string()),
                 Data::String("开票类型".to_string()),
                 Data::String("开票状态".to_string()),
-                Data::String("匹配单据号".to_string()),
+                Data::String("大类".to_string()),
+                Data::String("品牌".to_string()),
+                Data::String("主要商品名称".to_string()),
             ],
             vec![
                 Data::String("inv-888".to_string()),
                 Data::String("蓝票".to_string()),
                 Data::String("开票完成".to_string()),
-                Data::String("doc-100".to_string()),
+                Data::String("彩电".to_string()),
+                Data::String("创维".to_string()),
+                Data::String("创维-彩电-75A3D 4K超高清".to_string()),
             ],
         ]);
 
         let reconciler =
-            TransactionReconciler::from_inputs(&sales, &app_upload, &dig_upload, &invoices)
-                .unwrap();
+            TransactionReconciler::from_inputs(&app_upload, &dig_upload, &invoices).unwrap();
         let res = reconciler.reconcile("ref-999", "");
         assert_eq!(res.status, "审核通过未回款");
         assert_eq!(res.invoice_no, "inv-888");
         assert!(!res.is_red_flush);
         assert_eq!(res.category(), "彩电");
         assert_eq!(res.brand(), "创维");
-        assert_eq!(res.model(), "75A3D 4K超高清");
+        assert_eq!(res.model(), "创维-彩电-75A3D 4K超高清");
         assert_eq!(
             res.product,
             Some(ProductInfo {
                 category: "彩电",
                 brand: "创维",
-                model: "75A3D 4K超高清",
+                model: "创维-彩电-75A3D 4K超高清",
             })
         );
     }
