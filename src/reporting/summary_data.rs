@@ -3,13 +3,11 @@ use super::reader::{HeaderMap, UploadColumns, cell_to_decimal, cell_to_string};
 use calamine::Data;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 type UploadTotals = HashMap<String, (Decimal, i64)>;
 
-pub type SalesMatrix = HashMap<(String, String), HashMap<String, (Decimal, i64)>>;
-
-pub const STD_CATEGORIES: [(&str, &[&str]); 7] = [
+const STD_CATEGORIES: [(&str, &[&str]); 7] = [
     (
         "厨卫",
         &["AO史密斯", "万家乐", "方太", "欧意", "海尔", "美的", "老板"],
@@ -213,35 +211,90 @@ impl SummaryMetrics {
     }
 }
 
-pub fn build_sales_matrix(sales: &SheetData) -> Result<SalesMatrix, String> {
-    let h = &sales.header;
-    let cat_idx = h.require("财务大类", "销售用券情况统计.xlsx")?;
-    let brand_idx = h.require("品牌", "销售用券情况统计.xlsx")?;
-    let sub_idx = h.require("补贴额", "销售用券情况统计.xlsx")?;
-    let qty_idx = h.require("数量", "销售用券情况统计.xlsx")?;
-    let remark_idx = h.require("备注", "销售用券情况统计.xlsx")?;
+pub(crate) const SUMMARY_STATUSES: [&str; 5] =
+    ["已回款", "审核通过未回款", "待审核", "审核失败", "未上传"];
 
-    let mut matrix: SalesMatrix = HashMap::new();
+pub(crate) struct BrandSummary {
+    pub brand: String,
+    pub totals: [(Decimal, i64); 5],
+}
 
-    for row in &sales[1..] {
-        let remark = cell_to_string(&row[remark_idx]);
-        if remark == "退货-原单" || remark == "退货-退单" {
-            continue;
+pub(crate) struct CategorySummary {
+    pub category: String,
+    pub brands: Vec<BrandSummary>,
+}
+
+/// 品类品牌汇总：聚合、业务排序与五状态投影由同一 module 拥有。
+/// Excel 格式与大类合并由渲染负责。
+pub(crate) struct CategoryBrandSummary {
+    groups: Vec<CategorySummary>,
+}
+
+impl CategoryBrandSummary {
+    pub fn from_sales(sales: &SheetData) -> Result<Self, String> {
+        let h = &sales.header;
+        let cat_idx = h.require("财务大类", "销售用券情况统计.xlsx")?;
+        let brand_idx = h.require("品牌", "销售用券情况统计.xlsx")?;
+        let sub_idx = h.require("补贴额", "销售用券情况统计.xlsx")?;
+        let qty_idx = h.require("数量", "销售用券情况统计.xlsx")?;
+        let remark_idx = h.require("备注", "销售用券情况统计.xlsx")?;
+
+        let mut categories: BTreeMap<String, BTreeMap<String, [(Decimal, i64); 5]>> =
+            BTreeMap::new();
+        for row in &sales[1..] {
+            let remark = cell_to_string(&row[remark_idx]);
+            if remark == "退货-原单" || remark == "退货-退单" {
+                continue;
+            }
+            let totals = categories
+                .entry(cell_to_string(&row[cat_idx]))
+                .or_default()
+                .entry(cell_to_string(&row[brand_idx]))
+                .or_default();
+            // 非展示状态仍保留实际品类品牌组合，但不计入五状态数值。
+            if let Some(status) = SUMMARY_STATUSES.iter().position(|value| *value == remark) {
+                totals[status].0 += cell_to_decimal(&row[sub_idx]).unwrap_or(Decimal::ZERO);
+                totals[status].1 += cell_to_decimal(&row[qty_idx])
+                    .and_then(|d| d.to_i64())
+                    .unwrap_or(0);
+            }
         }
-        let cat = cell_to_string(&row[cat_idx]);
-        let brand = cell_to_string(&row[brand_idx]);
-        let amt = cell_to_decimal(&row[sub_idx]).unwrap_or(Decimal::ZERO);
-        let qty = cell_to_decimal(&row[qty_idx])
-            .and_then(|d| d.to_i64())
-            .unwrap_or(0);
 
-        let entry = matrix.entry((cat, brand)).or_default();
-        let status_entry = entry.entry(remark).or_insert((Decimal::ZERO, 0));
-        status_entry.0 += amt;
-        status_entry.1 += qty;
+        let mut groups: Vec<_> = categories
+            .into_iter()
+            .map(|(category, brands)| {
+                let standard_brands = STD_CATEGORIES
+                    .iter()
+                    .find(|(name, _)| *name == category)
+                    .map(|(_, brands)| *brands)
+                    .unwrap_or_default();
+                let mut brands: Vec<_> = brands
+                    .into_iter()
+                    .map(|(brand, totals)| BrandSummary { brand, totals })
+                    .collect();
+                // BTreeMap 已按文本升序提供新增品牌；稳定排序将标准品牌移至业务位置。
+                brands.sort_by_key(|brand| {
+                    standard_brands
+                        .iter()
+                        .position(|name| *name == brand.brand)
+                        .unwrap_or(usize::MAX)
+                });
+                CategorySummary { category, brands }
+            })
+            .collect();
+        // 标准品类使用业务顺序，新增品类保持 BTreeMap 的文本升序。
+        groups.sort_by_key(|group| {
+            STD_CATEGORIES
+                .iter()
+                .position(|(name, _)| *name == group.category)
+                .unwrap_or(usize::MAX)
+        });
+        Ok(Self { groups })
     }
 
-    Ok(matrix)
+    pub fn groups(&self) -> &[CategorySummary] {
+        &self.groups
+    }
 }
 
 pub fn build_invoice_name_map(invoices: &SheetData) -> Result<HashMap<String, String>, String> {
@@ -358,6 +411,88 @@ fn refund_indices(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sales(rows: &[&[&str]]) -> SheetData {
+        SheetData::new(
+            std::iter::once(&["财务大类", "品牌", "补贴额", "数量", "备注"][..])
+                .chain(rows.iter().copied())
+                .map(|row| {
+                    row.iter()
+                        .map(|value| Data::String((*value).into()))
+                        .collect()
+                })
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn category_brand_summary_orders_actual_combinations_and_projects_five_statuses() {
+        let input = sales(&[
+            &["Z", "B", "900", "1", "其他"],
+            &["冰箱", "海尔", "10.25", "1", "已回款"],
+            &["冰箱", "海尔", "-2.25", "-1", "已回款"],
+            &["冰箱", "博世", "5", "2", "待审核"],
+            &["冰箱", "Z", "4", "1", "未上传"],
+            &["冰箱", "A", "3", "1", "审核失败"],
+            &["冰箱", "", "6", "1", "审核通过未回款"],
+            &["A", "", "7", "1", ""],
+            &["", "", "8", "1", "未上传"],
+            &["退货品类", "退货品牌", "20", "1", " 退货-原单 "],
+            &["退货品类", "退货品牌", "-20", "-1", "退货-退单"],
+        ]);
+        let summary = CategoryBrandSummary::from_sales(&input).unwrap();
+        let names: Vec<_> = summary
+            .groups()
+            .iter()
+            .flat_map(|group| {
+                group
+                    .brands
+                    .iter()
+                    .map(move |brand| (group.category.as_str(), brand.brand.as_str()))
+            })
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("冰箱", "博世"),
+                ("冰箱", "海尔"),
+                ("冰箱", ""),
+                ("冰箱", "A"),
+                ("冰箱", "Z"),
+                ("", ""),
+                ("A", ""),
+                ("Z", "B")
+            ]
+        );
+        let zero = (Decimal::ZERO, 0);
+        let brands = &summary.groups()[0].brands;
+        assert_eq!(
+            brands[0].totals,
+            [zero, zero, (Decimal::from(5), 2), zero, zero]
+        );
+        assert_eq!(
+            brands[1].totals,
+            [(Decimal::from(8), 0), zero, zero, zero, zero]
+        );
+        assert_eq!(
+            brands[2].totals,
+            [zero, (Decimal::from(6), 1), zero, zero, zero]
+        );
+        assert_eq!(
+            brands[3].totals,
+            [zero, zero, zero, (Decimal::from(3), 1), zero]
+        );
+        assert_eq!(
+            brands[4].totals,
+            [zero, zero, zero, zero, (Decimal::from(4), 1)]
+        );
+        assert_eq!(
+            summary.groups()[1].brands[0].totals[4],
+            (Decimal::from(8), 1)
+        );
+        assert_eq!(summary.groups()[2].brands[0].totals, [zero; 5]);
+        assert_eq!(summary.groups()[3].brands[0].totals, [zero; 5]);
+    }
 
     #[test]
     fn zero_amount_ratios_are_zero() {

@@ -16,8 +16,8 @@ use super::data::{CommonInputs, ReportColumn, SheetData};
 #[cfg(test)]
 use super::reader::read_sheet_rows;
 use super::summary_data::{
-    AnomalyColors, MetricRow, STD_CATEGORIES, SalesMatrix, SummaryMetrics, SummaryRecords,
-    build_invoice_name_map, build_sales_matrix,
+    AnomalyColors, CategoryBrandSummary, MetricRow, SUMMARY_STATUSES, SummaryMetrics,
+    SummaryRecords, build_invoice_name_map,
 };
 
 /// Generate Workbook 1: 国补上传情况汇总.xlsx (5 Sheets)
@@ -54,7 +54,7 @@ pub(crate) fn generate_with_inputs(
 
     // Precalculate shared metrics and lookup structures once
     let metrics = SummaryMetrics::calculate(sales_rows, app_upload_rows, dig_upload_rows)?;
-    let sales_matrix = build_sales_matrix(sales_rows)?;
+    let category_brands = CategoryBrandSummary::from_sales(sales_rows)?;
     let invoice_name_map = build_invoice_name_map(invoice_rows)?;
 
     let colors = AnomalyColors {
@@ -88,7 +88,7 @@ pub(crate) fn generate_with_inputs(
     build_summary_sheet(&mut workbook, &styles, &metrics)?;
 
     // Build Sheet 2: 品类品牌汇总
-    build_category_brand_sheet(&mut workbook, &styles, &sales_matrix)?;
+    build_category_brand_sheet(&mut workbook, &styles, &category_brands)?;
 
     // Build Sheet 3: 审核失败明细
     build_failed_records_sheet(
@@ -333,7 +333,7 @@ fn build_summary_sheet(wb: &mut Workbook, s: &StylePool, m: &SummaryMetrics) -> 
 fn build_category_brand_sheet(
     wb: &mut Workbook,
     s: &StylePool,
-    matrix: &SalesMatrix,
+    summary: &CategoryBrandSummary,
 ) -> Result<(), String> {
     let ws = wb.add_worksheet();
     ws.set_name("品类品牌汇总").map_err(|e| e.to_string())?;
@@ -369,16 +369,11 @@ fn build_category_brand_sheet(
         .map_err(|e| e.to_string())?;
     ws.merge_range(3, 1, 4, 1, "品牌", &s.col_header_center)
         .map_err(|e| e.to_string())?;
-    ws.merge_range(3, 2, 3, 3, "已回款", &s.col_header_center)
-        .map_err(|e| e.to_string())?;
-    ws.merge_range(3, 4, 3, 5, "审核通过未回款", &s.col_header_center)
-        .map_err(|e| e.to_string())?;
-    ws.merge_range(3, 6, 3, 7, "待审核", &s.col_header_center)
-        .map_err(|e| e.to_string())?;
-    ws.merge_range(3, 8, 3, 9, "审核失败", &s.col_header_center)
-        .map_err(|e| e.to_string())?;
-    ws.merge_range(3, 10, 3, 11, "未上传", &s.col_header_center)
-        .map_err(|e| e.to_string())?;
+    for (index, status) in SUMMARY_STATUSES.iter().enumerate() {
+        let col = 2 + index as u16 * 2;
+        ws.merge_range(3, col, 3, col + 1, status, &s.col_header_center)
+            .map_err(|e| e.to_string())?;
+    }
 
     for col in (2..12).step_by(2) {
         ws.write_string_with_format(4, col, "补贴金额（元）", &s.col_header_center)
@@ -387,68 +382,19 @@ fn build_category_brand_sheet(
             .map_err(|e| e.to_string())?;
     }
 
-    // Collect all categories actually in matrix
-    let mut all_cats: Vec<String> = Vec::new();
-    for (cat, _) in STD_CATEGORIES {
-        if matrix.keys().any(|(c, _)| c == cat) {
-            all_cats.push(cat.to_string());
-        }
-    }
-    for (c, _) in matrix.keys() {
-        if !all_cats.contains(c) {
-            all_cats.push(c.clone());
-        }
-    }
-
-    let mut cat_brands: Vec<(String, Vec<String>)> = Vec::new();
-    for cat in all_cats {
-        let std_brands: Vec<String> = STD_CATEGORIES
-            .iter()
-            .find(|(c, _)| *c == cat)
-            .map(|(_, bs)| bs.iter().map(|s| s.to_string()).collect())
-            .unwrap_or_default();
-
-        let mut brands: Vec<String> = Vec::new();
-        // Add standard brands if present in matrix
-        for b in &std_brands {
-            if matrix.contains_key(&(cat.clone(), b.clone())) {
-                brands.push(b.clone());
-            }
-        }
-        // Add any newly encountered brands for this category
-        let mut new_brands: Vec<String> = matrix
-            .keys()
-            .filter(|(c, b)| c == &cat && !std_brands.contains(b))
-            .map(|(_, b)| b.clone())
-            .collect();
-        new_brands.sort();
-        brands.extend(new_brands);
-
-        if !brands.is_empty() {
-            cat_brands.push((cat, brands));
-        }
-    }
-
-    let statuses = ["已回款", "审核通过未回款", "待审核", "审核失败", "未上传"];
-
     let mut row_idx: u32 = 5; // 0-indexed row 5 = Excel Row 6
-    for (cat, brands) in cat_brands {
+    for group in summary.groups() {
+        let cat = &group.category;
         let start_row = row_idx;
-        for brand in &brands {
+        for brand in &group.brands {
             ws.set_row_height(row_idx, 22.0)
                 .map_err(|e| e.to_string())?;
-            ws.write_string_with_format(row_idx, 0, &cat, &s.text_center)
+            ws.write_string_with_format(row_idx, 0, cat, &s.text_center)
                 .map_err(|e| e.to_string())?;
-            ws.write_string_with_format(row_idx, 1, brand.as_str(), &s.text_left)
+            ws.write_string_with_format(row_idx, 1, brand.brand.as_str(), &s.text_left)
                 .map_err(|e| e.to_string())?;
 
-            let empty_map = HashMap::new();
-            let brand_map = matrix
-                .get(&(cat.to_string(), brand.to_string()))
-                .unwrap_or(&empty_map);
-
-            for (s_idx, st) in statuses.iter().enumerate() {
-                let (amt, cnt) = brand_map.get(*st).copied().unwrap_or((Decimal::ZERO, 0));
+            for (s_idx, &(amt, cnt)) in brand.totals.iter().enumerate() {
                 let col_amt = 2 + (s_idx as u16) * 2;
                 let col_cnt = col_amt + 1;
 
@@ -468,7 +414,7 @@ fn build_category_brand_sheet(
         }
         let end_row = row_idx - 1;
         if end_row > start_row {
-            ws.merge_range(start_row, 0, end_row, 0, &cat, &s.text_center)
+            ws.merge_range(start_row, 0, end_row, 0, cat, &s.text_center)
                 .map_err(|e| e.to_string())?;
         }
     }
@@ -881,6 +827,17 @@ fn build_invoice_anomaly_sheet(
 mod status_tests {
     use super::*;
 
+    fn category_sheet_xml(path: &Path) -> String {
+        use std::io::Read;
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(path).unwrap()).unwrap();
+        let mut xml = String::new();
+        zip.by_name("xl/worksheets/sheet2.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        xml
+    }
+
     #[test]
     fn standalone_summary_generates_only_excel() {
         use crate::jobs::{refund::OUTPUT_FIELDS, uploaded};
@@ -986,6 +943,74 @@ mod status_tests {
             names,
             ["博世", "海信", "海尔", "创维", "华为（终端）", "海信"]
         );
+        assert_eq!(brands.get_value((5, 10)), Some(&Data::String("-".into())));
+        assert_eq!(brands.get_value((5, 11)), Some(&Data::String("-".into())));
+        {
+            let xml = category_sheet_xml(&path);
+            assert!(xml.contains("<mergeCell ref=\"A6:A8\"/>"));
+            assert!(xml.contains("<mergeCell ref=\"A9:A11\"/>"));
+        }
+
+        // Verify presentation through the same standalone workbook interface.
+        let mut source = Workbook::new();
+        let sheet = source.add_worksheet();
+        for (col, header) in ["财务大类", "品牌", "补贴额", "数量", "备注"]
+            .iter()
+            .enumerate()
+        {
+            sheet.write_string(0, col as u16, *header).unwrap();
+        }
+        for (index, (category, brand, amount, quantity, status)) in [
+            ("Z", "Negative", -5.0, -1.0, "未上传"),
+            ("A", "ZeroQty", 4.0, 0.0, "未上传"),
+            ("A", "ZeroAmount", 0.0, 2.0, "未上传"),
+            ("A", "NoneState", 100.0, 1.0, "其他"),
+            ("A", "Zero", 0.0, 0.0, "未上传"),
+            ("A", "Return", 100.0, 1.0, "退货-原单"),
+            ("", "", 0.0, 0.0, ""),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = index as u32 + 1;
+            sheet.write_string(row, 0, category).unwrap();
+            sheet.write_string(row, 1, brand).unwrap();
+            sheet.write_number(row, 2, amount).unwrap();
+            sheet.write_number(row, 3, quantity).unwrap();
+            sheet.write_string(row, 4, status).unwrap();
+        }
+        source.save(input.join("销售用券情况统计.xlsx")).unwrap();
+        generate_summary_workbook(&input, &path).unwrap();
+        let mut book = open_workbook_auto(&path).unwrap();
+        let brands = book.worksheet_range("品类品牌汇总").unwrap();
+        let names: Vec<_> = brands
+            .rows()
+            .skip(5)
+            .map(|row| cell_to_string(&row[1]))
+            .collect();
+        assert_eq!(
+            names,
+            ["", "NoneState", "Zero", "ZeroAmount", "ZeroQty", "Negative"]
+        );
+        assert_eq!(brands.get_value((6, 0)), Some(&Data::String("A".into())));
+        assert_eq!(brands.get_value((10, 0)), Some(&Data::String("Z".into())));
+        for row in 5..=7 {
+            for col in 2..12 {
+                assert_eq!(
+                    brands.get_value((row, col)),
+                    Some(&Data::String("-".into()))
+                );
+            }
+        }
+        for (row, amount, quantity) in [(8, 0.0, 2.0), (9, 4.0, 0.0), (10, -5.0, -1.0)] {
+            assert_eq!(brands.get_value((row, 10)), Some(&Data::Float(amount)));
+            assert_eq!(brands.get_value((row, 11)), Some(&Data::Float(quantity)));
+        }
+        {
+            let xml = category_sheet_xml(&path);
+            assert!(xml.contains("<mergeCell ref=\"A7:A10\"/>"));
+            assert!(!xml.contains("<mergeCell ref=\"A11:"));
+        }
         assert!(!path.with_extension("md").exists());
         assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
         std::fs::remove_dir_all(root).unwrap();
