@@ -121,7 +121,12 @@ fn clean_product_name(raw: &str) -> String {
 /// Unknown categories and names without a confirmed brand remain blank.
 fn split_product_name(name: &str) -> (String, String) {
     let Some((brand, remainder)) = name.split_once('-') else {
-        return (String::new(), brand_from_unseparated_name(name));
+        let category = match name {
+            "手机" | "平板" | "手表" | "家用平板电脑" | "小天才" => "数码",
+            "空调" => "空调",
+            _ => "",
+        };
+        return (category.to_string(), brand_from_unseparated_name(name));
     };
     let (category_token, _) = remainder.split_once('-').unwrap_or((remainder, ""));
     let category = invoice_finance_category(category_token).unwrap_or_default();
@@ -732,11 +737,12 @@ mod tests {
             ("IQ手机", "", "iqoo"),
             ("iQ手机", "", "iqoo"),
             ("IQ00国产手机", "", "iqoo"),
-            ("手机", "", ""),
-            ("平板", "", ""),
-            ("手表", "", ""),
-            ("家用平板电脑", "", ""),
-            ("空调", "", ""),
+            ("手机", "数码", ""),
+            ("平板", "数码", ""),
+            ("手表", "数码", ""),
+            ("家用平板电脑", "数码", ""),
+            ("小天才", "数码", "小天才"),
+            ("空调", "空调", ""),
             ("烟机灶具套餐", "", ""),
             ("美的（微清）-炉具-微波炉C237", "小电", "美的"),
             ("COLMO厨热JX水系统-CWS-F08", "厨卫", "美的"),
