@@ -38,7 +38,7 @@ impl<'a> ReconciledTransaction<'a> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct ProductEntry {
     category: String,
     brand: String,
@@ -55,11 +55,11 @@ struct UploadEntry {
 struct InvoiceEntry {
     invoice_type: String,
     invoice_status: String,
+    product: ProductEntry,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct TransactionReconciler {
-    invoice_product_map: HashMap<String, ProductEntry>,
     upload_map: HashMap<String, UploadEntry>,
     invoice_map: HashMap<String, InvoiceEntry>,
 }
@@ -103,30 +103,25 @@ impl TransactionReconciler {
 
         // Index invoices and their parsed product fields by invoice number.
         let mut invoice_map = HashMap::new();
-        let mut invoice_product_map = HashMap::new();
         for row in &invoices[1..] {
             let invoice_no = cell_to_string(&row[inv_no_idx]);
             if !invoice_no.is_empty() {
-                invoice_product_map.insert(
-                    invoice_no.clone(),
-                    ProductEntry {
-                        category: cell_to_string(&row[inv_category_idx]),
-                        brand: cell_to_string(&row[inv_brand_idx]),
-                        model: cell_to_string(&row[inv_product_name_idx]),
-                    },
-                );
                 invoice_map.insert(
                     invoice_no,
                     InvoiceEntry {
                         invoice_type: cell_to_string(&row[inv_type_idx]),
                         invoice_status: cell_to_string(&row[inv_st_idx]),
+                        product: ProductEntry {
+                            category: cell_to_string(&row[inv_category_idx]),
+                            brand: cell_to_string(&row[inv_brand_idx]),
+                            model: cell_to_string(&row[inv_product_name_idx]),
+                        },
                     },
                 );
             }
         }
 
         Ok(Self {
-            invoice_product_map,
             upload_map,
             invoice_map,
         })
@@ -151,14 +146,11 @@ impl TransactionReconciler {
         };
 
         let invoice_entry = self.invoice_map.get(invoice_no);
-        let product = self
-            .invoice_product_map
-            .get(invoice_no)
-            .map(|entry| ProductInfo {
-                category: entry.category.as_str(),
-                brand: entry.brand.as_str(),
-                model: entry.model.as_str(),
-            });
+        let product = invoice_entry.map(|entry| ProductInfo {
+            category: entry.product.category.as_str(),
+            brand: entry.product.brand.as_str(),
+            model: entry.product.model.as_str(),
+        });
 
         let status = if store_remark == "已退货" {
             "已退货"
@@ -199,21 +191,17 @@ mod tests {
         );
 
         // invoice: inv-101 -> type "蓝票", status "开票完成"
+        // product: inv-101 -> ("冰箱", "海尔", "海尔-冰箱-BCD-500")
         reconciler.invoice_map.insert(
             "inv-101".to_string(),
             InvoiceEntry {
                 invoice_type: "蓝票".to_string(),
                 invoice_status: "开票完成".to_string(),
-            },
-        );
-
-        // product: inv-101 -> ("冰箱", "海尔", "海尔-冰箱-BCD-500")
-        reconciler.invoice_product_map.insert(
-            "inv-101".to_string(),
-            ProductEntry {
-                category: "冰箱".to_string(),
-                brand: "海尔".to_string(),
-                model: "海尔-冰箱-BCD-500".to_string(),
+                product: ProductEntry {
+                    category: "冰箱".to_string(),
+                    brand: "海尔".to_string(),
+                    model: "海尔-冰箱-BCD-500".to_string(),
+                },
             },
         );
 
@@ -284,6 +272,7 @@ mod tests {
             InvoiceEntry {
                 invoice_type: "红票".to_string(),
                 invoice_status: "开票完成".to_string(),
+                product: ProductEntry::default(),
             },
         );
 
@@ -300,6 +289,7 @@ mod tests {
             InvoiceEntry {
                 invoice_type: "蓝票".to_string(),
                 invoice_status: "已红冲".to_string(),
+                product: ProductEntry::default(),
             },
         );
 
@@ -316,6 +306,7 @@ mod tests {
             InvoiceEntry {
                 invoice_type: "蓝票".to_string(),
                 invoice_status: "开票完成".to_string(),
+                product: ProductEntry::default(),
             },
         );
 
