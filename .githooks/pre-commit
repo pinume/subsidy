@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -e
+
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked --quiet
+python3 -I scripts/check-docs.py

@@ -380,7 +380,7 @@ Row 1 为表头行（柔和中蓝 `#5B9BD5` 填充，加粗白字，ht=30），�
 库公开导出`generate_summary_workbook`、`generate_store_finance_workbook`，独立工作簿接口自行加载共同输入。当前依赖以`Cargo.toml`为准，不再维护旧独立报表工程的依赖清单或模块树。
 
 
-构建、普通测试和真实样本验收命令见[运行与验证](architecture.md#运行与验证)。真实验收使用`COMBINE_SOURCE_DIR`指向2026-10-01原始数据，默认`ignored`；测试复制到临时目录，经完整 CLI 校验明细、报表、失败隔离和源文件未变。
+构建、普通测试和真实样本验收命令见[运行与验证](architecture.md#运行与验证)。真实验收使用`COMBINE_SOURCE_DIR`指向任意批次的原始数据，默认`ignored`；测试复制到临时目录，经完整 CLI 校验明细、报表、失败隔离和源文件未变。
 
 ---
 

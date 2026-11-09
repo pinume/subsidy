@@ -51,6 +51,6 @@
 
 ## 验证入口
 
-`src/`内测试覆盖业务转换、匹配、歧义、缓存、路径与发布失败；`tests/cli.rs`经真实终端入口验证失败隔离，`tests/full_pipeline.rs`使用小型原始数据夹具验证8类清洗和两份报表的完整成功流程，`tests/publishing.rs`验证文件发布。`tests/acceptance_test.rs`经完整 CLI 验证2026-10-01原始数据副本，包括退货链、报表内容及源文件未变；默认忽略，需提供`COMBINE_SOURCE_DIR`。
+`src/`内测试覆盖业务转换、匹配、歧义、缓存、路径与发布失败；`tests/cli.rs`经真实终端入口验证失败隔离，`tests/full_pipeline.rs`使用小型原始数据夹具验证8类清洗和两份报表的完整成功流程，`tests/publishing.rs`验证文件发布。`tests/acceptance_test.rs`经完整 CLI 验证任意批次原始数据的副本，包括退货链、报表内容及源文件未变；默认忽略，需提供`COMBINE_SOURCE_DIR`。
 
 构建、检查与样本验收命令见[运行与验证](architecture.md#运行与验证)。
