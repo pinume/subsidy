@@ -740,6 +740,21 @@ mod tests {
     use super::*;
     use crate::test_support::unique_temp_path;
 
+    /// 按下标取列的常量必须指向同名表头；输出列调整顺序时这里先失败。
+    #[test]
+    fn value_column_indices_match_headers() {
+        for (index, header) in [
+            (VALUE_COL_ORDER_NO, "订单号"),
+            (VALUE_COL_TRANSACTION_AMOUNT, "交易金额"),
+            (VALUE_COL_REFERENCE, "检索参考号"),
+            (VALUE_COL_STATUS, "状态"),
+            (VALUE_COL_UPDATED_AT, "更新时间"),
+            (VALUE_COL_INVOICE_NO, "发票号码"),
+        ] {
+            assert_eq!(FRONT_HEADERS[index], header);
+        }
+    }
+
     /// 第10.12.2节：同一参考号取`更新时间`最新的状态；最新时间相同而状态不同仍为歧义。
     #[test]
     fn reference_status_uses_latest_update() {

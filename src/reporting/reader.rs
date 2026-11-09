@@ -268,7 +268,7 @@ pub fn get_colored_row_indices_multi(
         for (xf_idx, &fill_id) in xf_fill_ids.iter().enumerate() {
             if let Some(Some(color)) = fills.get(fill_id) {
                 for target in &clean_targets {
-                    if color == target || color.ends_with(target) || target.ends_with(color) {
+                    if color == target {
                         xf_map.entry(xf_idx).or_default().push(target.clone());
                     }
                 }
@@ -345,4 +345,39 @@ pub fn get_colored_row_indices(path: &Path, target_hex: &str) -> Result<HashSet<
     let clean = target_hex.trim_start_matches('#').to_uppercase();
     let mut map = get_colored_row_indices_multi(path, &[target_hex])?;
     Ok(map.remove(&clean).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::xlsx_writer::write_table;
+    use crate::model::{Column, ColumnType, Fill, Row, Table, Value};
+
+    /// 清洗按行填色，报表按颜色取回异常行：两端的颜色契约变了，异常明细会悄悄变空。
+    #[test]
+    fn fills_written_by_cleaning_are_read_back_by_reporting() {
+        let row = |fill| Row {
+            values: vec![Value::Text("x".into())],
+            fill,
+        };
+        let table = Table {
+            columns: vec![Column {
+                name: "值",
+                ty: ColumnType::Text,
+            }],
+            rows: vec![
+                row(None),
+                row(Some(Fill::Pink)),
+                row(Some(Fill::Yellow)),
+                row(None),
+            ],
+        };
+        let path = crate::test_support::unique_temp_path("fill-roundtrip").with_extension("xlsx");
+        write_table(&table, &path).unwrap();
+        let colors = get_colored_row_indices_multi(&path, &["FFFFEB9C", "FFFFC7CE"]).unwrap();
+        // 第1行是表头；第5行是斑马纹底色，不算异常色。
+        assert_eq!(colors["FFFFC7CE"], HashSet::from([3]));
+        assert_eq!(colors["FFFFEB9C"], HashSet::from([4]));
+        std::fs::remove_file(path).unwrap();
+    }
 }

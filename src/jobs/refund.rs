@@ -542,6 +542,21 @@ mod tests {
     use super::*;
     use crate::test_support::unique_temp_path;
 
+    /// 按下标取列的常量必须指向同名输出字段；输出列调整顺序时这里先失败。
+    #[test]
+    fn column_indices_match_output_fields() {
+        for (index, field) in [
+            (REFERENCE, "交易参考号"),
+            (MERCHANT_ORDER, "商户订单号"),
+            (DEALER_CODE, "核销商编"),
+            (OTHER_PAYMENT, "其他支付"),
+            (SUBSIDY_AMOUNT, "补贴金额"),
+            (RATIO, "补贴比例"),
+        ] {
+            assert_eq!(OUTPUT_FIELDS[index], field);
+        }
+    }
+
     #[test]
     fn equal_subsidies_with_different_scales_are_one_value() {
         let row = |amount: Decimal| {
