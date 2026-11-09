@@ -8,8 +8,8 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, PipelineContext, amount_value, cell_amount, cell_date_or_text,
-    cell_datetime_or_text, cell_text, data_error, text_value,
+    ALLOWED_MERCHANTS, Category, Job, PipelineContext, amount_value, cell_amount,
+    cell_date_or_text, cell_datetime_or_text, cell_text, data_error, text_value,
 };
 
 pub(crate) const HEADERS: [&str; 26] = [
@@ -109,7 +109,9 @@ fn matches_filename(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".xlsx") else {
         return false;
     };
-    stem.starts_with("89813014812B06R_MX_") || stem.starts_with("89813015722APT1_MX_")
+    ALLOWED_MERCHANTS
+        .iter()
+        .any(|merchant| stem.starts_with(&format!("{merchant}_MX_")))
 }
 
 fn read_record(
@@ -190,7 +192,9 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
     files.sort();
     if files.is_empty() {
         return Err(ProcessError::NoInput {
-            pattern: "89813014812B06R_MX_*.xlsx / 89813015722APT1_MX_*.xlsx".to_string(),
+            pattern: ALLOWED_MERCHANTS
+                .map(|m| format!("{m}_MX_*.xlsx"))
+                .join(" / "),
         });
     }
 

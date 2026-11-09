@@ -431,7 +431,7 @@ mod tests {
         write_workbook(
             &dir.join(FILE_NAME),
             &[
-                // project.md 9.4 节示例：2026-01-01 + 收款ZFFX000003 → 260101ZFFX000003。
+                // cleaning-rules.md 9.4 节示例：2026-01-01 + 收款ZFFX000003 → 260101ZFFX000003。
                 RowSpec {
                     date: "2026-01-01",
                     doc_no: "收款ZFFX000003",

@@ -1,9 +1,37 @@
 use calamine::{Data, DataType};
-use rust_xlsxwriter::{ExcelDateTime, Format, Workbook, Worksheet};
+use rust_xlsxwriter::{ExcelDateTime, Format, Workbook, Worksheet, XlsxError};
 
 use super::data::{CellKind, ReportColumn};
 use super::reader::{cell_to_decimal, cell_to_string};
 use super::styles::StylePool;
+
+/// 报表写出错误：统一承接 xlsx 写出错误与既有文本错误，可用 `?` 转回调用方的 `String`。
+#[derive(Debug)]
+pub struct ReportError(String);
+
+impl From<XlsxError> for ReportError {
+    fn from(error: XlsxError) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl From<String> for ReportError {
+    fn from(message: String) -> Self {
+        Self(message)
+    }
+}
+
+impl From<&str> for ReportError {
+    fn from(message: &str) -> Self {
+        Self(message.to_string())
+    }
+}
+
+impl From<ReportError> for String {
+    fn from(error: ReportError) -> Self {
+        error.0
+    }
+}
 
 pub fn write_date_cell(
     ws: &mut Worksheet,
@@ -11,40 +39,35 @@ pub fn write_date_cell(
     col: u16,
     cell: &Data,
     format: &Format,
-) -> Result<(), String> {
+) -> Result<(), ReportError> {
     if matches!(cell, Data::Empty) {
-        return ws
-            .write_string_with_format(row, col, "", format)
-            .map(|_| ())
-            .map_err(|e| e.to_string());
+        ws.write_string_with_format(row, col, "", format)?;
+        return Ok(());
     }
 
     if let Some(value) = cell.as_datetime() {
-        return ws
-            .write_datetime_with_format(row, col, value, format)
-            .map(|_| ())
-            .map_err(|e| e.to_string());
+        ws.write_datetime_with_format(row, col, value, format)?;
+        return Ok(());
     }
 
     let value = cell_to_string(cell);
     match ExcelDateTime::parse_from_str(&value) {
-        Ok(datetime) => ws
-            .write_datetime_with_format(row, col, datetime, format)
-            .map(|_| ())
-            .map_err(|e| e.to_string()),
+        Ok(datetime) => {
+            ws.write_datetime_with_format(row, col, datetime, format)?;
+        }
         Err(error) => {
             eprintln!(
-                "[警告] 第 {} 行第 {} 列日期值 '{}' 无法解析，已保留原文本: {}",
+                "[警告] 工作表「{}」第 {} 行第 {} 列日期值 '{}' 无法解析，已保留原文本: {}",
+                ws.name(),
                 row + 1,
                 col + 1,
                 value,
                 error
             );
-            ws.write_string_with_format(row, col, value, format)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            ws.write_string_with_format(row, col, value, format)?;
         }
     }
+    Ok(())
 }
 
 pub fn write_decimal_cell(
@@ -54,13 +77,12 @@ pub fn write_decimal_cell(
     cell: &Data,
     format: &Format,
     empty_format: &Format,
-) -> Result<(), String> {
+) -> Result<(), ReportError> {
     match cell_to_decimal(cell) {
         Some(value) => ws.write_with_format(row, col, value, format),
         None => ws.write_string_with_format(row, col, "", empty_format),
-    }
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    }?;
+    Ok(())
 }
 
 impl CellKind {
@@ -71,7 +93,7 @@ impl CellKind {
         row: u32,
         col: u16,
         cell: &Data,
-    ) -> Result<(), String> {
+    ) -> Result<(), ReportError> {
         match self {
             Self::Date => write_date_cell(ws, row, col, cell, &s.date),
             Self::DateTime => write_date_cell(ws, row, col, cell, &s.datetime),
@@ -83,9 +105,8 @@ impl CellKind {
                 } else {
                     &s.text_left
                 };
-                ws.write_string_with_format(row, col, cell_to_string(cell), format)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                ws.write_string_with_format(row, col, cell_to_string(cell), format)?;
+                Ok(())
             }
         }
     }
@@ -97,8 +118,8 @@ fn write_report_row(
     index: u32,
     row: &[Data],
     columns: &[ReportColumn],
-) -> Result<(), String> {
-    ws.set_row_height(index, 22.0).map_err(|e| e.to_string())?;
+) -> Result<(), ReportError> {
+    ws.set_row_height(index, 22.0)?;
     for (col, column) in columns.iter().enumerate() {
         column
             .kind
@@ -115,9 +136,13 @@ pub struct ReportSheetBuilder<'a> {
 }
 
 impl<'a> ReportSheetBuilder<'a> {
-    pub fn new(wb: &'a mut Workbook, name: &str, styles: &'a StylePool) -> Result<Self, String> {
+    pub fn new(
+        wb: &'a mut Workbook,
+        name: &str,
+        styles: &'a StylePool,
+    ) -> Result<Self, ReportError> {
         let ws = wb.add_worksheet();
-        ws.set_name(name).map_err(|e| e.to_string())?;
+        ws.set_name(name)?;
         Ok(Self {
             ws,
             styles,
@@ -125,19 +150,15 @@ impl<'a> ReportSheetBuilder<'a> {
         })
     }
 
-    pub fn set_column_widths(&mut self, widths: &[f64]) -> Result<&mut Self, String> {
+    pub fn set_column_widths(&mut self, widths: &[f64]) -> Result<&mut Self, ReportError> {
         for (col, &w) in widths.iter().enumerate() {
-            self.ws
-                .set_column_width(col as u16, w)
-                .map_err(|e| e.to_string())?;
+            self.ws.set_column_width(col as u16, w)?;
         }
         Ok(self)
     }
 
-    pub fn set_freeze_panes(&mut self, row: u32, col: u16) -> Result<&mut Self, String> {
-        self.ws
-            .set_freeze_panes(row, col)
-            .map_err(|e| e.to_string())?;
+    pub fn set_freeze_panes(&mut self, row: u32, col: u16) -> Result<&mut Self, ReportError> {
+        self.ws.set_freeze_panes(row, col)?;
         Ok(self)
     }
 
@@ -146,41 +167,39 @@ impl<'a> ReportSheetBuilder<'a> {
         max_col: u16,
         title: &str,
         subtitle: &str,
-    ) -> Result<&mut Self, String> {
-        self.ws.set_row_height(0, 30.0).map_err(|e| e.to_string())?;
+    ) -> Result<&mut Self, ReportError> {
+        self.ws.set_row_height(0, 30.0)?;
         self.ws
-            .merge_range(0, 0, 0, max_col, title, &self.styles.title)
-            .map_err(|e| e.to_string())?;
+            .merge_range(0, 0, 0, max_col, title, &self.styles.title)?;
 
-        self.ws.set_row_height(1, 22.0).map_err(|e| e.to_string())?;
+        self.ws.set_row_height(1, 22.0)?;
         self.ws
-            .merge_range(1, 0, 1, max_col, subtitle, &self.styles.subtitle)
-            .map_err(|e| e.to_string())?;
+            .merge_range(1, 0, 1, max_col, subtitle, &self.styles.subtitle)?;
 
-        self.ws.set_row_height(2, 8.0).map_err(|e| e.to_string())?;
+        self.ws.set_row_height(2, 8.0)?;
         self.cur_row = 3;
         Ok(self)
     }
 
-    pub fn write_section_header(&mut self, max_col: u16, title: &str) -> Result<&mut Self, String> {
-        self.ws
-            .set_row_height(self.cur_row, 24.0)
-            .map_err(|e| e.to_string())?;
-        self.ws
-            .merge_range(
-                self.cur_row,
-                0,
-                self.cur_row,
-                max_col,
-                title,
-                &self.styles.section_header,
-            )
-            .map_err(|e| e.to_string())?;
+    pub fn write_section_header(
+        &mut self,
+        max_col: u16,
+        title: &str,
+    ) -> Result<&mut Self, ReportError> {
+        self.ws.set_row_height(self.cur_row, 24.0)?;
+        self.ws.merge_range(
+            self.cur_row,
+            0,
+            self.cur_row,
+            max_col,
+            title,
+            &self.styles.section_header,
+        )?;
         self.cur_row += 1;
         Ok(self)
     }
 
-    pub fn write_headers(&mut self, headers: &[&str]) -> Result<&mut Self, String> {
+    pub fn write_headers(&mut self, headers: &[&str]) -> Result<&mut Self, ReportError> {
         self.write_headers_with(headers, |_| false)
     }
 
@@ -188,13 +207,11 @@ impl<'a> ReportSheetBuilder<'a> {
         &mut self,
         headers: &[&str],
         mut is_center: F,
-    ) -> Result<&mut Self, String>
+    ) -> Result<&mut Self, ReportError>
     where
         F: FnMut(usize) -> bool,
     {
-        self.ws
-            .set_row_height(self.cur_row, 30.0)
-            .map_err(|e| e.to_string())?;
+        self.ws.set_row_height(self.cur_row, 30.0)?;
         for (col, h) in headers.iter().enumerate() {
             let fmt = if is_center(col) {
                 &self.styles.col_header_center
@@ -202,17 +219,14 @@ impl<'a> ReportSheetBuilder<'a> {
                 &self.styles.col_header
             };
             self.ws
-                .write_string_with_format(self.cur_row, col as u16, *h, fmt)
-                .map_err(|e| e.to_string())?;
+                .write_string_with_format(self.cur_row, col as u16, *h, fmt)?;
         }
         self.cur_row += 1;
         Ok(self)
     }
 
-    pub fn write_blank_row(&mut self, height: f64) -> Result<&mut Self, String> {
-        self.ws
-            .set_row_height(self.cur_row, height)
-            .map_err(|e| e.to_string())?;
+    pub fn write_blank_row(&mut self, height: f64) -> Result<&mut Self, ReportError> {
+        self.ws.set_row_height(self.cur_row, height)?;
         self.cur_row += 1;
         Ok(self)
     }
@@ -221,7 +235,7 @@ impl<'a> ReportSheetBuilder<'a> {
         &mut self,
         row: &[Data],
         columns: &[ReportColumn],
-    ) -> Result<&mut Self, String> {
+    ) -> Result<&mut Self, ReportError> {
         write_report_row(self.ws, self.styles, self.cur_row, row, columns)?;
         self.cur_row += 1;
         Ok(self)

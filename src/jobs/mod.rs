@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
@@ -22,7 +23,11 @@ pub enum Category {
 pub(crate) mod context;
 pub(crate) mod multi_value_index;
 pub use context::{MatchStats, PipelineContext};
-pub(crate) use multi_value_index::{MultiValueIndex, PriorityOutcome, resolve};
+pub(crate) use multi_value_index::{MultiValueIndex, PriorityOutcome};
+
+pub(crate) const MERCHANT_DIGITAL: &str = "89813014812B06R";
+pub(crate) const MERCHANT_APPLIANCE: &str = "89813015722APT1";
+pub(crate) const ALLOWED_MERCHANTS: [&str; 2] = [MERCHANT_DIGITAL, MERCHANT_APPLIANCE];
 
 pub trait Job {
     fn category(&self) -> Category;
@@ -36,6 +41,14 @@ pub trait Job {
         input_dir: &Path,
         ctx: &mut PipelineContext,
     ) -> Result<Table, ProcessError>;
+    /// 供下游任务共享整表；需要缓存的任务覆盖为走 `PipelineContext::cached_table`。
+    fn run_shared(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Rc<Table>, ProcessError> {
+        self.run_in_context(input_dir, ctx).map(Rc::new)
+    }
 }
 
 /// 文本字段：保留原值（包括纯空白），仅数值型单元格需还原为完整整数文本。

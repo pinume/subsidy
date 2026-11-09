@@ -1,5 +1,4 @@
 use std::collections::{HashMap, HashSet};
-use std::ops::Index;
 
 /// 候选值优先判定结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,19 +82,6 @@ impl MultiValueIndex {
     }
 }
 
-impl Index<&str> for MultiValueIndex {
-    type Output = [String];
-
-    fn index(&self, key: &str) -> &Self::Output {
-        self.map.get(key).map(|v| v.as_slice()).unwrap_or(&[])
-    }
-}
-
-/// 对一组候选值去重：恰好一个不同值→`Unique`；两个及以上→`Ambiguous`；没有候选→`NoHit`。
-pub(crate) fn resolve(hits: Vec<String>) -> PriorityOutcome {
-    PriorityOutcome::resolve(hits)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -166,7 +152,5 @@ mod tests {
             Some(&["INV1".to_string(), "INV1".to_string()][..])
         );
         assert_eq!(index.get("NONE"), None);
-        assert_eq!(index["DOC1"], ["INV1".to_string(), "INV1".to_string()]);
-        assert!(index["NONE"].is_empty());
     }
 }

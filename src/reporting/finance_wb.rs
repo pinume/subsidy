@@ -2,7 +2,7 @@ use rust_xlsxwriter::Workbook;
 use std::path::Path;
 
 use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
-use super::excel::ReportSheetBuilder;
+use super::excel::{ReportError, ReportSheetBuilder};
 use super::reader::{HeaderMap, cell_to_string};
 use super::reconciler::TransactionReconciler;
 use super::styles::StylePool;
@@ -73,7 +73,7 @@ fn build_final_match_sheet(
     dig_up: &SheetData,
     invoices: &SheetData,
     sales: &SheetData,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<String>, ReportError> {
     let mut sheet = ReportSheetBuilder::new(wb, "最终匹配表（全部的国补发生数据上匹配）", s)?;
     sheet.set_freeze_panes(1, 0)?;
 
@@ -131,16 +131,12 @@ fn build_final_match_sheet(
 
     for (r_idx, row) in store_occ.iter().enumerate().skip(1) {
         let cur_row = r_idx as u32; // Row 1 is header, data starts at row 1
-        sheet
-            .ws
-            .set_row_height(cur_row, 22.0)
-            .map_err(|e| e.to_string())?;
+        sheet.ws.set_row_height(cur_row, 22.0)?;
 
         // Col 0: 序号 (1-based)
         sheet
             .ws
-            .write_number_with_format(cur_row, 0, r_idx as f64, &s.int_count)
-            .map_err(|e| e.to_string())?;
+            .write_number_with_format(cur_row, 0, r_idx as f64, &s.int_count)?;
 
         // Col 1-20: Pre-resolved from store occurrence
         for (index, column) in resolved_store_cols.iter().enumerate() {
@@ -156,34 +152,28 @@ fn build_final_match_sheet(
         // Col 21, 22, 23: prefer complete, unique sales products; fall back to invoices as a group.
         sheet
             .ws
-            .write_string_with_format(cur_row, 21, rec.category(), &s.text_center)
-            .map_err(|e| e.to_string())?;
+            .write_string_with_format(cur_row, 21, rec.category(), &s.text_center)?;
         sheet
             .ws
-            .write_string_with_format(cur_row, 22, rec.brand(), &s.text_left)
-            .map_err(|e| e.to_string())?;
+            .write_string_with_format(cur_row, 22, rec.brand(), &s.text_left)?;
         sheet
             .ws
-            .write_string_with_format(cur_row, 23, rec.model(), &s.text_left)
-            .map_err(|e| e.to_string())?;
+            .write_string_with_format(cur_row, 23, rec.model(), &s.text_left)?;
 
         // Col 24: 状态
         sheet
             .ws
-            .write_string_with_format(cur_row, 24, rec.status, &s.text_center)
-            .map_err(|e| e.to_string())?;
+            .write_string_with_format(cur_row, 24, rec.status, &s.text_center)?;
 
         // Col 25: 发票号
         sheet
             .ws
-            .write_string_with_format(cur_row, 25, rec.invoice_no, &s.text_left)
-            .map_err(|e| e.to_string())?;
+            .write_string_with_format(cur_row, 25, rec.invoice_no, &s.text_left)?;
 
         // Col 26: 发票是否红冲
         sheet
             .ws
-            .write_string_with_format(cur_row, 26, rec.red_flush_text(), &s.text_center)
-            .map_err(|e| e.to_string())?;
+            .write_string_with_format(cur_row, 26, rec.red_flush_text(), &s.text_center)?;
     }
 
     Ok(reconciler.warnings())
@@ -1128,7 +1118,7 @@ mod tests {
         }
         // Reissued invoices provide their cleaned product fields directly.
         let uploads = vec![
-            strings(&["检索参考号", "状态", "发票号码", "补贴金额"]),
+            strings(&["检索参考号", "状态", "发票号码", "补贴金额", "更新时间"]),
             strings(&["ref-a", "审核通过未回款", "invoice-a", "1"]),
             strings(&["ref-b", "待审核", "", "1"]),
             strings(&["ref-c", "审核失败", "unmatched-invoice", "1"]),
@@ -1224,6 +1214,6 @@ mod tests {
             ])]),
         )
         .unwrap_err();
-        assert!(error.contains("发票明细.xlsx: 缺少必要列 [大类]"));
+        assert!(String::from(error).contains("发票明细.xlsx: 缺少必要列 [大类]"));
     }
 }

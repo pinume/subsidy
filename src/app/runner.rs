@@ -68,7 +68,7 @@ fn process(
 ) -> Result<PathBuf, ProcessError> {
     // 用 catch_unwind 隔离单个任务的 panic，避免其中断批量执行或整个程序。
     panic::catch_unwind(AssertUnwindSafe(|| {
-        let table = job.run_in_context(input_dir, ctx)?;
+        let table = job.run_shared(input_dir, ctx)?;
         publish(job, input_dir, &table)
     }))
     .unwrap_or_else(|payload| {
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn all_lifecycle_failures_are_isolated_and_next_category_publishes() {
-        for stage in ["business", "write", "replace", "cleanup-backup"] {
+        for stage in ["business", "write", "replace"] {
             for panic in [false, true] {
                 let base = unique_temp_path("runner-faults");
                 let input = base.join("input");

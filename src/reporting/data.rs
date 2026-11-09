@@ -1,5 +1,5 @@
-use super::reader::{HeaderMap, extract_unique_merchant_code, read_sheet_rows};
-use calamine::Data;
+use super::reader::{HeaderMap, cell_to_string, extract_unique_merchant_code, read_sheet_rows};
+use calamine::{Data, DataType};
 use std::ops::Deref;
 use std::path::Path;
 
@@ -94,6 +94,20 @@ impl SheetData {
     }
     pub fn load(path: &Path) -> Result<Self, String> {
         Ok(Self::new(read_sheet_rows(path)?))
+    }
+
+    /// 清洗层保留重复导出：同一非空键只保留`更新时间`最新的数据行（重新提交后以最新为准），
+    /// 最新时间相同的行都保留，由调用方按各自规则处理；没有更新时间视为最旧，键为空的行全部保留。
+    /// 按源顺序返回。
+    pub fn latest_rows(&self, key_idx: usize, updated_idx: usize) -> Vec<&Vec<Data>> {
+        fn cell(row: &[Data], idx: usize) -> &Data {
+            row.get(idx).unwrap_or(&Data::Empty)
+        }
+        crate::utils::latest::latest_by_key(
+            &self[1..],
+            |row| Some(cell_to_string(cell(row, key_idx))).filter(|key| !key.is_empty()),
+            |row| cell(row, updated_idx).as_datetime(),
+        )
     }
 }
 

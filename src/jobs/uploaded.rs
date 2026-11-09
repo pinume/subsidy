@@ -1,6 +1,5 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
+use std::rc::Rc;
 
 use rust_decimal::Decimal;
 
@@ -8,11 +7,11 @@ use crate::io::paths::list_xlsx_files;
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, ProcessError, Row, Table, Value};
 
-use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL, subsidy_indices};
+use super::refund::{REFUND_APPLIANCE, REFUND_DIGITAL, RefundSubsidyIndex};
 use super::{
-    Category, Job, MultiValueIndex, PipelineContext, PriorityOutcome, amount_value, cell_amount,
-    cell_date_or_text, cell_datetime_or_text, cell_text, data_error, resolve_synonym_column,
-    text_value,
+    ALLOWED_MERCHANTS, Category, Job, MERCHANT_APPLIANCE, MERCHANT_DIGITAL, MultiValueIndex,
+    PipelineContext, amount_value, cell_amount, cell_date_or_text, cell_datetime_or_text,
+    cell_text, data_error, resolve_synonym_column, text_value,
 };
 
 /// 前25列两组数据组结构完全相同，按固定列位置读取。
@@ -302,7 +301,7 @@ const DIGITAL_CONFIG: UploadedConfig = UploadedConfig {
     category: Category::UploadedDigital,
     title: "数码已上传数据",
     output_stem: "已上传数码",
-    merchant_no: "89813014812B06R",
+    merchant_no: MERCHANT_DIGITAL,
     tail: &DIGITAL_TAIL,
 };
 
@@ -310,7 +309,7 @@ const APPLIANCE_CONFIG: UploadedConfig = UploadedConfig {
     category: Category::UploadedAppliance,
     title: "家电、电脑已上传数据",
     output_stem: "已上传家电电脑",
-    merchant_no: "89813015722APT1",
+    merchant_no: MERCHANT_APPLIANCE,
     tail: &APPLIANCE_TAIL,
 };
 
@@ -348,12 +347,14 @@ impl Job for UploadedJob {
         input_dir: &Path,
         ctx: &mut PipelineContext,
     ) -> Result<Table, ProcessError> {
-        if let Some(cached) = ctx.get_table(self.0.category) {
-            return Ok(cached);
-        }
-        let table = run_uploaded(self.0, input_dir, ctx)?;
-        ctx.store_table(self.0.category, table.clone());
-        Ok(table)
+        run_uploaded(self.0, input_dir, ctx)
+    }
+    fn run_shared(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Rc<Table>, ProcessError> {
+        ctx.cached_table(self.0.category, |ctx| self.run_in_context(input_dir, ctx))
     }
 }
 
@@ -492,52 +493,92 @@ const VALUE_COL_REFERENCE: usize = 6; // 检索参考号
 const VALUE_COL_STATUS: usize = 8; // 状态
 const VALUE_COL_INVOICE_NO: usize = 19; // 发票号码
 
-/// 按对应类别构建状态索引；参考号是唯一业务键，发票号码可能对应多条记录。
+const VALUE_COL_UPDATED_AT: usize = 11; // 更新时间
+
+/// 第10.12.2节第二阶段命中的键。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadKey {
+    Reference,
+    InvoiceNo,
+}
+
+/// 一组已上传数据的状态索引（第10.12.2节）：参考号为主键，发票号码为次键。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct UploadStatusIndex {
+    by_reference: MultiValueIndex,
+    by_invoice_no: MultiValueIndex,
+}
+
+impl UploadStatusIndex {
+    pub(crate) fn new(by_reference: MultiValueIndex, by_invoice_no: MultiValueIndex) -> Self {
+        Self {
+            by_reference,
+            by_invoice_no,
+        }
+    }
+
+    /// 清洗保留重复记录。同一参考号按`latest_by_key`只取`更新时间`最新的记录（重新提交后以最新为准），
+    /// 最新记录状态为空时参考号未命中；最新时间相同而状态不同仍为歧义。发票号码兜底也只用这些最新记录，
+    /// 已被重新提交取代的旧状态不参与；发票号码可对应多笔交易，不同状态按歧义判定。
+    fn from_table(table: &Table) -> Self {
+        fn reference_of(row: &Row) -> Option<&str> {
+            Some(value_text(&row.values[VALUE_COL_REFERENCE])).filter(|r| !r.is_empty())
+        }
+        let updated_at = |row: &Row| match row.values[VALUE_COL_UPDATED_AT] {
+            Value::DateTime(time) => Some(time),
+            _ => None,
+        };
+        let mut by_reference = MultiValueIndex::new();
+        let mut by_invoice_no = MultiValueIndex::new();
+        for row in crate::utils::latest::latest_by_key(&table.rows, reference_of, updated_at) {
+            let status = value_text(&row.values[VALUE_COL_STATUS]);
+            if status.is_empty() {
+                continue;
+            }
+            if let Some(reference) = reference_of(row) {
+                by_reference.insert(reference, status);
+            }
+            let invoice_no = value_text(&row.values[VALUE_COL_INVOICE_NO]);
+            if !invoice_no.is_empty() {
+                by_invoice_no.insert(invoice_no, status);
+            }
+        }
+        Self::new(by_reference, by_invoice_no)
+    }
+
+    /// 参考号未命中、为空或歧义时降级到发票号码；两键都歧义的记录只给计数器加 1。
+    pub(crate) fn matched(
+        &self,
+        reference: Option<&str>,
+        invoice_no: Option<&str>,
+        ambiguous_counter: &mut usize,
+    ) -> Option<(UploadKey, String)> {
+        let mut ambiguous = 0;
+        let hit = self
+            .by_reference
+            .resolve(reference)
+            .into_unique(&mut ambiguous)
+            .map(|status| (UploadKey::Reference, status))
+            .or_else(|| {
+                self.by_invoice_no
+                    .resolve(invoice_no)
+                    .into_unique(&mut ambiguous)
+                    .map(|status| (UploadKey::InvoiceNo, status))
+            });
+        *ambiguous_counter += usize::from(ambiguous > 0);
+        hit
+    }
+}
+
+/// 按对应类别构建状态索引，共享上下文中已缓存的已上传明细。
 pub(super) fn status_indices_in_context(
     input_dir: &Path,
     job: &UploadedJob,
     ctx: &mut PipelineContext,
-) -> Result<(HashMap<String, String>, MultiValueIndex), ProcessError> {
-    let mut by_reference = HashMap::new();
-    let mut by_invoice_no = MultiValueIndex::new();
-    let mut accumulate = |table: &Table| {
-        for row in &table.rows {
-            let Value::Text(status) = &row.values[VALUE_COL_STATUS] else {
-                continue;
-            };
-            if status.is_empty() {
-                continue;
-            }
-            if let Value::Text(reference) = &row.values[VALUE_COL_REFERENCE] {
-                by_reference.insert(reference.clone(), status.clone());
-            }
-            if let Value::Text(invoice_no) = &row.values[VALUE_COL_INVOICE_NO] {
-                by_invoice_no.insert(invoice_no.clone(), status.clone());
-            }
-        }
-    };
-    if ctx.with_table(job.category(), &mut accumulate).is_none() {
-        accumulate(&job.run_in_context(input_dir, ctx)?);
-    }
-    Ok((by_reference, by_invoice_no))
-}
-
-/// 按`订单号`（主键）→`检索参考号`（次键）依次在回款明细索引中查找
-/// 唯一命中的`补贴金额`；命中即停，同级歧义立即停止、不再尝试下一级。
-fn matched_refund_subsidy(
-    by_order: &MultiValueIndex,
-    by_reference: &MultiValueIndex,
-    order_no: &str,
-    reference: &str,
-) -> Option<Decimal> {
-    for (index, key) in [(by_order, order_no), (by_reference, reference)] {
-        match index.resolve(Some(key)) {
-            PriorityOutcome::Unique(value) => return Decimal::from_str(&value).ok(),
-            PriorityOutcome::Ambiguous => return None,
-            PriorityOutcome::NoHit => {}
-        }
-    }
-    None
+) -> Result<UploadStatusIndex, ProcessError> {
+    Ok(UploadStatusIndex::from_table(
+        job.run_shared(input_dir, ctx)?.as_ref(),
+    ))
 }
 
 fn value_text(value: &Value) -> &str {
@@ -554,7 +595,7 @@ fn estimate_subsidy(transaction_amount: &Value, cap: Decimal) -> Option<Decimal>
         return None;
     };
     let ratio = Decimal::new(15, 2); // 0.15
-    Some((*amount * ratio).round_dp(2).min(cap))
+    Some(crate::utils::numbers::round_cents(*amount * ratio).min(cap))
 }
 
 /// 第5.7节状态归一化：仅替换列出的原值，其余原样保留；在回款匹配的“已回款”覆盖之前
@@ -567,8 +608,6 @@ fn normalize_status(value: String) -> String {
         _ => value,
     }
 }
-
-const ALLOWED_MERCHANTS: [&str; 2] = ["89813014812B06R", "89813015722APT1"];
 
 fn collect_merchant_files(
     input_dir: &Path,
@@ -626,13 +665,8 @@ fn run_uploaded(
             "UploadedConfig 只用于 UploadedAppliance/UploadedDigital，实际为 {other:?}"
         ),
     };
-    let (by_order, by_reference) = match ctx.with_table(refund_job.category(), subsidy_indices) {
-        Some(indices) => indices,
-        None => {
-            let refund_table = refund_job.run_in_context(input_dir, ctx)?;
-            subsidy_indices(&refund_table)
-        }
-    };
+    let refund_subsidy =
+        RefundSubsidyIndex::from_table(refund_job.run_shared(input_dir, ctx)?.as_ref());
     let subsidy_cap = subsidy_cap(config.category);
 
     let mut rows = Vec::new();
@@ -661,9 +695,7 @@ fn run_uploaded(
                         Value::Text(normalize_status(status.clone()));
                 }
 
-                let subsidy = matched_refund_subsidy(
-                    &by_order,
-                    &by_reference,
+                let subsidy = refund_subsidy.matched(
                     value_text(&record_row.values[VALUE_COL_ORDER_NO]),
                     value_text(&record_row.values[VALUE_COL_REFERENCE]),
                 );
@@ -707,6 +739,63 @@ mod tests {
 
     use super::*;
     use crate::test_support::unique_temp_path;
+
+    /// 第10.12.2节：同一参考号取`更新时间`最新的状态；最新时间相同而状态不同仍为歧义。
+    #[test]
+    fn reference_status_uses_latest_update() {
+        let at = |hour| {
+            Value::DateTime(
+                chrono::NaiveDate::from_ymd_opt(2026, 11, 1)
+                    .unwrap()
+                    .and_hms_opt(hour, 0, 0)
+                    .unwrap(),
+            )
+        };
+        let row = |reference: &str, status: &str, updated_at: Value| {
+            let mut values = vec![Value::Empty; 59];
+            values[VALUE_COL_REFERENCE] = Value::Text(reference.into());
+            values[VALUE_COL_STATUS] = Value::Text(status.into());
+            values[VALUE_COL_UPDATED_AT] = updated_at;
+            values[VALUE_COL_INVOICE_NO] = Value::Text(format!("INV-{reference}"));
+            Row { values, fill: None }
+        };
+        let table = Table {
+            columns: vec![],
+            rows: vec![
+                row("A", "已回款", at(10)),
+                row("A", "待审核", at(9)),
+                row("D", "待审核", at(9)),
+                row("D", "", at(10)),
+                row("B", "待审核", at(9)),
+                row("B", "审核失败", at(9)),
+                row("C", "待审核", Value::Empty),
+                row("C", "审核失败", at(8)),
+            ],
+        };
+        let index = UploadStatusIndex::from_table(&table);
+        let mut ambiguous = 0;
+        let hit =
+            |reference, ambiguous: &mut usize| index.matched(Some(reference), None, ambiguous);
+        assert_eq!(
+            hit("A", &mut ambiguous),
+            Some((UploadKey::Reference, "已回款".to_string()))
+        );
+        assert_eq!(hit("B", &mut ambiguous), None);
+        // 没有更新时间的记录视为最旧。
+        assert_eq!(
+            hit("C", &mut ambiguous),
+            Some((UploadKey::Reference, "审核失败".to_string()))
+        );
+        // 最新记录状态为空：参考号未命中，发票号兜底也不使用被取代的旧状态。
+        assert_eq!(hit("D", &mut ambiguous), None);
+        assert_eq!(index.matched(None, Some("INV-D"), &mut ambiguous), None);
+        // 发票号兜底只用最新记录，旧状态不构成歧义。
+        assert_eq!(
+            index.matched(None, Some("INV-A"), &mut ambiguous),
+            Some((UploadKey::InvoiceNo, "已回款".to_string()))
+        );
+        assert_eq!(ambiguous, 1);
+    }
 
     const REFUND_APPLIANCE_HEADER: [&str; 19] = [
         "拨付批次",
@@ -1397,6 +1486,12 @@ mod tests {
         assert_eq!(
             estimate_subsidy(&big_amount, Decimal::new(150000, 2)),
             Some("1500.00".parse().unwrap())
+        );
+        // 99.90 × 15% = 14.985：逢五进一，银行家舍入会得到 14.98。
+        let midpoint = Value::Decimal("99.90".parse().unwrap());
+        assert_eq!(
+            estimate_subsidy(&midpoint, Decimal::new(150000, 2)),
+            Some("14.99".parse().unwrap())
         );
         assert_eq!(
             estimate_subsidy(&Value::Empty, Decimal::new(150000, 2)),

@@ -1,8 +1,7 @@
-use std::collections::{HashMap, HashSet};
-
 use super::data::SheetData;
 use super::reader::{UploadColumns, cell_to_string};
 use super::unique_index::UniqueIndex;
+use crate::jobs::invoice::BlueInvoiceCandidates;
 
 /// 商品信息（零拷贝借用）
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,7 +62,7 @@ struct InvoiceEntry {
 pub(crate) struct TransactionReconciler {
     sales_map: UniqueIndex<ProductEntry>,
     sales_documents: UniqueIndex<String>,
-    blue_invoices: HashMap<String, String>,
+    blue_invoices: BlueInvoiceCandidates,
     upload_map: UniqueIndex<UploadEntry>,
     invoice_map: UniqueIndex<InvoiceEntry>,
 }
@@ -91,10 +90,14 @@ impl TransactionReconciler {
 
         let inv_doc_idx = inv_h.require("匹配单据号", "发票明细.xlsx")?;
 
-        // Build index for uploaded records (appliance + digital).
+        // 与清洗第10.12.2节一致：同一参考号只取`更新时间`最新的记录，最新时间相同而内容不同仍为冲突。
         let mut upload_map = UniqueIndex::default();
-        for (rows, cols) in [(app_upload, app_cols), (dig_upload, dig_cols)] {
-            for row in &rows[1..] {
+        for (rows, cols, label) in [
+            (app_upload, app_cols, "已上传家电电脑.xlsx"),
+            (dig_upload, dig_cols, "已上传数码.xlsx"),
+        ] {
+            let updated_idx = rows.header.require("更新时间", label)?;
+            for row in rows.latest_rows(cols.reference, updated_idx) {
                 let reference_no = cell_to_string(&row[cols.reference]);
                 if !reference_no.is_empty() {
                     upload_map.insert(
@@ -110,8 +113,7 @@ impl TransactionReconciler {
 
         // Index invoices and their parsed product fields by invoice number.
         let mut invoice_map = UniqueIndex::default();
-        let mut blue_candidates: HashMap<String, (HashSet<String>, HashSet<String>)> =
-            HashMap::new();
+        let mut blue_candidates = BlueInvoiceCandidates::default();
         for row in &invoices[1..] {
             let invoice_no = cell_to_string(&row[inv_no_idx]);
             if !invoice_no.is_empty() {
@@ -119,13 +121,12 @@ impl TransactionReconciler {
                     .get(inv_doc_idx)
                     .map(ToString::to_string)
                     .unwrap_or_default();
-                if !document.is_empty() && cell_to_string(&row[inv_type_idx]) == "蓝票" {
-                    let (all, completed) = blue_candidates.entry(document).or_default();
-                    all.insert(invoice_no.clone());
-                    if cell_to_string(&row[inv_st_idx]) == "开票完成" {
-                        completed.insert(invoice_no.clone());
-                    }
-                }
+                blue_candidates.add(
+                    &document,
+                    &cell_to_string(&row[inv_type_idx]),
+                    &cell_to_string(&row[inv_st_idx]),
+                    &invoice_no,
+                );
                 invoice_map.insert(
                     invoice_no,
                     InvoiceEntry {
@@ -170,23 +171,11 @@ impl TransactionReconciler {
             sales_map.insert(reference_no, product);
         }
 
-        // Completed blue invoices take priority; ambiguity never falls back to an arbitrary blue.
-        let blue_invoices = blue_candidates
-            .into_iter()
-            .filter_map(|(document, (all, completed))| {
-                let candidates = if completed.is_empty() { all } else { completed };
-                if candidates.len() == 1 {
-                    Some((document, candidates.into_iter().next().unwrap()))
-                } else {
-                    None
-                }
-            })
-            .collect();
-
         Ok(Self {
             sales_map,
             sales_documents,
-            blue_invoices,
+            // Completed blue invoices take priority; ambiguity never falls back to an arbitrary blue.
+            blue_invoices: blue_candidates,
             upload_map,
             invoice_map,
         })
@@ -213,8 +202,7 @@ impl TransactionReconciler {
             _ => self
                 .sales_documents
                 .get(reference_no)
-                .and_then(|document| self.blue_invoices.get(document))
-                .map(String::as_str)
+                .and_then(|document| self.blue_invoices.unique(document))
                 .unwrap_or(""),
         };
 
@@ -459,7 +447,13 @@ mod tests {
             "partial-invoice",
             "missing-invoice",
         ];
-        let mut upload_rows = vec![vec!["检索参考号", "状态", "发票号码", "补贴金额"]];
+        let mut upload_rows = vec![vec![
+            "检索参考号",
+            "状态",
+            "发票号码",
+            "补贴金额",
+            "更新时间",
+        ]];
         for key in keys {
             let invoice = match key {
                 "partial-invoice" => "partial",
@@ -469,7 +463,13 @@ mod tests {
             upload_rows.push(vec![key, "审核终止", invoice, ""]);
         }
         let uploads = table(upload_rows);
-        let digital = table(vec![vec!["检索参考号", "状态", "发票号码", "补贴金额"]]);
+        let digital = table(vec![vec![
+            "检索参考号",
+            "状态",
+            "发票号码",
+            "补贴金额",
+            "更新时间",
+        ]]);
         let invoices = table(vec![
             vec![
                 "数电发票号码",
@@ -591,12 +591,18 @@ mod tests {
     #[test]
     fn empty_upload_invoice_uses_unique_sales_document_and_preferred_blue_invoice() {
         let uploads = table(vec![
-            vec!["检索参考号", "状态", "发票号码", "补贴金额"],
+            vec!["检索参考号", "状态", "发票号码", "补贴金额", "更新时间"],
             vec!["primary", "待审核", "red-only", ""],
             vec!["primary-missing", "审核失败", "unknown-invoice", ""],
             vec!["empty-upload", "审核终止", "", ""],
         ]);
-        let digital = table(vec![vec!["检索参考号", "状态", "发票号码", "补贴金额"]]);
+        let digital = table(vec![vec![
+            "检索参考号",
+            "状态",
+            "发票号码",
+            "补贴金额",
+            "更新时间",
+        ]]);
         let invoice_rows = [
             ["done", "done-no", "蓝票", "开票完成"],
             ["flushed", "flushed-no", "蓝票", "已红冲"],
@@ -751,12 +757,14 @@ mod tests {
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let dig_upload = SheetData::new(vec![vec![
             Data::String("检索参考号".to_string()),
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let invoices = SheetData::new(vec![vec![
             Data::String("数电发票号码".to_string()),
@@ -780,6 +788,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-999".to_string()),
@@ -793,6 +802,7 @@ mod tests {
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let invoices = SheetData::new(vec![
             vec![
@@ -834,6 +844,48 @@ mod tests {
         );
     }
 
+    /// 与清洗第10.12.2节一致：同一参考号取`更新时间`最新的记录，不视为冲突。
+    #[test]
+    fn upload_reference_uses_latest_update() {
+        use calamine::Data;
+        let text = |value: &str| Data::String(value.to_string());
+        let header = ["检索参考号", "状态", "发票号码", "补贴金额", "更新时间"];
+        let row = |status: &str, time: &str| {
+            vec![
+                text("ref-r"),
+                text(status),
+                text("inv-r"),
+                text("100"),
+                Data::DateTimeIso(format!("2026-11-01T{time}")),
+            ]
+        };
+        let app_upload = SheetData::new(vec![
+            header.iter().map(|name| text(name)).collect(),
+            row("已回款", "10:00:00"),
+            row("审核失败", "09:00:00"),
+        ]);
+        let dig_upload = SheetData::new(vec![header.iter().map(|name| text(name)).collect()]);
+        let invoices = SheetData::new(vec![
+            [
+                "数电发票号码",
+                "开票类型",
+                "开票状态",
+                "大类",
+                "品牌",
+                "主要商品名称",
+                "匹配单据号",
+            ]
+            .iter()
+            .map(|name| text(name))
+            .collect(),
+        ]);
+        let reconciler =
+            TransactionReconciler::from_inputs(&app_upload, &dig_upload, &invoices, &empty_sales())
+                .unwrap();
+        assert_eq!(reconciler.reconcile("ref-r", "").status, "已回款");
+        assert!(reconciler.warnings().is_empty());
+    }
+
     #[test]
     fn conflicting_upload_reference_falls_back_to_unsubmitted_and_reports_warning() {
         use calamine::Data;
@@ -843,6 +895,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-dup".to_string()),
@@ -862,6 +915,7 @@ mod tests {
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let invoices = SheetData::new(vec![vec![
             Data::String("数电发票号码".to_string()),
@@ -897,6 +951,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-same".to_string()),
@@ -911,6 +966,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-same".to_string()),
@@ -947,6 +1003,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-inv-test".to_string()),
@@ -960,6 +1017,7 @@ mod tests {
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let invoices = SheetData::new(vec![
             vec![
@@ -1018,6 +1076,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-inv-diff".to_string()),
@@ -1037,6 +1096,7 @@ mod tests {
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let invoices = SheetData::new(vec![vec![
             Data::String("数电发票号码".to_string()),
@@ -1072,6 +1132,7 @@ mod tests {
                 Data::String("状态".to_string()),
                 Data::String("发票号码".to_string()),
                 Data::String("补贴金额".to_string()),
+                Data::String("更新时间".to_string()),
             ],
             vec![
                 Data::String("ref-prod-diff".to_string()),
@@ -1085,6 +1146,7 @@ mod tests {
             Data::String("状态".to_string()),
             Data::String("发票号码".to_string()),
             Data::String("补贴金额".to_string()),
+            Data::String("更新时间".to_string()),
         ]]);
         let invoices = SheetData::new(vec![
             vec![

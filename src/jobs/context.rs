@@ -3,7 +3,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use super::{Category, MultiValueIndex, invoice, receipts, unionpay};
-use crate::model::{ProcessError, Table, Value};
+use crate::model::{ProcessError, Table};
 
 /// 命中分类互斥；不同阶段的歧义可重复计数。
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
@@ -12,9 +12,22 @@ pub struct MatchStats {
     pub ambiguous: [usize; 4],
 }
 
+impl MatchStats {
+    // `hits` 下标：互斥的四类匹配结果。
+    pub(crate) const HIT_RECEIPTS: usize = 0;
+    pub(crate) const HIT_REFERENCE: usize = 1;
+    pub(crate) const HIT_INVOICE: usize = 2;
+    pub(crate) const NOT_UPLOADED: usize = 3;
+    // `ambiguous` 下标：各阶段歧义记录数。
+    pub(crate) const AMB_REFERENCE: usize = 0;
+    pub(crate) const AMB_INVOICE_NO: usize = 1;
+    pub(crate) const AMB_RECEIPTS: usize = 2;
+    pub(crate) const AMB_UPLOAD_STATUS: usize = 3;
+}
+
 #[derive(Default, Debug)]
 pub struct PipelineContext {
-    tables: HashMap<Category, Table>,
+    tables: HashMap<Category, Rc<Table>>,
     authority: Option<Rc<HashSet<String>>>,
     invoices: Option<Rc<MultiValueIndex>>,
     receipts: Option<Rc<MultiValueIndex>>,
@@ -26,20 +39,18 @@ impl PipelineContext {
         Self::default()
     }
 
-    pub fn store_table(&mut self, category: Category, table: Table) {
-        self.tables.insert(category, table);
-    }
-
-    pub fn get_table(&self, category: Category) -> Option<Table> {
-        self.tables.get(&category).cloned()
-    }
-
-    /// 只读借用缓存中的表并执行闭包，避免整表深拷贝。
-    pub fn with_table<F, R>(&self, category: Category, f: F) -> Option<R>
-    where
-        F: FnOnce(&Table) -> R,
-    {
-        self.tables.get(&category).map(f)
+    /// 已缓存时直接共享该表（不深拷贝），否则运行 `produce` 并缓存结果。
+    pub(crate) fn cached_table(
+        &mut self,
+        category: Category,
+        produce: impl FnOnce(&mut Self) -> Result<Table, ProcessError>,
+    ) -> Result<Rc<Table>, ProcessError> {
+        if let Some(cached) = self.tables.get(&category) {
+            return Ok(Rc::clone(cached));
+        }
+        let table = Rc::new(produce(self)?);
+        self.tables.insert(category, Rc::clone(&table));
+        Ok(table)
     }
 
     pub(crate) fn authority(
@@ -81,28 +92,14 @@ impl PipelineContext {
             return Ok(Rc::clone(index));
         }
         let records = invoice::load_records(input_dir)?;
-        let index = Self::build_invoice_index(&records);
+        let index = Rc::new(invoice::document_index(&records));
         self.invoices = Some(Rc::clone(&index));
         Ok(index)
     }
 
     pub(crate) fn store_invoices(&mut self, records: &[invoice::InvoiceRecord]) {
-        let index = Self::build_invoice_index(records);
+        let index = Rc::new(invoice::document_index(records));
         self.invoices = Some(index);
-    }
-
-    fn build_invoice_index(records: &[invoice::InvoiceRecord]) -> Rc<MultiValueIndex> {
-        let mut grouped = MultiValueIndex::new();
-        for record in records {
-            let Value::Text(match_doc_no) = &record.match_doc_no else {
-                continue;
-            };
-            if record.invoice_no.is_empty() {
-                continue;
-            }
-            grouped.insert(match_doc_no.clone(), record.invoice_no.clone());
-        }
-        Rc::new(grouped)
     }
 
     /// 按`匹配单据号`汇总收款单统计全部非空`备注`（未去重）；歧义判定同样复用`resolve`。
@@ -148,15 +145,18 @@ impl PipelineContext {
         if let Some(stats) = self.stats {
             println!(
                 "匹配统计：收款单备注 {}，上传参考号 {}，上传发票号 {}，未上传 {}；合计 {}。",
-                stats.hits[0],
-                stats.hits[1],
-                stats.hits[2],
-                stats.hits[3],
+                stats.hits[MatchStats::HIT_RECEIPTS],
+                stats.hits[MatchStats::HIT_REFERENCE],
+                stats.hits[MatchStats::HIT_INVOICE],
+                stats.hits[MatchStats::NOT_UPLOADED],
                 stats.hits.iter().sum::<usize>()
             );
             println!(
                 "歧义记录：参考号提取 {}，发票号码 {}，收款单备注 {}，上传状态 {}（不同阶段可重复计数）。",
-                stats.ambiguous[0], stats.ambiguous[1], stats.ambiguous[2], stats.ambiguous[3]
+                stats.ambiguous[MatchStats::AMB_REFERENCE],
+                stats.ambiguous[MatchStats::AMB_INVOICE_NO],
+                stats.ambiguous[MatchStats::AMB_RECEIPTS],
+                stats.ambiguous[MatchStats::AMB_UPLOAD_STATUS]
             );
         }
     }
@@ -183,24 +183,27 @@ mod tests {
     }
 
     #[test]
-    fn stores_and_retrieves_table() {
+    fn cached_table_runs_once_and_shares_without_cloning() {
         let mut ctx = PipelineContext::new();
-        let table = sample_table();
-        assert!(ctx.get_table(Category::Invoice).is_none());
-        ctx.store_table(Category::Invoice, table.clone());
-        assert_eq!(
-            ctx.get_table(Category::Invoice).map(|t| t.rows.len()),
-            Some(1)
-        );
+        let first = ctx
+            .cached_table(Category::RefundAppliance, |_| Ok(sample_table()))
+            .unwrap();
+        let second = ctx
+            .cached_table(Category::RefundAppliance, |_| unreachable!("已缓存"))
+            .unwrap();
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(second.rows.len(), 1);
     }
 
     #[test]
-    fn with_table_borrows_without_cloning() {
+    fn failed_production_is_not_cached() {
         let mut ctx = PipelineContext::new();
-        let table = sample_table();
-        ctx.store_table(Category::RefundAppliance, table);
-        let row_count = ctx.with_table(Category::RefundAppliance, |t| t.rows.len());
-        assert_eq!(row_count, Some(1));
+        let failed = ctx.cached_table(Category::Invoice, |_| {
+            Err(ProcessError::Read("boom".into()))
+        });
+        assert!(failed.is_err());
+        let retried = ctx.cached_table(Category::Invoice, |_| Ok(sample_table()));
+        assert!(retried.is_ok());
     }
 
     #[test]

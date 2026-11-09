@@ -51,7 +51,7 @@ impl MatchDocNo {
     }
 }
 
-/// project.md 3.4 节已确认的定向修正，作用于整条备注文本。
+/// cleaning-rules.md 3.4 节已确认的定向修正，作用于整条备注文本。
 fn apply_known_remark_fixes(remark: &str) -> String {
     remark
         .replace("2026-0101", "2026-01-01")

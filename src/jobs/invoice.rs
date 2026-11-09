@@ -6,10 +6,11 @@ use chrono::NaiveDate;
 use crate::io::paths::list_xlsx_files;
 use crate::io::xlsx_reader::open_sheets;
 use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
+use crate::utils::product::normalize_invoice_brand;
 use crate::utils::{dates, doc_no};
 
 use super::{
-    Category, Job, PipelineContext, cell_text, data_error, parse_datetime_field,
+    Category, Job, MultiValueIndex, PipelineContext, cell_text, data_error, parse_datetime_field,
     pick_unique_latest, text_value,
 };
 
@@ -217,10 +218,6 @@ fn unseparated_finance_category(name: &str) -> Option<&'static str> {
     }
 }
 
-fn normalize_invoice_brand(brand: &str) -> String {
-    crate::utils::product::normalize_invoice_brand(brand)
-}
-
 fn brand_from_unseparated_name(name: &str) -> String {
     match name {
         "VIXO手机" | "手机vivo" => return "vivo".to_string(),
@@ -369,6 +366,76 @@ impl Job for InvoiceJob {
         ctx.store_invoices(&records);
         Ok(classify_and_build_table(records))
     }
+}
+
+/// 第10.10节蓝票取号规则，清洗（销售用券`数电发票号码`）与财务统筹表（发票号回退）共用：
+/// 只在蓝票中取号；同一`匹配单据号`有开票完成的蓝票时只保留这些号码（红冲后重开取新票），
+/// 否则保留全部蓝票号码。开票类型与状态去除首尾空白后比较。多个候选由调用方判为歧义。
+#[derive(Debug, Default)]
+pub(crate) struct BlueInvoiceCandidates(HashMap<String, (Vec<String>, Vec<String>)>);
+
+impl BlueInvoiceCandidates {
+    pub(crate) fn add(
+        &mut self,
+        document: &str,
+        invoice_type: &str,
+        status: &str,
+        invoice_no: &str,
+    ) {
+        if document.is_empty() || invoice_no.is_empty() || invoice_type.trim() != "蓝票" {
+            return;
+        }
+        let (all, completed) = self.0.entry(document.to_string()).or_default();
+        push_distinct(all, invoice_no);
+        if status.trim() == "开票完成" {
+            push_distinct(completed, invoice_no);
+        }
+    }
+
+    fn preferred((all, completed): &(Vec<String>, Vec<String>)) -> &[String] {
+        if completed.is_empty() { all } else { completed }
+    }
+
+    /// 该`匹配单据号`唯一的候选号码；无候选或多个候选（歧义）时为`None`，不任选。
+    pub(crate) fn unique(&self, document: &str) -> Option<&str> {
+        match self.0.get(document).map(Self::preferred) {
+            Some([only]) => Some(only.as_str()),
+            _ => None,
+        }
+    }
+
+    /// `匹配单据号 → 候选号码`索引，歧义由`MultiValueIndex`判定并计数。
+    pub(crate) fn into_index(self) -> MultiValueIndex {
+        let mut index = MultiValueIndex::new();
+        for (document, candidates) in &self.0 {
+            for invoice_no in Self::preferred(candidates) {
+                index.insert(document.clone(), invoice_no.clone());
+            }
+        }
+        index
+    }
+}
+
+fn push_distinct(values: &mut Vec<String>, value: &str) {
+    if !values.iter().any(|v| v == value) {
+        values.push(value.to_string());
+    }
+}
+
+/// `匹配单据号 → 数电发票号码`候选索引，按`BlueInvoiceCandidates`取号。
+pub(crate) fn document_index(records: &[InvoiceRecord]) -> MultiValueIndex {
+    let mut blue = BlueInvoiceCandidates::default();
+    for record in records {
+        if let Value::Text(match_doc_no) = &record.match_doc_no {
+            blue.add(
+                match_doc_no,
+                &record.invoice_type,
+                &record.invoice_status,
+                &record.invoice_no,
+            );
+        }
+    }
+    blue.into_index()
 }
 
 /// 读取当前最新发票工作簿的全部有效明细（含正常、重复与异常记录），供本任务
@@ -541,6 +608,7 @@ mod tests {
     use rust_xlsxwriter::Workbook;
 
     use super::*;
+    use crate::jobs::PriorityOutcome;
     use crate::test_support::unique_temp_path;
 
     #[test]
@@ -608,6 +676,98 @@ mod tests {
             "操作人甲",
             "已打印",
         ]
+    }
+
+    /// 第10.10节：同一匹配单据号只在蓝票中取号，开票完成的蓝票优先；不任选。
+    #[test]
+    fn document_index_prefers_unique_completed_blue_invoice() {
+        let dir = unique_temp_path("invoice-document-index");
+        std::fs::create_dir_all(&dir).unwrap();
+        let row = |remark, invoice_type, status, invoice_no| {
+            let mut values =
+                sample_source_row("2026-09-14 10:00:00", invoice_type, status, remark, "商品");
+            values[8] = invoice_no;
+            values
+        };
+        write_invoice_workbook(
+            &dir.join("发票_20260914.xlsx"),
+            "发票_20260914",
+            &[
+                // 红冲后重开：取开票完成的那张。
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000001",
+                    "蓝票",
+                    "已红冲",
+                    "RED1",
+                ),
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000001",
+                    "蓝票",
+                    "开票完成",
+                    "OK1",
+                ),
+                // 没有开票完成时，唯一的蓝票可用。
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000002",
+                    "蓝票",
+                    "开票失败",
+                    "FAIL2",
+                ),
+                // 两张开票完成：歧义。
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000003",
+                    "蓝票",
+                    "开票完成",
+                    "OK3A",
+                ),
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000003",
+                    "蓝票",
+                    "开票完成",
+                    "OK3B",
+                ),
+                // 无开票完成且多张蓝票：歧义，不退回任选。
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000004",
+                    "蓝票",
+                    "已红冲",
+                    "RED4A",
+                ),
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000004",
+                    "蓝票",
+                    "已红冲",
+                    "RED4B",
+                ),
+                // 红票不参与取号。
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000005",
+                    "红票",
+                    "开票完成",
+                    "REDTICKET5",
+                ),
+                row(
+                    "销售日期2026-08-29 单据号ZFFX000005",
+                    "蓝票",
+                    "已红冲",
+                    "BLUE5",
+                ),
+            ],
+        );
+        let index = document_index(&load_records(&dir).unwrap());
+        let resolve = |doc: &str| index.resolve(Some(&format!("260829{doc}")));
+        assert_eq!(resolve("ZFFX000001"), PriorityOutcome::Unique("OK1".into()));
+        assert_eq!(
+            resolve("ZFFX000002"),
+            PriorityOutcome::Unique("FAIL2".into())
+        );
+        assert_eq!(resolve("ZFFX000003"), PriorityOutcome::Ambiguous);
+        assert_eq!(resolve("ZFFX000004"), PriorityOutcome::Ambiguous);
+        assert_eq!(
+            resolve("ZFFX000005"),
+            PriorityOutcome::Unique("BLUE5".into())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

@@ -97,9 +97,21 @@ pub struct SummaryMetrics {
     pub wait: MetricRow,
     pub fail: MetricRow,
     pub unup: MetricRow,
+    /// 实时清分UUID与状态都重复、只计一次的上传记录数。
+    pub duplicate_uploads: usize,
 }
 
 impl SummaryMetrics {
+    /// 报表规则第4.1.1节：重复记录只计一次并输出告警。
+    pub(crate) fn duplicate_warning(&self) -> Option<String> {
+        (self.duplicate_uploads > 0).then(|| {
+            format!(
+                "已上传明细：{} 条同一实时清分UUID的重复记录未计入，汇总金额和笔数按更新时间最新的状态统计",
+                self.duplicate_uploads
+            )
+        })
+    }
+
     /// 数值顺序：发生、已回款、综合回款、未回款、通过、待审、失败、未上传。
     pub(crate) fn amount_ratios(&self) -> [(Decimal, f64, Decimal, f64, Decimal, f64); 8] {
         let combined = MetricRow::new(
@@ -168,10 +180,13 @@ impl SummaryMetrics {
             }
         }
 
-        let count_uploaded = |rows: &SheetData, label: &str| -> Result<UploadTotals, String> {
+        let mut duplicate_uploads = 0;
+        let mut count_uploaded = |rows: &SheetData, label: &str| -> Result<UploadTotals, String> {
             let cols = UploadColumns::from_header(&rows.header, label)?;
+            let (current, duplicates) = current_uploads(rows, label)?;
+            duplicate_uploads += duplicates;
             let mut totals = UploadTotals::new();
-            for row in &rows[1..] {
+            for row in current {
                 let status = cell_to_string(&row[cols.status]);
                 let amount = cell_to_decimal(&row[cols.subsidy]).unwrap_or(Decimal::ZERO);
                 let entry = totals.entry(status).or_default();
@@ -208,8 +223,34 @@ impl SummaryMetrics {
             wait,
             fail,
             unup,
+            duplicate_uploads,
         })
     }
+}
+
+/// 报表规则第4.1.1节：金额和笔数不能因重复导出翻倍。同一`实时清分UUID`按`SheetData::latest_rows`
+/// 只取更新时间最新的记录；最新时间相同时每个状态各留一条。UUID 为空无法判断重复，全部保留。
+/// 返回保留的行（源顺序）与去掉的行数。不用 UniqueIndex：它把状态不同的重复判为冲突并全部丢弃。
+pub(crate) fn current_uploads<'a>(
+    rows: &'a SheetData,
+    label: &str,
+) -> Result<(Vec<&'a Vec<Data>>, usize), String> {
+    let uuid_idx = rows.header.require("实时清分UUID", label)?;
+    let updated_idx = rows.header.require("更新时间", label)?;
+    let status_idx = rows.header.require("状态", label)?;
+    let cell =
+        |row: &'a Vec<Data>, idx: usize| cell_to_string(row.get(idx).unwrap_or(&Data::Empty));
+    let mut seen = HashSet::new();
+    let current: Vec<_> = rows
+        .latest_rows(uuid_idx, updated_idx)
+        .into_iter()
+        .filter(|row| {
+            let uuid = cell(row, uuid_idx);
+            uuid.is_empty() || seen.insert((uuid, cell(row, status_idx)))
+        })
+        .collect();
+    let duplicates = rows.len() - 1 - current.len();
+    Ok((current, duplicates))
 }
 
 pub(crate) const SUMMARY_STATUSES: [&str; 5] =
@@ -401,8 +442,9 @@ impl<'a> FailedUploadRecord<'a> {
         let status_idx = app_up.header.require("状态", "已上传明细")?;
         let inv_idx = app_up.header.require("发票号码", "已上传家电电脑.xlsx")?;
 
-        let mut records: Vec<_> = app_up[1..]
-            .iter()
+        let mut records: Vec<_> = current_uploads(app_up, "已上传家电电脑.xlsx")?
+            .0
+            .into_iter()
             .filter(|row| cell_to_string(&row[status_idx]) == "审核失败")
             .map(|row| {
                 let inv_no = cell_to_string(&row[inv_idx]);
@@ -430,8 +472,9 @@ impl<'a> FailedUploadRecord<'a> {
             .find(&["IMEI2", "imei2"])
             .ok_or("已上传数码.xlsx: 缺少必要列 [IMEI2]")?;
 
-        let records: Vec<_> = dig_up[1..]
-            .iter()
+        let records: Vec<_> = current_uploads(dig_up, "已上传数码.xlsx")?
+            .0
+            .into_iter()
             .filter(|row| cell_to_string(&row[status_idx]) == "审核失败")
             .map(|row| {
                 let imei1 = cell_to_string(&row[imei1_idx]);
@@ -612,6 +655,98 @@ mod tests {
     }
 
     #[test]
+    fn repeated_exports_count_once_per_uuid_and_status() {
+        let text = |value: &str| Data::String(value.into());
+        let sales = SheetData::new(vec![vec![text("财务大类"), text("补贴额"), text("数量")]]);
+        let header = [
+            "实时清分UUID",
+            "状态",
+            "补贴金额",
+            "检索参考号",
+            "发票号码",
+            "更新时间",
+        ];
+        let at = |time: &str| Data::DateTimeIso(format!("2026-11-01T{time}"));
+        let timed_row = |uuid: &str, status: &str, updated_at: Data| {
+            vec![
+                text(uuid),
+                text(status),
+                Data::Int(10),
+                text(""),
+                text(""),
+                updated_at,
+            ]
+        };
+        let row = |uuid: &str, status: &str| timed_row(uuid, status, Data::Empty);
+        let uploads = SheetData::new(vec![
+            header.iter().map(|name| text(name)).collect(),
+            row("A", "待审核"),
+            row("A", "待审核"),
+            row("A", "审核失败"),
+            row("", "待审核"),
+            row("", "待审核"),
+            // 重新提交后以`更新时间`最新的状态为准。
+            timed_row("B", "待审核", at("09:00:00")),
+            timed_row("B", "审核失败", at("10:00:00")),
+        ]);
+        let empty = SheetData::new(vec![header.iter().map(|name| text(name)).collect()]);
+        let metrics = SummaryMetrics::calculate(&sales, &uploads, &empty).unwrap();
+        // 空 UUID 无法判断重复，全部保留。
+        assert_eq!(metrics.wait.app_cnt, 3);
+        assert_eq!(metrics.wait.app_amt, Decimal::from(30));
+        assert_eq!(metrics.fail.app_cnt, 2);
+        assert_eq!(metrics.duplicate_uploads, 2);
+        assert_eq!(
+            metrics.duplicate_warning().as_deref(),
+            Some(
+                "已上传明细：2 条同一实时清分UUID的重复记录未计入，汇总金额和笔数按更新时间最新的状态统计"
+            )
+        );
+    }
+
+    #[test]
+    fn failed_records_follow_the_same_uuid_dedup_as_metrics() {
+        let text = |value: &str| Data::String(value.into());
+        let header = [
+            "状态",
+            "发票号码",
+            "实时清分UUID",
+            "更新时间",
+            "IMEI1",
+            "IMEI2",
+        ];
+        let row = |uuid: &str, status: &str, time: &str| {
+            vec![
+                text(status),
+                text(""),
+                text(uuid),
+                Data::DateTimeIso(format!("2026-11-01T{time}")),
+                text(""),
+                text(""),
+            ]
+        };
+        let uploads = SheetData::new(vec![
+            header.iter().map(|name| text(name)).collect(),
+            row("X", "审核失败", "09:00:00"),
+            row("X", "审核失败", "09:00:00"),
+            // 失败后重新提交并通过：不再列入失败明细。
+            row("Y", "审核失败", "09:00:00"),
+            row("Y", "待审核", "10:00:00"),
+        ]);
+        let names = UniqueIndex::default();
+        assert_eq!(
+            FailedUploadRecord::extract_appliance(&uploads, &names)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            FailedUploadRecord::extract_digital(&uploads).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
     fn zero_amount_ratios_are_zero() {
         let zero = MetricRow::default();
         let metrics = SummaryMetrics {
@@ -622,7 +757,9 @@ mod tests {
             wait: zero,
             fail: zero,
             unup: zero,
+            duplicate_uploads: 0,
         };
+        assert_eq!(metrics.duplicate_warning(), None);
         for row in metrics.amount_ratios() {
             assert_eq!(
                 row,
@@ -634,7 +771,12 @@ mod tests {
     #[test]
     fn anomaly_datasets_extract_orders_and_groups_sections() {
         let app_rows = SheetData::new(vec![
-            vec![Data::String("状态".into()), Data::String("发票号码".into())],
+            vec![
+                Data::String("状态".into()),
+                Data::String("发票号码".into()),
+                Data::String("实时清分UUID".into()),
+                Data::String("更新时间".into()),
+            ],
             vec![Data::String("审核失败".into()), Data::String("INV2".into())],
             vec![Data::String("已回款".into()), Data::String("INV1".into())],
             vec![Data::String("审核失败".into()), Data::String("INV1".into())],
@@ -648,6 +790,8 @@ mod tests {
                 Data::String("状态".into()),
                 Data::String("IMEI1".into()),
                 Data::String("IMEI2".into()),
+                Data::String("实时清分UUID".into()),
+                Data::String("更新时间".into()),
             ],
             vec![
                 Data::String("审核失败".into()),

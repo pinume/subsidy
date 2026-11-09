@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::str::FromStr;
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
@@ -9,8 +11,9 @@ use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, MultiValueIndex, PipelineContext, amount_value, cell_amount, cell_text,
-    data_error, pick_unique_latest, resolve_synonym_column, text_value,
+    Category, Job, MERCHANT_APPLIANCE, MERCHANT_DIGITAL, MultiValueIndex, PipelineContext,
+    PriorityOutcome, amount_value, cell_amount, cell_text, data_error, pick_unique_latest,
+    resolve_synonym_column, text_value,
 };
 
 pub(crate) const OUTPUT_FIELDS: [&str; 24] = [
@@ -128,7 +131,7 @@ const APPLIANCE_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年以旧换新补贴明细.xlsx",
     field_synonyms: APPLIANCE_SYNONYMS,
     required_indices: &APPLIANCE_REQUIRED,
-    dealer_code: "89813015722APT1",
+    dealer_code: MERCHANT_APPLIANCE,
 };
 
 const DIGITAL_SYNONYMS: [&[&str]; 24] = [
@@ -167,7 +170,7 @@ const DIGITAL_CONFIG: RefundConfig = RefundConfig {
     filename_suffix: "年数码补贴明细.xlsx",
     field_synonyms: DIGITAL_SYNONYMS,
     required_indices: &DIGITAL_REQUIRED,
-    dealer_code: "89813014812B06R",
+    dealer_code: MERCHANT_DIGITAL,
 };
 
 pub struct RefundJob(&'static RefundConfig);
@@ -191,14 +194,16 @@ impl Job for RefundJob {
     fn run_in_context(
         &self,
         input_dir: &Path,
-        ctx: &mut PipelineContext,
+        _: &mut PipelineContext,
     ) -> Result<Table, ProcessError> {
-        if let Some(cached) = ctx.get_table(self.0.category) {
-            return Ok(cached);
-        }
-        let table = run_refund(self.0, input_dir)?;
-        ctx.store_table(self.0.category, table.clone());
-        Ok(table)
+        run_refund(self.0, input_dir)
+    }
+    fn run_shared(
+        &self,
+        input_dir: &Path,
+        ctx: &mut PipelineContext,
+    ) -> Result<Rc<Table>, ProcessError> {
+        ctx.cached_table(self.0.category, |ctx| self.run_in_context(input_dir, ctx))
     }
 }
 
@@ -479,28 +484,55 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
 
 /// 按`商户订单号`、`交易参考号`分别汇总回款明细"正常区域"（排除第7.5/8.5节
 /// 沉底的粉色重复记录）全部`补贴金额`（未去重，格式化为两位小数文本以统一比较）。
-pub(super) fn subsidy_indices(refund_table: &Table) -> (MultiValueIndex, MultiValueIndex) {
-    let mut by_order = MultiValueIndex::new();
-    let mut by_reference = MultiValueIndex::new();
+pub(crate) struct RefundSubsidyIndex {
+    by_order: MultiValueIndex,
+    by_reference: MultiValueIndex,
+}
 
-    for row in refund_table
-        .rows
-        .iter()
-        .filter(|r| r.fill != Some(Fill::Pink))
-    {
-        let Value::Decimal(subsidy) = &row.values[SUBSIDY_AMOUNT] else {
-            continue;
-        };
-        let subsidy_text = subsidy.round_dp(2).to_string();
+impl RefundSubsidyIndex {
+    /// 只索引回款正常区域（非粉色）的补贴金额。
+    pub(super) fn from_table(refund_table: &Table) -> Self {
+        let mut by_order = MultiValueIndex::new();
+        let mut by_reference = MultiValueIndex::new();
 
-        if let Value::Text(order_no) = &row.values[MERCHANT_ORDER] {
-            by_order.insert(order_no.clone(), subsidy_text.clone());
+        for row in refund_table
+            .rows
+            .iter()
+            .filter(|r| r.fill != Some(Fill::Pink))
+        {
+            let Value::Decimal(subsidy) = &row.values[SUBSIDY_AMOUNT] else {
+                continue;
+            };
+            // 统一为两位小数再转文本，避免 100 与 100.00 被当成两个不同金额。
+            let mut cents = crate::utils::numbers::round_cents(*subsidy);
+            cents.rescale(2);
+            let subsidy_text = cents.to_string();
+
+            if let Value::Text(order_no) = &row.values[MERCHANT_ORDER] {
+                by_order.insert(order_no.clone(), subsidy_text.clone());
+            }
+            if let Value::Text(reference) = &row.values[REFERENCE] {
+                by_reference.insert(reference.clone(), subsidy_text.clone());
+            }
         }
-        if let Value::Text(reference) = &row.values[REFERENCE] {
-            by_reference.insert(reference.clone(), subsidy_text.clone());
+        Self {
+            by_order,
+            by_reference,
         }
     }
-    (by_order, by_reference)
+
+    /// 按`订单号`（主键）→`检索参考号`（次键）依次在回款明细索引中查找
+    /// 唯一命中的`补贴金额`；命中即停，同级歧义立即停止、不再尝试下一级。
+    pub(super) fn matched(&self, order_no: &str, reference: &str) -> Option<Decimal> {
+        for (index, key) in [(&self.by_order, order_no), (&self.by_reference, reference)] {
+            match index.resolve(Some(key)) {
+                PriorityOutcome::Unique(value) => return Decimal::from_str(&value).ok(),
+                PriorityOutcome::Ambiguous => return None,
+                PriorityOutcome::NoHit => {}
+            }
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -509,6 +541,22 @@ mod tests {
 
     use super::*;
     use crate::test_support::unique_temp_path;
+
+    #[test]
+    fn equal_subsidies_with_different_scales_are_one_value() {
+        let row = |amount: Decimal| {
+            let mut values = vec![Value::Empty; OUTPUT_FIELDS.len()];
+            values[MERCHANT_ORDER] = Value::Text("order-1".into());
+            values[SUBSIDY_AMOUNT] = Value::Decimal(amount);
+            Row { values, fill: None }
+        };
+        let table = Table {
+            columns: vec![],
+            rows: vec![row(Decimal::new(100, 0)), row(Decimal::new(10000, 2))],
+        };
+        let index = RefundSubsidyIndex::from_table(&table);
+        assert_eq!(index.matched("order-1", ""), Some(Decimal::new(10000, 2)));
+    }
 
     type SheetSpec<'a> = (&'a str, &'a [&'a str], &'a [Vec<String>]);
 
