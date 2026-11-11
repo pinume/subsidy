@@ -9,7 +9,7 @@ use crate::io::{
 };
 use crate::jobs::{self, Category};
 use crate::model::ProcessError;
-use crate::reporting::{data::CommonInputs, finance_wb, summary_wb};
+use crate::reporting::{data::CommonInputs, finance_wb, ledger, summary_wb};
 
 const SUMMARY_DEPENDENCIES: &[Category] = &[
     Category::Invoice,
@@ -65,7 +65,7 @@ pub(super) fn run_all(input: &Path, cleaned: &Path, success: &HashSet<Category>)
             all_ok = false;
             continue;
         }
-        let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        all_ok &= attempt(stem, || {
             validate_output_dir(input)?;
             generate_and_publish(stem, cleaned, &output, |input, path| {
                 let inputs = common_inputs
@@ -74,27 +74,45 @@ pub(super) fn run_all(input: &Path, cleaned: &Path, success: &HashSet<Category>)
                     .map_err(Clone::clone)?;
                 generator(input, path, inputs)
             })
-        }))
-        .unwrap_or_else(|payload| {
-            Err(ProcessError::Read(format!(
-                "报表处理过程中发生程序内部错误：{}",
-                super::runner::panic_message(payload.as_ref())
-            )))
         });
-        match result {
-            Ok(warnings) => {
-                for warning in warnings {
-                    println!("[{stem}] 注意：{warning}");
-                }
-                println!("[{stem}] 报表成功。");
-            }
-            Err(error) => {
-                println!("[{stem}] 报表失败：{error}");
-                all_ok = false;
-            }
-        }
+    }
+    // 台账直接读取原始数据，不依赖本次清洗结果。
+    for (stem, generator) in [
+        (
+            "家电台账",
+            ledger::generate_appliance as fn(&Path, &Path) -> Result<Vec<String>, String>,
+        ),
+        ("数码台账", ledger::generate_digital),
+    ] {
+        all_ok &= attempt(stem, || {
+            validate_output_dir(input)?;
+            generate_and_publish(stem, input, &output, generator)
+        });
     }
     all_ok
+}
+
+/// 隔离单份报表的失败与 panic，打印结果；成功（含告警）时返回 `true`。
+fn attempt(stem: &str, run: impl FnOnce() -> Result<Vec<String>, ProcessError>) -> bool {
+    let result = panic::catch_unwind(AssertUnwindSafe(run)).unwrap_or_else(|payload| {
+        Err(ProcessError::Read(format!(
+            "报表处理过程中发生程序内部错误：{}",
+            super::runner::panic_message(payload.as_ref())
+        )))
+    });
+    match result {
+        Ok(warnings) => {
+            for warning in warnings {
+                println!("[{stem}] 注意：{warning}");
+            }
+            println!("[{stem}] 报表成功。");
+            true
+        }
+        Err(error) => {
+            println!("[{stem}] 报表失败：{error}");
+            false
+        }
+    }
 }
 
 fn generate_and_publish(
@@ -162,6 +180,34 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_dir(root.join(REPORT_DIR)).unwrap().count(), 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn ledgers_run_without_cleaning_and_a_failed_ledger_keeps_its_old_file() {
+        let root = unique_temp_path("report-ledgers");
+        let input = root.join("raw");
+        let reports = root.join(REPORT_DIR);
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::write(reports.join("家电台账.xlsx"), b"old ledger").unwrap();
+        let mut book = rust_xlsxwriter::Workbook::new();
+        book.add_worksheet().write_string(0, 0, "商户编号").unwrap();
+        book.save(input.join("2026年数码补贴明细.xlsx")).unwrap();
+        let mut invoices = rust_xlsxwriter::Workbook::new();
+        let sheet = invoices.add_worksheet();
+        for (col, header) in crate::jobs::invoice::SOURCE_HEADERS.iter().enumerate() {
+            sheet.write_string(5, col as u16, *header).unwrap();
+        }
+        invoices.save(input.join("发票_20260201.xlsx")).unwrap();
+        // 清洗全部失败：原有报表跳过；家电台账缺少补贴明细失败；数码台账照常发布。
+        assert!(!run_all(&input, &root.join("国补明细"), &HashSet::new()));
+        assert_eq!(
+            std::fs::read(reports.join("家电台账.xlsx")).unwrap(),
+            b"old ledger"
+        );
+        assert!(reports.join("数码台账.xlsx").is_file());
+        assert_eq!(std::fs::read_dir(&reports).unwrap().count(), 2);
         std::fs::remove_dir_all(root).unwrap();
     }
 

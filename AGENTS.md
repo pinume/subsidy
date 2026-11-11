@@ -1,12 +1,12 @@
 # subsidy 开发规则
 
-Rust CLI：8类 Excel 清洗后生成2份报表。业务术语见 [CONTEXT.md](CONTEXT.md)。
+Rust CLI：8类 Excel 清洗后生成2份工作簿，另由原始数据生成2份台账，共4份报表。业务术语见 [CONTEXT.md](CONTEXT.md)。
 
 ## 按任务读取
 
 - 修改模块、共享规则或发布流程：读[项目架构](docs/architecture.md)，在对应规则所有者中实现。
 - 修改清洗：先读[清洗规则](docs/cleaning-rules.md) §1 通用约束，再读对应章节：§3 发票、§5 已上传、§6 银联、§7–8 回款、§9 收款单、§10 销售用券。
-- 修改报表：先读[报表规则](docs/reporting-rules.md) §3 输入契约，再读对应章节：§4 汇总、§5 财务统筹；改排版另读 §7。
+- 修改报表：先读[报表规则](docs/reporting-rules.md) §3 输入契约，再读对应章节：§4 汇总、§5 财务统筹、§6 台账；改排版另读 §7。
 - 改动影响输出：按[真实数据核对](docs/agents/real-data.md)比较结果；没有数据时说明未验证部分。
 
 ## 修改约束

@@ -51,7 +51,7 @@ fn field(path: &Path, sheet: usize, row: usize, name: &str) -> Data {
 }
 
 #[test]
-fn cli_cleans_all_eight_categories_and_publishes_two_excel_reports() {
+fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
     let root = std::env::temp_dir().join(format!(
         "subsidy-full-{}-{}",
         std::process::id(),
@@ -135,15 +135,21 @@ fn cli_cleans_all_eight_categories_and_publishes_two_excel_reports() {
         ]],
         Some("请注意：D1手续费字段为预估数据仅供参考，实际以17：40分之后的D1划付数据为准。"),
     );
-    for (name, merchant, order, subsidy) in [
+    for (name, header, merchant_field, time_field, merchant, order, subsidy) in [
         (
             "2026年以旧换新补贴明细.xlsx",
+            headers::REFUND,
+            "核销商编",
+            "交易完成时间",
             "89813015722APT1",
             "order-a",
             "150.00",
         ),
         (
             "2026年数码补贴明细.xlsx",
+            headers::DIGITAL_REFUND,
+            "商户编号",
+            "提交时间",
             "89813014812B06R",
             "other",
             "10.00",
@@ -152,15 +158,15 @@ fn cli_cleans_all_eight_categories_and_publishes_two_excel_reports() {
         export(
             &input,
             name,
-            headers::REFUND,
+            header,
             0,
             "",
             &[&[
                 ("拨付批次", "批次1"),
-                ("核销商编", merchant),
+                (merchant_field, merchant),
                 ("商户订单号", order),
                 ("补贴金额", subsidy),
-                ("交易完成时间", "2026-09-14 10:00:00"),
+                (time_field, "2026-09-14 10:00:00"),
             ]],
             None,
         );
@@ -264,7 +270,18 @@ fn cli_cleans_all_eight_categories_and_publishes_two_excel_reports() {
         "退货-退单"
     );
     let reports = root.join("国补报表");
-    assert_eq!(std::fs::read_dir(&reports).unwrap().count(), 2);
+    assert_eq!(std::fs::read_dir(&reports).unwrap().count(), 4);
+    for (name, order) in [("家电台账", "order-a"), ("数码台账", "other")] {
+        let mut book = open_workbook_auto(reports.join(format!("{name}.xlsx"))).unwrap();
+        assert_eq!(book.sheet_names(), [name]);
+        let range = book.worksheet_range(name).unwrap();
+        let rows: Vec<_> = range.rows().collect();
+        assert_eq!(rows.len(), 3, "{name}: 标题、表头及1条本店记录");
+        assert_eq!(rows[1].len(), 26);
+        let col = |field: &str| rows[1].iter().position(|cell| cell == field).unwrap();
+        assert_eq!(rows[2][col("序号")], "1-01");
+        assert_eq!(rows[2][col("商户订单号")], order);
+    }
     assert_eq!(
         open_workbook_auto(reports.join("国补上传情况汇总.xlsx"))
             .unwrap()
@@ -285,7 +302,7 @@ fn cli_cleans_all_eight_categories_and_publishes_two_excel_reports() {
 }
 
 #[test]
-fn cli_warns_on_duplicate_business_key_conflicts_and_exits_successfully() {
+fn cli_warns_on_duplicate_invoice_keys_and_only_the_ledgers_fail() {
     let root = std::env::temp_dir().join(format!(
         "subsidy-conflict-{}-{}",
         std::process::id(),
@@ -380,15 +397,21 @@ fn cli_warns_on_duplicate_business_key_conflicts_and_exits_successfully() {
         ]],
         Some("请注意：D1手续费字段为预估数据仅供参考，实际以17：40分之后的D1划付数据为准。"),
     );
-    for (name, merchant, order, subsidy) in [
+    for (name, header, merchant_field, time_field, merchant, order, subsidy) in [
         (
             "2026年以旧换新补贴明细.xlsx",
+            headers::REFUND,
+            "核销商编",
+            "交易完成时间",
             "89813015722APT1",
             "order-a",
             "150.00",
         ),
         (
             "2026年数码补贴明细.xlsx",
+            headers::DIGITAL_REFUND,
+            "商户编号",
+            "提交时间",
             "89813014812B06R",
             "other",
             "10.00",
@@ -397,15 +420,15 @@ fn cli_warns_on_duplicate_business_key_conflicts_and_exits_successfully() {
         export(
             &input,
             name,
-            headers::REFUND,
+            header,
             0,
             "",
             &[&[
                 ("拨付批次", "批次1"),
-                ("核销商编", merchant),
+                (merchant_field, merchant),
                 ("商户订单号", order),
                 ("补贴金额", subsidy),
-                ("交易完成时间", "2026-09-14 10:00:00"),
+                (time_field, "2026-09-14 10:00:00"),
             ]],
             None,
         );
@@ -461,11 +484,21 @@ fn cli_warns_on_duplicate_business_key_conflicts_and_exits_successfully() {
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
 
-    // Exit code must remain 0 (success) even when warnings are generated
+    // 原有报表只告警；台账按唯一键使用数电发票号码，重复即失败，整体退出码为 1。
+    assert_eq!(
+        result.status.code(),
+        Some(1),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
     assert!(
-        result.status.success(),
-        "CLI failed with exit code {:?}\nstdout: {stdout}\nstderr: {stderr}",
-        result.status.code()
+        stdout
+            .contains("[家电台账] 报表失败：读取失败：发票数电发票号码重复，无法唯一补充台账：123"),
+        "Appliance ledger should reject duplicate invoice numbers: {stdout}"
+    );
+    assert!(
+        stdout
+            .contains("[数码台账] 报表失败：读取失败：发票数电发票号码重复，无法唯一补充台账：123"),
+        "Digital ledger should reject duplicate invoice numbers: {stdout}"
     );
 
     // Assert warnings are surfaced to CLI output with proper format
@@ -489,5 +522,49 @@ fn cli_warns_on_duplicate_business_key_conflicts_and_exits_successfully() {
     let reports = root.join("国补报表");
     assert_eq!(std::fs::read_dir(&reports).unwrap().count(), 2);
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn cli_ledger_keeps_records_when_headers_start_in_column_b() {
+    let root = std::env::temp_dir().join(format!("ledger-offset-{}", std::process::id()));
+    let input = root.join("raw");
+    std::fs::create_dir_all(&input).unwrap();
+    let mut book = Workbook::new();
+    let sheet = book.add_worksheet();
+    sheet.write_string(0, 1, "商户编号").unwrap();
+    sheet.write_string(0, 2, "商户订单号").unwrap();
+    sheet.write_string(1, 1, "89813014812B06R").unwrap();
+    sheet.write_string(1, 2, "ORDER-1").unwrap();
+    book.save(input.join("2026年数码补贴明细.xlsx")).unwrap();
+    export(
+        &input,
+        "发票_20261109.xlsx",
+        headers::INVOICE,
+        5,
+        "",
+        &[],
+        None,
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_subsidy"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(child.stdin.take().unwrap(), "{}", input.display()).unwrap();
+    let result = child.wait_with_output().unwrap();
+    // Other required sources are absent; the independent digital ledger must still publish.
+    assert_eq!(result.status.code(), Some(1));
+    let mut book = open_workbook_auto(root.join("国补报表/数码台账.xlsx")).unwrap();
+    let range = book.worksheet_range_at(0).unwrap().unwrap();
+    assert_eq!(range.height(), 3);
+    assert!(
+        range
+            .rows()
+            .nth(2)
+            .unwrap()
+            .iter()
+            .any(|cell| cell == "ORDER-1")
+    );
     std::fs::remove_dir_all(root).unwrap();
 }

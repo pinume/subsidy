@@ -4,6 +4,7 @@ pub const RECEIPTS: &str = "日期|销售部门|单据号|联系人|联系电话
 pub const COUPONS: &str = "供应商|原始供应商|单据号|单据日期|收款员|商品名称|商品简码|品牌|销售部门|销售员|业绩成本|业绩利润|价格类型名称|库存类型|财务大类|顾客姓名|备注|明细摘要|收款日期|销售成本|不含券收入|其它|本期尾款|销售单价|含券收入|2026家电国补（计入收入）|2026数码国补（计入收入）|合计";
 pub const UNIONPAY: &str = "清算时间|交易时间|终端号|交易类型|卡号|交易金额|清算金额|手续费|T0手续费|D1手续费|流水号|检索号|卡类型|发卡行|商户号|商户名称|分店简称|商户订单号|银商订单号|交易方式|分店|优惠金额|分期手续费|付款附言|备注|买家ID";
 pub const REFUND: &str = "拨付批次|交易完成时间|交易参考号|商户订单号|交易订单号|销售企业名称|核销商编|其他支付|销售金额|实收销售金额|补贴金额|补贴比例|SN码|所在地区|商品编码|能耗等级|编码品类|商品名称|发票金额|发票号|发票头/购买方名称|ID|退回原因|原拨付批次";
+pub const DIGITAL_REFUND: &str = "端口情况|拨付批次|提交时间|商户订单号|参考号|销售企业名称|门店名称/县域编码|商户编号|核销日期|商品编码|销售金额|补贴金额|补贴比例/补贴限额|SN码|原始SN码|券号/数据唯一标识|所在地区|类别|商品名称|发票号码|物流单号|备注|ID|客户购买品类";
 pub const UPLOADED: &str = "实时清分UUID|商户号|商户名称|订单号|交易日期|交易金额|检索参考号|模版类型|状态|描述|提交时间|更新时间|终端号|分店id|分店名|所在地区|详细地址|地区编码|tel|发票号码|发票金额|购买方名称|图片1|S/N码|是否属于 AI 产品";
 pub const APPLIANCE: &str = "图片1|图片2|图片3|图片4|img5|img6|img7|img8|img9|img10|img11|img12|img13|img14|img15|签收时间|remark|EEG|物流单号|erpOrderNum|ocrModify|modifyStatus|introduceInvoiceFlag|是否交旧|是否自提|receiverName|productCode|subsideAmt|productName|交旧品类|收货地址是否农村地区|airConditionerKitInfo|开票日期";
 pub const DIGITAL: &str = "IMEI1|IMEI2|图片1|图片2|图片3|图片4|图片5|图片6|img7|img8|img9|img10|img11|img12|img13|img14|img15|签收时间|remark|物流单号|erpOrderNum|ocrModify|modifyStatus|introduceInvoiceFlag|是否交旧|是否自提|receiverName|productCode|subsideAmt|productName|oldExchangeType|收货地址是否农村地区|开票日期";

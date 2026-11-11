@@ -10,8 +10,8 @@ use crate::utils::product::normalize_invoice_brand;
 use crate::utils::{dates, doc_no};
 
 use super::{
-    Category, Job, MultiValueIndex, PipelineContext, cell_text, data_error, parse_datetime_field,
-    pick_unique_latest, text_value,
+    Category, Job, MultiValueIndex, PipelineContext, amount_value, cell_amount, cell_text,
+    data_error, parse_datetime_field, pick_unique_latest, text_value,
 };
 
 pub(crate) const SOURCE_HEADERS: [&str; 30] = [
@@ -65,6 +65,7 @@ pub(crate) struct InvoiceRecord {
     invoice_type: String,
     pub invoice_no: String,
     buyer_name: String,
+    total_amount: Value,
     product_name: String,
     finance_category: String,
     brand: String,
@@ -112,7 +113,7 @@ fn select_latest_file(input_dir: &Path) -> Result<PathBuf, ProcessError> {
 }
 
 /// 以最后一个半角星号为分隔符，仅保留星号后的商品名称；不含星号时保持不变。
-fn clean_product_name(raw: &str) -> String {
+pub(crate) fn clean_product_name(raw: &str) -> String {
     raw.rsplit_once('*')
         .map_or(raw, |(_, name)| name)
         .to_string()
@@ -336,6 +337,20 @@ fn invoice_finance_category(token: &str) -> Option<&'static str> {
     })
 }
 
+impl InvoiceRecord {
+    pub(crate) fn total_amount(&self) -> &Value {
+        &self.total_amount
+    }
+
+    pub(crate) fn buyer_name(&self) -> &str {
+        &self.buyer_name
+    }
+
+    pub(crate) fn status(&self) -> &str {
+        &self.invoice_status
+    }
+}
+
 fn is_abnormal(record: &InvoiceRecord) -> bool {
     record.invoice_type == "红票"
         || record.invoice_status == "已红冲"
@@ -493,6 +508,11 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
         let invoice_type = text_at(4, "开票类型")?;
         let invoice_no = text_at(9, "数电发票号码")?;
         let buyer_name = text_at(10, "购方名称")?;
+        let total_cell = sheet.cell(row, 17);
+        // 仅供台账补空；清洗不读取，无法解析时保留原文，不使清洗失败。
+        let total_amount = cell_amount(&total_cell)
+            .map(amount_value)
+            .unwrap_or_else(|_| Value::Text(total_cell.to_string()));
         let raw_product_name = text_at(16, "主要商品名称")?;
         let product_name = clean_product_name(&raw_product_name);
         let (finance_category, brand) = split_product_name(&product_name);
@@ -504,6 +524,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
             invoice_type,
             invoice_no,
             buyer_name,
+            total_amount,
             product_name,
             finance_category,
             brand,

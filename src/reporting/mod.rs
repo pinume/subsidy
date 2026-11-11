@@ -3,6 +3,7 @@ mod excel;
 pub(crate) mod finance_wb;
 #[cfg(test)]
 mod float_roundtrip_tests;
+pub(crate) mod ledger;
 pub(crate) mod reader;
 mod reconciler;
 mod styles;

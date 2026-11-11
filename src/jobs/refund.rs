@@ -93,7 +93,7 @@ struct RefundConfig {
     dealer_code: &'static str,
 }
 
-const APPLIANCE_SYNONYMS: [&[&str]; 24] = [
+pub(crate) const APPLIANCE_SYNONYMS: [&[&str]; 24] = [
     &["拨付批次"],
     &["交易完成时间"],
     &["交易参考号"],
@@ -216,7 +216,7 @@ fn matches_filename(name: &str, suffix: &str) -> bool {
 }
 
 /// 比例字段：接受十进制数值，或带`%`的文本（按 100 换算为底层比例）。
-fn cell_ratio(cell: &RawCell) -> Result<Option<Decimal>, String> {
+pub(crate) fn cell_ratio(cell: &RawCell) -> Result<Option<Decimal>, String> {
     match cell {
         RawCell::Empty => Ok(None),
         RawCell::Text(t) if t.trim().is_empty() => Ok(None),
@@ -400,7 +400,14 @@ fn select_latest_file(candidates: Vec<PathBuf>, suffix: &str) -> Result<PathBuf,
     pick_unique_latest(dated, "最新年份无法唯一确定：多个文件对应同一最新年份")
 }
 
-fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessError> {
+impl RefundJob {
+    /// 本类别的原始补贴明细工作簿；台账与清洗共用同一选择规则。
+    pub(crate) fn source_file(&self, input_dir: &Path) -> Result<PathBuf, ProcessError> {
+        source_file(self.0, input_dir)
+    }
+}
+
+fn source_file(config: &RefundConfig, input_dir: &Path) -> Result<PathBuf, ProcessError> {
     let candidates: Vec<PathBuf> = list_xlsx_files(input_dir)?
         .into_iter()
         .filter(|path| {
@@ -415,7 +422,11 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
             pattern: format!("yyyy{}", config.filename_suffix),
         });
     }
-    let path = select_latest_file(candidates, config.filename_suffix)?;
+    select_latest_file(candidates, config.filename_suffix)
+}
+
+fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessError> {
+    let path = source_file(config, input_dir)?;
     let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
 
     let sheets = open_sheets(&path)?;

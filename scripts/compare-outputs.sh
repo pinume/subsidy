@@ -3,11 +3,18 @@
 # 用法：scripts/compare-outputs.sh <旧运行根目录> <新运行根目录>
 # 退出码：0 全部一致；1 有差异（逐个列出文件）。
 set -euo pipefail
+shopt -s nullglob
 old=$1 new=$2
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 status=0
 for dir in 国补明细 国补报表; do
+  for file in "$old/$dir"/*.xlsx; do
+    name=$dir/$(basename "$file")
+    if [[ ! -f "$new/$name" ]]; then
+      echo "仅旧运行存在：$name"; status=1
+    fi
+  done
   for file in "$new/$dir"/*.xlsx; do
     name=$dir/$(basename "$file")
     if [[ ! -f "$old/$name" ]]; then

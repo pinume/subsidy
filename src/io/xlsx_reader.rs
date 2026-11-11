@@ -90,14 +90,14 @@ impl SheetGrid {
             .map(|relative_max| start_row + relative_max + 1)
     }
 
-    /// 读取某绝对行在数据区域全部列宽度上的文本值，用于读取表头。
+    /// 读取某绝对行从 A 列到数据区域末列的文本值，保留开头空列。
     pub fn row_texts(&self, row: u32) -> Vec<String> {
         let Some((_, start_col)) = self.range.start() else {
             return Vec::new();
         };
-        let width = self.range.width() as u32;
-        (0..width)
-            .map(|offset| match self.cell(row, start_col + offset + 1) {
+        let end_col = start_col + self.range.width() as u32;
+        (1..=end_col)
+            .map(|col| match self.cell(row, col) {
                 RawCell::Text(text) => text,
                 RawCell::Int(value) => value.to_string(),
                 RawCell::Float(value) => value.to_string(),
@@ -127,6 +127,18 @@ pub fn open_sheets(path: &Path) -> Result<Vec<SheetGrid>, ProcessError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headers_preserve_leading_empty_columns() {
+        let mut range = Range::new((0, 1), (1, 2));
+        range.set_value((0, 1), Data::String("商户编号".into()));
+        range.set_value((0, 2), Data::String("订单号".into()));
+        let sheet = SheetGrid {
+            name: "批次".into(),
+            range,
+        };
+        assert_eq!(sheet.row_texts(1), ["", "商户编号", "订单号"]);
+    }
 
     #[test]
     fn standard_epoch_serials_are_unchanged() {

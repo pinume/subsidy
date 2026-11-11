@@ -38,7 +38,7 @@ fn real_dataset_invariants() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(log.matches("处理成功").count(), 8);
-    assert_eq!(log.matches("报表成功").count(), 2);
+    assert_eq!(log.matches("报表成功").count(), 4);
     assert!(!log.contains("请输入选项"));
 
     let cleaned = root.join("国补明细");
@@ -80,7 +80,7 @@ fn real_dataset_invariants() {
     }
 
     let out_dir = root.join("国补报表");
-    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 2);
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 4);
     let wb1_path = out_dir.join("国补上传情况汇总.xlsx");
     let wb2_path = out_dir.join("26年国补门店财务统筹表.xlsx");
 
@@ -229,7 +229,8 @@ fn real_dataset_invariants() {
     // With a missing raw invoice, valid old cleaned/report files must remain unused.
     let invoice = cleaned.join("发票明细.xlsx");
     let invoice_before = std::fs::read(&invoice).unwrap();
-    let reports_before: Vec<_> = [&wb1_path, &wb2_path]
+    let ledgers = ["家电台账.xlsx", "数码台账.xlsx"].map(|name| out_dir.join(name));
+    let reports_before: Vec<_> = [&wb1_path, &wb2_path, &ledgers[0], &ledgers[1]]
         .into_iter()
         .map(|path| (path, std::fs::read(path).unwrap()))
         .collect();
@@ -244,7 +245,10 @@ fn real_dataset_invariants() {
     let log = String::from_utf8_lossy(&result.stdout);
     assert!(!result.status.success());
     assert_eq!(log.matches("跳过报表").count(), 2, "{log}");
-    assert!(!log.contains("报表成功"));
+    // 两份台账都依赖原始发票：缺少发票时均失败并保留旧文件。
+    assert!(log.contains("[家电台账] 报表失败"), "{log}");
+    assert!(log.contains("[数码台账] 报表失败"), "{log}");
+    assert!(!log.contains("报表成功"), "{log}");
     assert!(log.contains("不使用旧文件"));
     assert_eq!(std::fs::read(&invoice).unwrap(), invoice_before);
     for (path, bytes) in reports_before {
