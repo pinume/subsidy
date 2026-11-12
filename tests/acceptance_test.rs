@@ -293,11 +293,17 @@ fn assert_return_trace(input: &std::path::Path, cleaned: &std::path::Path) {
     let mut receipts = open_workbook_auto(cleaned.join("收款单统计.xlsx")).unwrap();
     let receipts = receipts.worksheet_range_at(0).unwrap().unwrap();
     let rows: Vec<_> = receipts.rows().skip(1).collect();
+    // 源表列序可能变化，与生产代码一样按表头名称定位。
+    let category = source
+        .rows()
+        .nth(1)
+        .and_then(|header| header.iter().position(|cell| *cell == "销售类别"))
+        .expect("收款单源表第2行应有销售类别");
     let categories: Vec<_> = source
         .rows()
         .skip(2)
         .take(rows.len())
-        .map(|row| row[8].to_string())
+        .map(|row| row[category].to_string())
         .collect();
     let mut children: HashMap<String, Vec<usize>> = HashMap::new();
     for (index, row) in rows.iter().enumerate() {
