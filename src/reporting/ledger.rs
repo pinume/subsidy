@@ -323,24 +323,23 @@ fn brand_category(name: &str, code_category: &str) -> Option<String> {
     // 去掉发票式`*品类*`前缀，与发票商品名称清洗一致。
     let name = invoice::clean_product_name(name.trim());
     let name = name.trim();
-    let brand = edge_brand(name)
-        .or_else(|| {
-            let brand = edge_brand(category)?;
-            // 品类文本自带品牌时去掉，避免拼接后重复。
-            let len = brand.len(); // 品牌写法为 ASCII 或汉字，小写不改变字节长度。
-            category = if category.to_lowercase().starts_with(&brand.to_lowercase()) {
-                category[len..].trim()
-            } else {
-                category[..category.len() - len].trim()
-            };
-            Some(brand)
-        })
-        .or_else(|| {
-            MODEL_BRANDS
-                .iter()
-                .find(|(model, _)| *model == name)
-                .map(|(_, brand)| *brand)
-        });
+    let brand = if let Some(brand) = edge_brand(name) {
+        Some(brand)
+    } else if let Some(brand) = edge_brand(category) {
+        // 品类文本自带品牌时去掉，避免拼接后重复。
+        let len = brand.len(); // 品牌写法为 ASCII 或汉字，小写不改变字节长度。
+        category = if category.to_lowercase().starts_with(&brand.to_lowercase()) {
+            category[len..].trim()
+        } else {
+            category[..category.len() - len].trim()
+        };
+        Some(brand)
+    } else {
+        MODEL_BRANDS
+            .iter()
+            .find(|(model, _)| *model == name)
+            .map(|(_, brand)| *brand)
+    };
     Some(match brand {
         Some(brand) => format!("{}{category}", ledger_brand(brand)),
         None => category.to_string(),
