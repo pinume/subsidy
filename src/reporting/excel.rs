@@ -70,6 +70,11 @@ pub fn write_date_cell(
     Ok(())
 }
 
+/// 与 `write_date_cell` 相同的日期有效性判断：原生日期或当前解析器可识别的文本。
+pub(crate) fn is_date_cell(cell: &Data) -> bool {
+    cell.as_datetime().is_some() || ExcelDateTime::parse_from_str(&cell_to_string(cell)).is_ok()
+}
+
 pub fn write_decimal_cell(
     ws: &mut Worksheet,
     row: u32,

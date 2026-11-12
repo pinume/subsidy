@@ -1,11 +1,14 @@
+use calamine::{Data, DataType};
+use chrono::NaiveDate;
 use rust_xlsxwriter::Workbook;
 use std::path::Path;
 
 use super::data::{CellKind, CommonInputs, ReportColumn, SheetData};
-use super::excel::{ReportError, ReportSheetBuilder};
+use super::excel::{ReportError, ReportSheetBuilder, is_date_cell};
 use super::reader::{HeaderMap, cell_to_string};
 use super::reconciler::TransactionReconciler;
 use super::styles::StylePool;
+use super::unique_index::UniqueIndex;
 
 /// Generate Workbook 2: 26年国补门店财务统筹表.xlsx (4 Sheets)
 pub fn generate_store_finance_workbook(input_dir: &Path, output_path: &Path) -> Result<(), String> {
@@ -32,7 +35,7 @@ pub(crate) fn generate_with_inputs(
     let dig_store_code = &inputs.dig_store_code;
 
     // Build Sheet 1: 最终匹配表（全部的国补发生数据上匹配）
-    let warnings = build_final_match_sheet(
+    let mut warnings = build_final_match_sheet(
         &mut workbook,
         &styles,
         &store_occ_rows,
@@ -56,7 +59,13 @@ pub(crate) fn generate_with_inputs(
     )?;
 
     // Build Sheet 4: 3.门店上传明细（从门店银联后台每月导出后汇总）
-    build_store_upload_sheet(&mut workbook, &styles, app_upload_rows, dig_upload_rows)?;
+    warnings.extend(build_store_upload_sheet(
+        &mut workbook,
+        &styles,
+        app_upload_rows,
+        dig_upload_rows,
+        invoice_rows,
+    )?);
 
     workbook
         .save(output_path)
@@ -269,7 +278,8 @@ fn build_store_upload_sheet(
     s: &StylePool,
     app_up: &SheetData,
     dig_up: &SheetData,
-) -> Result<(), String> {
+    invoices: &SheetData,
+) -> Result<Vec<String>, String> {
     let mut sheet =
         ReportSheetBuilder::new(wb, "3.门店上传明细（从门店银联后台每月导出后汇总）", s)?;
     sheet.set_freeze_panes(1, 0)?;
@@ -381,20 +391,56 @@ fn build_store_upload_sheet(
     let app_map = resolve_indices(app_h, false, "已上传家电电脑.xlsx")?;
     let dig_map = resolve_indices(dig_h, true, "已上传数码.xlsx")?;
 
-    for row in &app_up[1..] {
-        sheet.write_row(row, &app_map)?;
-    }
-    for row in &dig_up[1..] {
-        sheet.write_row(row, &dig_map)?;
+    // §5.4.1 第8项：异常开票日期按发票号码取发票明细的开票时间日期。
+    let inv_no = invoices.header.require("数电发票号码", "发票明细.xlsx")?;
+    let inv_time = invoices.header.require("开票时间", "发票明细.xlsx")?;
+    let mut invoice_dates = UniqueIndex::default();
+    for row in &invoices[1..] {
+        let key = cell_to_string(&row[inv_no]).trim().to_string();
+        let time = &row[inv_time];
+        let date = time.as_date().or_else(|| {
+            let text = cell_to_string(time);
+            NaiveDate::parse_from_str(text.get(..10)?, "%Y-%m-%d").ok()
+        });
+        if let (false, Some(date)) = (key.is_empty(), date) {
+            invoice_dates.insert(key, date.format("%Y-%m-%d").to_string());
+        }
     }
 
-    Ok(())
+    for (up, map, label) in [
+        (app_up, &app_map, "已上传家电电脑.xlsx"),
+        (dig_up, &dig_map, "已上传数码.xlsx"),
+    ] {
+        let date_col = up.header.require("开票日期", label)?;
+        let no_col = up.header.require("发票号码", label)?;
+        for row in &up[1..] {
+            let date = &row[date_col];
+            let fixed = (!matches!(date, Data::Empty) && !is_date_cell(date))
+                .then(|| invoice_dates.get(cell_to_string(&row[no_col]).trim()))
+                .flatten();
+            match fixed {
+                Some(fixed) => {
+                    let mut row = row.clone();
+                    row[date_col] = Data::String(fixed.clone());
+                    sheet.write_row(&row, map)?;
+                }
+                None => {
+                    sheet.write_row(row, map)?;
+                }
+            }
+        }
+    }
+
+    Ok(invoice_dates
+        .warning("发票明细开票时间按数电发票号码")
+        .into_iter()
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use calamine::{Data, Reader, open_workbook_auto};
+    use calamine::{Reader, open_workbook_auto};
 
     #[test]
     fn finance_preserves_terminal_status_without_mutating_shared_inputs() {
@@ -548,6 +594,7 @@ mod tests {
                 "大类",
                 "品牌",
                 "主要商品名称",
+                "开票时间",
             ],
             &[
                 &[
@@ -697,6 +744,7 @@ mod tests {
                 "大类",
                 "品牌",
                 "主要商品名称",
+                "开票时间",
             ],
             &[
                 &[
@@ -900,6 +948,7 @@ mod tests {
                 "大类",
                 "品牌",
                 "主要商品名称",
+                "开票时间",
             ],
             &[],
         );
@@ -922,6 +971,126 @@ mod tests {
             }
         }
         book.save(root.join(name)).unwrap();
+    }
+
+    #[test]
+    fn upload_invoice_dates_fall_back_to_invoice_time_only_when_unparsable() {
+        use crate::jobs::uploaded;
+        let root = finance_fixture("finance-invoice-date");
+        for (name, tail, rows) in [
+            (
+                "已上传家电电脑.xlsx",
+                &uploaded::APPLIANCE_TAIL,
+                &[
+                    &[
+                        ("商户号", "89813015722APT1"),
+                        ("发票号码", "A1"),
+                        ("开票日期", "2 2026年03月30日"),
+                    ][..],
+                    &[
+                        ("商户号", "89813015722APT1"),
+                        ("发票号码", " A2 "),
+                        ("开票日期", "202610"),
+                    ],
+                    &[
+                        ("商户号", "89813015722APT1"),
+                        ("发票号码", "A3"),
+                        ("开票日期", "2026-05-01"),
+                    ],
+                    &[("商户号", "89813015722APT1"), ("发票号码", "A4")],
+                ][..],
+            ),
+            (
+                "已上传数码.xlsx",
+                &uploaded::DIGITAL_TAIL,
+                &[
+                    &[
+                        ("商户号", "89813014812B06R"),
+                        ("发票号码", "D1"),
+                        ("开票日期", "坏日期"),
+                    ][..],
+                    &[
+                        ("商户号", "89813014812B06R"),
+                        ("发票号码", "D2"),
+                        ("开票日期", "冲突"),
+                    ],
+                    &[
+                        ("商户号", "89813014812B06R"),
+                        ("发票号码", "D3"),
+                        ("开票日期", "2 2026年09月09日"),
+                    ],
+                ][..],
+            ),
+        ] {
+            let headers: Vec<_> = uploaded::FRONT_HEADERS
+                .iter()
+                .copied()
+                .chain(tail.iter().map(|field| field.synonyms[0]))
+                .chain(["补贴金额"])
+                .collect();
+            write_fixture(&root, name, &headers, rows);
+        }
+        write_fixture(
+            &root,
+            "发票明细.xlsx",
+            &[
+                "数电发票号码",
+                "开票时间",
+                "匹配单据号",
+                "开票类型",
+                "开票状态",
+                "大类",
+                "品牌",
+                "主要商品名称",
+            ],
+            &[
+                &[("数电发票号码", "A1"), ("开票时间", "2026-03-30 10:00:00")],
+                &[("数电发票号码", "A2"), ("开票时间", "2026-10-08 09:00:00")],
+                &[("数电发票号码", "A3"), ("开票时间", "2026-05-09 09:00:00")],
+                &[("数电发票号码", "A4"), ("开票时间", "2026-05-09 09:00:00")],
+                &[("数电发票号码", "D2"), ("开票时间", "2026-01-01 09:00:00")],
+                &[("数电发票号码", "D2"), ("开票时间", "2026-01-02 09:00:00")],
+                &[("数电发票号码", "D3"), ("开票时间", "2026-09-09 09:00:00")],
+                &[("数电发票号码", "D3"), ("开票时间", "2026-09-09 18:00:00")],
+            ],
+        );
+        let inputs = CommonInputs::load(&root).unwrap();
+        let path = root.join("finance.xlsx");
+        let warnings = generate_with_inputs(&root, &path, &inputs).unwrap();
+        assert!(warnings.iter().any(|w| w.contains("D2")), "{warnings:?}");
+
+        let mut book = open_workbook_auto(&path).unwrap();
+        let name = book.sheet_names()[3].clone();
+        let range = book.worksheet_range(&name).unwrap();
+        let date = |row: usize| range.get_value((row as u32, 59)).unwrap().clone();
+        let day = |row: usize| date(row).as_date().map(|d| d.to_string());
+        assert_eq!(day(1).as_deref(), Some("2026-03-30"));
+        assert_eq!(day(2).as_deref(), Some("2026-10-08"));
+        assert_eq!(day(3).as_deref(), Some("2026-05-01"));
+        assert_eq!(cell_to_string(&date(4)), "");
+        assert_eq!(date(5), "坏日期");
+        assert_eq!(date(6), "冲突");
+        assert_eq!(day(7).as_deref(), Some("2026-09-09"));
+
+        let col = inputs
+            .app_upload
+            .header
+            .require("开票日期", "input")
+            .unwrap();
+        assert_eq!(
+            cell_to_string(&inputs.app_upload[1][col]),
+            "2 2026年03月30日"
+        );
+        let col = inputs
+            .dig_upload
+            .header
+            .require("开票日期", "input")
+            .unwrap();
+        assert_eq!(
+            cell_to_string(&inputs.dig_upload[3][col]),
+            "2 2026年09月09日"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
