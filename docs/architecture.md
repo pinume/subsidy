@@ -32,6 +32,7 @@
 - 蓝票取号 (清洗 §10.10 及财务兜底) → `BlueInvoiceCandidates` (`src/jobs/invoice.rs`)
 - 上传状态匹配 (§10.12.2) → `UploadStatusIndex` (`src/jobs/uploaded.rs`)
 - 回款补贴匹配 → `RefundSubsidyIndex` (`src/jobs/refund.rs`)
+- 回款源表读取（文件选择、`汇总`排除、表头定位与去空白）→ `RefundJob::batch_sheets` / `BatchSheet` (`src/jobs/refund.rs`)，回款清洗与台账共用
 - 销售用券备注级联、匹配统计 → `SalesCouponReconciler` (`src/jobs/coupons.rs`)
 - 清洗中间表与索引缓存 → `PipelineContext` (`src/jobs/context.rs`)；整表共享使用 `Job::run_shared`
 - 财务统筹最终匹配 → `TransactionReconciler` (`src/reporting/reconciler.rs`)
@@ -53,7 +54,7 @@
 
 清洗通过 `PipelineContext` 显式传递索引和中间表。已上传依赖对应回款数据，销售用券依赖银联、发票、收款单及两份已上传数据。已上传和回款的 `Job::run_shared()` 通过 `cached_table()` 复用 `Rc<Table>`；索引按需构建，只缓存成功结果，运行结束释放。被引用任务只提供数据，发布仍由调度器负责。
 
-CLI 报表阶段使用局部 `OnceCell<Result<CommonInputs, String>>` 加载6份共同明细及商户号。财务统筹额外读取银联，完整成功流程共解析7份输入。异常行保存为源行索引，渲染借用共同数据。共同输入加载失败影响两份报表，单份报表的底色读取、计算、写出或发布失败只影响自身。台账不检查清洗依赖，直接读取原始数据：回款源文件选择复用 `RefundJob::source_file`，发票复用 `invoice::load_records`（`合计含税金额` 仅供台账，不进入清洗输出）；不缓存到 `PipelineContext`。
+CLI 报表阶段使用局部 `OnceCell<Result<CommonInputs, String>>` 加载6份共同明细及商户号。财务统筹额外读取银联，完整成功流程共解析7份输入。异常行保存为源行索引，渲染借用共同数据。共同输入加载失败影响两份报表，单份报表的底色读取、计算、写出或发布失败只影响自身。台账不检查清洗依赖，直接读取原始数据：回款源表的文件选择、`汇总`排除与表头定位复用 `RefundJob::batch_sheets`，发票复用 `invoice::load_records`（`合计含税金额` 仅供台账，不进入清洗输出）；不缓存到 `PipelineContext`。
 
 库导出 `generate_summary_workbook` 和 `generate_store_finance_workbook`；独立调用自行加载共同输入，CLI 使用内部共享入口。
 

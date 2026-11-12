@@ -890,7 +890,7 @@ mod tests {
             }
         }
         workbook
-            .save(dir.join("2026年以旧换新补贴明细.xlsx"))
+            .save(dir.join("2026年家电类以旧换新补贴明细已经回款下发.xlsx"))
             .unwrap();
     }
 
@@ -922,7 +922,9 @@ mod tests {
                 sheet.write_string(row, col as u16, *value).unwrap();
             }
         }
-        workbook.save(dir.join("2026年数码补贴明细.xlsx")).unwrap();
+        workbook
+            .save(dir.join("2026年数码补贴明细已经回款下发.xlsx"))
+            .unwrap();
     }
 
     fn write_workbook(path: &Path, title: &str, headers: &[&str], rows: &[Vec<&str>]) {
@@ -1796,7 +1798,7 @@ mod tests {
             }
         }
         workbook
-            .save(dir.join("2026年以旧换新补贴明细.xlsx"))
+            .save(dir.join("2026年家电类以旧换新补贴明细已经回款下发.xlsx"))
             .unwrap();
         write_workbook(
             &dir.join("MER_89813015722APT1_20260914101809_yjhx.xlsx"),

@@ -193,7 +193,8 @@ mod tests {
         std::fs::write(reports.join("家电台账.xlsx"), b"old ledger").unwrap();
         let mut book = rust_xlsxwriter::Workbook::new();
         book.add_worksheet().write_string(0, 0, "商户编号").unwrap();
-        book.save(input.join("2026年数码补贴明细.xlsx")).unwrap();
+        book.save(input.join("2026年数码补贴明细已经回款下发.xlsx"))
+            .unwrap();
         let mut invoices = rust_xlsxwriter::Workbook::new();
         let sheet = invoices.add_worksheet();
         for (col, header) in crate::jobs::invoice::SOURCE_HEADERS.iter().enumerate() {

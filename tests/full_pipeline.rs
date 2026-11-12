@@ -137,7 +137,7 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
     );
     for (name, header, merchant_field, time_field, merchant, order, subsidy) in [
         (
-            "2026年以旧换新补贴明细.xlsx",
+            "2026年家电类以旧换新补贴明细已经回款下发.xlsx",
             headers::REFUND,
             "核销商编",
             "交易完成时间",
@@ -146,7 +146,7 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
             "150.00",
         ),
         (
-            "2026年数码补贴明细.xlsx",
+            "2026年数码补贴明细已经回款下发.xlsx",
             headers::DIGITAL_REFUND,
             "商户编号",
             "提交时间",
@@ -279,7 +279,8 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
         assert_eq!(rows.len(), 3, "{name}: 标题、表头及1条本店记录");
         assert_eq!(rows[1].len(), 26);
         let col = |field: &str| rows[1].iter().position(|cell| cell == field).unwrap();
-        assert_eq!(rows[2][col("序号")], "1-01");
+        // 夹具源表无“序号”列：台账序号留空，不补号（报表规则 §6.1）。
+        assert_eq!(rows[2][col("序号")], calamine::Data::Empty);
         assert_eq!(rows[2][col("商户订单号")], order);
     }
     assert_eq!(
@@ -399,7 +400,7 @@ fn cli_warns_on_duplicate_invoice_keys_and_only_the_ledgers_fail() {
     );
     for (name, header, merchant_field, time_field, merchant, order, subsidy) in [
         (
-            "2026年以旧换新补贴明细.xlsx",
+            "2026年家电类以旧换新补贴明细已经回款下发.xlsx",
             headers::REFUND,
             "核销商编",
             "交易完成时间",
@@ -408,7 +409,7 @@ fn cli_warns_on_duplicate_invoice_keys_and_only_the_ledgers_fail() {
             "150.00",
         ),
         (
-            "2026年数码补贴明细.xlsx",
+            "2026年数码补贴明细已经回款下发.xlsx",
             headers::DIGITAL_REFUND,
             "商户编号",
             "提交时间",
@@ -536,7 +537,8 @@ fn cli_ledger_keeps_records_when_headers_start_in_column_b() {
     sheet.write_string(0, 2, "商户订单号").unwrap();
     sheet.write_string(1, 1, "89813014812B06R").unwrap();
     sheet.write_string(1, 2, "ORDER-1").unwrap();
-    book.save(input.join("2026年数码补贴明细.xlsx")).unwrap();
+    book.save(input.join("2026年数码补贴明细已经回款下发.xlsx"))
+        .unwrap();
     export(
         &input,
         "发票_20261109.xlsx",

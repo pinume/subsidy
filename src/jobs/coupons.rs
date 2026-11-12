@@ -829,8 +829,8 @@ mod tests {
     /// （已上传数据内部会按订单号/检索参考号匹配回款明细的补贴金额），仅用于
     /// 满足前置依赖存在。
     fn write_empty_uploaded_fixtures(dir: &Path) {
-        write_empty_refund_fixture(dir, "2026年以旧换新补贴明细.xlsx");
-        write_empty_refund_fixture(dir, "2026年数码补贴明细.xlsx");
+        write_empty_refund_fixture(dir, "2026年家电类以旧换新补贴明细已经回款下发.xlsx");
+        write_empty_refund_fixture(dir, "2026年数码补贴明细已经回款下发.xlsx");
         write_uploaded_fixture(dir, MERCHANT_APPLIANCE, &uploaded::APPLIANCE_TAIL, &[]);
         write_uploaded_fixture(dir, MERCHANT_DIGITAL, &uploaded::DIGITAL_TAIL, &[]);
     }
@@ -1291,8 +1291,8 @@ mod tests {
                 "260828ORIGINAL",
             )],
         );
-        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
-        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年家电类以旧换新补贴明细已经回款下发.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细已经回款下发.xlsx");
         write_uploaded_fixture(
             &dir,
             MERCHANT_APPLIANCE,
@@ -1335,8 +1335,8 @@ mod tests {
             )],
         );
         write_receipts_fixture(&dir, &[]);
-        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
-        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年家电类以旧换新补贴明细已经回款下发.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细已经回款下发.xlsx");
         write_uploaded_fixture(&dir, MERCHANT_APPLIANCE, &uploaded::APPLIANCE_TAIL, &[]);
         write_uploaded_fixture(
             &dir,
@@ -1378,8 +1378,8 @@ mod tests {
             )],
         );
         write_receipts_fixture(&dir, &[]);
-        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
-        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年家电类以旧换新补贴明细已经回款下发.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细已经回款下发.xlsx");
         // 参考号和数电发票号码分别命中不同状态：主键（参考号）命中的值必须胜出。
         write_uploaded_fixture(
             &dir,
@@ -1422,8 +1422,8 @@ mod tests {
         write_invoice_fixture(&dir, &[]);
         // 第一行命中第一阶段（收款单统计），将填粉色并沉底
         write_receipts_fixture(&dir, &[("2026-08-29", "收款ZFFX000001", "退货", "")]);
-        write_empty_refund_fixture(&dir, "2026年以旧换新补贴明细.xlsx");
-        write_empty_refund_fixture(&dir, "2026年数码补贴明细.xlsx");
+        write_empty_refund_fixture(&dir, "2026年家电类以旧换新补贴明细已经回款下发.xlsx");
+        write_empty_refund_fixture(&dir, "2026年数码补贴明细已经回款下发.xlsx");
         // 第二行命中第二阶段（已上传数据），不填粉色、不沉底
         write_uploaded_fixture(
             &dir,

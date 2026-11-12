@@ -6,7 +6,7 @@ use rust_xlsxwriter::Workbook;
 
 use super::excel::{ReportError, ReportSheetBuilder};
 use super::styles::StylePool;
-use crate::io::xlsx_reader::{RawCell, open_sheets};
+use crate::io::xlsx_reader::RawCell;
 use crate::jobs::refund::{
     self, APPLIANCE_SYNONYMS, OUTPUT_FIELDS, REFUND_APPLIANCE, REFUND_DIGITAL,
 };
@@ -155,25 +155,11 @@ fn read_rows(
     source: &refund::RefundJob,
     input_dir: &Path,
 ) -> Result<Vec<Vec<Value>>, ProcessError> {
-    let path = source.source_file(input_dir)?;
-    let file = path.file_name().unwrap().to_string_lossy().into_owned();
     let merchant_index = position(ledger, ledger.merchant_field);
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for sheet in open_sheets(&path)? {
-        if sheet.name().trim() == "汇总" {
-            continue;
-        }
-        let structure = |detail: String| ProcessError::Structure {
-            file: file.clone(),
-            sheet: sheet.name().to_string(),
-            detail,
-        };
-        let header: Vec<String> = sheet
-            .row_texts(1)
-            .iter()
-            .map(|name| name.trim().to_string())
-            .collect();
-        let find = |names: &[&str]| jobs::resolve_synonym_column(&header, names, 0);
+    for sheet in source.batch_sheets(input_dir)? {
+        let structure = |detail: String| sheet.structure_error(detail);
+        let find = |names: &[&str]| jobs::resolve_synonym_column(sheet.header(), names, 0);
         let mut columns = Vec::with_capacity(ledger.fields.len());
         for field in &ledger.fields {
             let names = (ledger.synonyms)(field).unwrap_or(std::slice::from_ref(field));
@@ -186,8 +172,8 @@ fn read_rows(
         let merchant_column = columns[merchant_index]
             .ok_or_else(|| structure(format!("缺少商户筛选字段 {}", ledger.merchant_field)))?;
 
-        for row in 2..=sheet.last_value_row().unwrap_or(1) {
-            if sheet.cell(row, merchant_column).to_string().trim() != ledger.merchant {
+        for row in sheet.data_rows() {
+            if !sheet.merchant_matches(row, merchant_column, ledger.merchant) {
                 continue;
             }
             let values = ledger
@@ -195,8 +181,6 @@ fn read_rows(
                 .iter()
                 .zip(&columns)
                 .map(|(field, column)| match (*field, column) {
-                    // 按批次分组后统一编号。
-                    ("序号", _) => Value::Empty,
                     // 由发票补充，不读取源表同名列。
                     ("发票状态" | "品牌品类", _) => Value::Empty,
                     ("发票头/购买方名称", _) if !ledger.fill_invoice_details => {
@@ -209,7 +193,7 @@ fn read_rows(
             rows.push(values);
         }
     }
-    // §6.1：按拨付批次首次出现的顺序稳定分组，批次内保持源顺序，再全表连续编号。
+    // §6.1：按拨付批次首次出现的顺序稳定分组，批次内保持源顺序；序号读取源表并随记录保留。
     let batch = position(ledger, "拨付批次");
     let mut first_seen = HashMap::new();
     for row in &rows {
@@ -219,10 +203,6 @@ fn read_rows(
             .or_insert(next);
     }
     rows.sort_by_key(|row| first_seen[text_of(&row[batch]).trim()]);
-    let serial = position(ledger, "序号");
-    for (index, row) in rows.iter_mut().enumerate() {
-        row[serial] = Value::Text(format!("1-{:02}", index + 1));
-    }
     Ok(rows)
 }
 
@@ -518,7 +498,8 @@ mod tests {
         }
     }
 
-    const OLD_APPLIANCE: [&str; 11] = [
+    const OLD_APPLIANCE: [&str; 12] = [
+        "序号",
         "拨付批次",
         "交易时间",
         "商户订单号",
@@ -531,7 +512,8 @@ mod tests {
         "编码品类",
         "商品名称",
     ];
-    const NEW_APPLIANCE: [&str; 11] = [
+    const NEW_APPLIANCE: [&str; 12] = [
+        "序号",
         "拨付批次",
         "创建时间",
         "交易时间",
@@ -551,7 +533,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let m = MERCHANT_APPLIANCE;
         write_book(
-            &dir.join("2026年以旧换新补贴明细.xlsx"),
+            &dir.join("2026年家电类以旧换新补贴明细已经回款下发.xlsx"),
             0,
             &[
                 (
@@ -559,6 +541,7 @@ mod tests {
                     &OLD_APPLIANCE,
                     vec![
                         row(&[
+                            "1-03",
                             "B1",
                             "2026-01-01 10:00:00",
                             "O1",
@@ -571,8 +554,9 @@ mod tests {
                             "A03-洗衣机",
                             "卡萨帝洗衣机C1",
                         ]),
-                        row(&["B1", "", "OX", "", "OTHER", "1", "1", "INV1", ""]),
+                        row(&["1-04", "B1", "", "OX", "", "OTHER", "1", "1", "INV1", ""]),
                         row(&[
+                            "2-006",
                             "B1",
                             "",
                             "O1",
@@ -593,6 +577,7 @@ mod tests {
                     &NEW_APPLIANCE,
                     vec![
                         row(&[
+                            "7-01",
                             "B7",
                             "7.19-8.4",
                             "2026-01-01 00:00:00",
@@ -605,8 +590,8 @@ mod tests {
                             "INV2",
                             "已有买方",
                         ]),
-                        row(&["B7", "", "", "", "O3", m, "1", "1", "", "MISS", ""]),
-                        row(&["B7", "", "", "", "O4", m, "1", "1", "", "", ""]),
+                        row(&["", "B7", "", "", "", "O3", m, "1", "1", "", "MISS", ""]),
+                        row(&["7-01", "B7", "", "", "", "O4", m, "1", "1", "", "", ""]),
                     ],
                 ),
             ],
@@ -648,7 +633,8 @@ mod tests {
             data.iter()
                 .map(|r| text(&r[col("序号")]))
                 .collect::<Vec<_>>(),
-            ["1-01", "1-02", "1-03", "1-04", "1-05"]
+            // 源序号原样保留：非连续、前导零、重复；空单元格留空。
+            ["1-03", "2-006", "7-01", "", "7-01"]
         );
         assert_eq!(data[2][col("补贴金额")], Data::Float(-30.0));
         assert_eq!(data[0][col("销售金额")], Data::Float(100.0));
@@ -732,6 +718,7 @@ mod tests {
             "发票号码",
         ];
         let new_header = [
+            "序号",
             "拨付批次",
             "提交时间",
             "商户订单号",
@@ -764,6 +751,7 @@ mod tests {
             .collect();
         let new_rows = vec![
             row(&[
+                "9-01",
                 "新",
                 "2026-08-01 14:00:00",
                 "N1",
@@ -776,11 +764,13 @@ mod tests {
                 "平板",
                 "ID1",
             ]),
-            row(&["新", "", "N2", m, "", "100", "500", "500元", "Q2", "", ""]),
-            row(&["新", "", "N3", m, "", "", "", "", "", "", ""]),
+            row(&[
+                "9-03", "新", "", "N2", m, "", "100", "500", "500元", "Q2", "", "",
+            ]),
+            row(&["", "新", "", "N3", m, "", "", "", "", "", "", ""]),
         ];
         write_book(
-            &dir.join("2026年数码补贴明细.xlsx"),
+            &dir.join("2026年数码补贴明细已经回款下发.xlsx"),
             0,
             &[
                 ("过渡期", &old_header, old_rows),
@@ -802,14 +792,16 @@ mod tests {
         let col = |field| position(&DIGITAL, field);
         let data = &rows[2..];
         assert_eq!(data.len(), 101);
+        // 源序号随记录读取：旧表缺列留空，新表原样保留，空单元格留空，不补号。
         assert_eq!(
             data[97..]
                 .iter()
                 .map(|r| text(&r[col("序号")]))
                 .collect::<Vec<_>>(),
-            ["1-98", "1-99", "1-100", "1-101"]
+            ["", "9-01", "9-03", ""]
         );
         let missing = [
+            "序号",
             "提交时间",
             "门店名称/县域编码",
             "核销日期",
@@ -859,16 +851,17 @@ mod tests {
         let dir = unique_temp_path("ledger-batches");
         std::fs::create_dir_all(&dir).unwrap();
         let m = MERCHANT_DIGITAL;
-        let header = ["拨付批次", "商户编号", "商户订单号"];
+        let header = ["拨付批次", "商户编号", "商户订单号", "序号"];
+        // 同一批次分散在两张表；序号重复（O3、O6 均为 0-01）。
         let first = vec![
-            row(&["B2", m, "O1"]),
-            row(&[" B1 ", m, "O2"]),
-            row(&["", m, "O3"]),
-            row(&["B2", m, "O4"]),
+            row(&["B2", m, "O1", "2-01"]),
+            row(&[" B1 ", m, "O2", "1-01"]),
+            row(&["", m, "O3", "0-01"]),
+            row(&["B2", m, "O4", "2-02"]),
         ];
-        let mut second = vec![row(&["B1", m, "O5"]), row(&["", m, "O6"])];
-        second.extend((7..=102).map(|n| row(&["B2", m, &format!("O{n}")])));
-        let source = dir.join("2026年数码补贴明细.xlsx");
+        let mut second = vec![row(&["B1", m, "O5", "1-02"]), row(&["", m, "O6", "0-01"])];
+        second.extend((7..=102).map(|n| row(&["B2", m, &format!("O{n}"), &format!("2-{n:03}")])));
+        let source = dir.join("2026年数码补贴明细已经回款下发.xlsx");
         write_book(
             &source,
             0,
@@ -888,22 +881,37 @@ mod tests {
                 .map(|r| text(&r[col("商户订单号")]))
                 .collect::<Vec<_>>()
         };
+        let pairs = |rows: &[Vec<Data>]| {
+            rows.iter()
+                .map(|r| (text(&r[col("商户订单号")]), text(&r[col("序号")])))
+                .collect::<Vec<_>>()
+        };
+        let source_pairs = |sheets: &[&Vec<Vec<String>>]| {
+            sheets
+                .iter()
+                .flat_map(|rows| rows.iter().map(|r| (r[2].clone(), r[3].clone())))
+                .collect::<HashMap<_, _>>()
+        };
         // 按首次出现顺序 B2、B1、空批次分组，不按名称排序；批次内保持源表及源行顺序。
         let mut expected = vec!["O1".to_string(), "O4".to_string()];
         expected.extend((7..=102).map(|n| format!("O{n}")));
         expected.extend(["O2", "O5", "O3", "O6"].map(String::from));
         assert_eq!(orders(&before), expected);
-        // 全表连续编号，跨批次不重置，并跨越 1-99。
+        // 序号随所属记录移动，分组不串号、不重新编号。
+        let expected_pairs = source_pairs(&[&first, &second]);
+        for (order, serial) in pairs(&before) {
+            assert_eq!(serial, expected_pairs[&order], "{order}");
+        }
         assert_eq!(
-            before[97..]
-                .iter()
-                .map(|r| text(&r[col("序号")]))
-                .collect::<Vec<_>>(),
-            ["1-98", "1-99", "1-100", "1-101", "1-102"]
+            pairs(&before[..2]),
+            [("O1".into(), "2-01".into()), ("O4".into(), "2-02".into())]
         );
 
         // 源数据末尾追加新批次：原记录顺序、序号、内容不变，新记录接在末尾。
-        second.extend([row(&["B3", m, "O103"]), row(&["B3", m, "O104"])]);
+        second.extend([
+            row(&["B3", m, "O103", "3-01"]),
+            row(&["B3", m, "O104", "3-01"]),
+        ]);
         write_book(
             &source,
             0,
@@ -912,8 +920,60 @@ mod tests {
         generate_digital(&dir, &output).unwrap();
         let after = read_output(&output).1[2..].to_vec();
         assert_eq!(after[..102], before[..]);
-        assert_eq!(orders(&after[102..]), ["O103", "O104"]);
-        assert_eq!(text(&after[103][col("序号")]), "1-104");
+        assert_eq!(
+            pairs(&after[102..]),
+            [
+                ("O103".into(), "3-01".into()),
+                ("O104".into(), "3-01".into())
+            ]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// 表头不在第1行时按回款清洗的同一规则定位，表头行本身不作为明细。
+    #[test]
+    fn ledger_reads_below_located_header_row() {
+        let dir = unique_temp_path("ledger-header-row");
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = MERCHANT_DIGITAL;
+        write_book(
+            &dir.join("2026年数码补贴明细已经回款下发.xlsx"),
+            1,
+            &[(
+                "批次",
+                &["序号", "拨付批次", "商户编号", "商户订单号"],
+                vec![
+                    row(&["9", "B1", m, "O1"]),
+                    row(&["10", "B1", "OTHER", "O2"]),
+                ],
+            )],
+        );
+        write_invoices(&dir, "发票_20260201.xlsx", &[]);
+        let output = dir.join("数码台账.xlsx");
+        generate_digital(&dir, &output).unwrap();
+        let rows = read_output(&output).1;
+        assert_eq!(rows.len(), 3);
+        let col = |field| position(&DIGITAL, field);
+        assert_eq!(text(&rows[2][col("商户订单号")]), "O1");
+        assert_eq!(text(&rows[2][col("序号")]), "9");
+
+        // 数值型源序号按现有文本转换写为完整整数文本。
+        let mut book = Workbook::new();
+        let ws = book.add_worksheet();
+        for (col, field) in ["序号", "拨付批次", "商户编号", "商户订单号"]
+            .iter()
+            .enumerate()
+        {
+            ws.write_string(0, col as u16, *field).unwrap();
+        }
+        ws.write_number(1, 0, 12.0).unwrap();
+        for (col, value) in ["B1", m, "O1"].iter().enumerate() {
+            ws.write_string(1, col as u16 + 1, *value).unwrap();
+        }
+        book.save(dir.join("2026年数码补贴明细已经回款下发.xlsx"))
+            .unwrap();
+        generate_digital(&dir, &output).unwrap();
+        assert_eq!(text(&read_output(&output).1[2][col("序号")]), "12");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -965,7 +1025,7 @@ mod tests {
     fn empty_selection_still_writes_title_and_header_and_missing_merchant_field_fails() {
         let dir = unique_temp_path("ledger-empty");
         std::fs::create_dir_all(&dir).unwrap();
-        let source = dir.join("2026年数码补贴明细.xlsx");
+        let source = dir.join("2026年数码补贴明细已经回款下发.xlsx");
         write_book(
             &source,
             0,
@@ -983,6 +1043,19 @@ mod tests {
         );
         let error = generate_digital(&dir, &output).unwrap_err();
         assert!(error.contains("缺少商户筛选字段"), "{error}");
+
+        // 同一字段的两个同义表头同时出现：结构异常，不任取一列。
+        write_book(
+            &source,
+            0,
+            &[(
+                "批次",
+                &["拨付批次", "商户编号", "经销商编号"],
+                vec![row(&["B1", MERCHANT_DIGITAL, MERCHANT_DIGITAL])],
+            )],
+        );
+        let error = generate_digital(&dir, &output).unwrap_err();
+        assert!(error.contains("多个匹配"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
