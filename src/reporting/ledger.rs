@@ -1,4 +1,4 @@
-//! 家电、数码台账（§6）：直接读取原始补贴明细，按商户筛选后保持源顺序输出 26 列。
+//! 家电、数码台账（§6）：直接读取原始补贴明细，按商户筛选、按拨付批次分组后输出 26 列。
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -158,7 +158,7 @@ fn read_rows(
     let path = source.source_file(input_dir)?;
     let file = path.file_name().unwrap().to_string_lossy().into_owned();
     let merchant_index = position(ledger, ledger.merchant_field);
-    let mut rows = Vec::new();
+    let mut rows: Vec<Vec<Value>> = Vec::new();
     for sheet in open_sheets(&path)? {
         if sheet.name().trim() == "汇总" {
             continue;
@@ -190,13 +190,13 @@ fn read_rows(
             if sheet.cell(row, merchant_column).to_string().trim() != ledger.merchant {
                 continue;
             }
-            let serial = format!("1-{:02}", rows.len() + 1);
             let values = ledger
                 .fields
                 .iter()
                 .zip(&columns)
                 .map(|(field, column)| match (*field, column) {
-                    ("序号", _) => Value::Text(serial.clone()),
+                    // 按批次分组后统一编号。
+                    ("序号", _) => Value::Empty,
                     // 由发票补充，不读取源表同名列。
                     ("发票状态" | "品牌品类", _) => Value::Empty,
                     ("发票头/购买方名称", _) if !ledger.fill_invoice_details => {
@@ -208,6 +208,20 @@ fn read_rows(
                 .collect();
             rows.push(values);
         }
+    }
+    // §6.1：按拨付批次首次出现的顺序稳定分组，批次内保持源顺序，再全表连续编号。
+    let batch = position(ledger, "拨付批次");
+    let mut first_seen = HashMap::new();
+    for row in &rows {
+        let next = first_seen.len();
+        first_seen
+            .entry(text_of(&row[batch]).trim().to_string())
+            .or_insert(next);
+    }
+    rows.sort_by_key(|row| first_seen[text_of(&row[batch]).trim()]);
+    let serial = position(ledger, "序号");
+    for (index, row) in rows.iter_mut().enumerate() {
+        row[serial] = Value::Text(format!("1-{:02}", index + 1));
     }
     Ok(rows)
 }
@@ -838,6 +852,69 @@ mod tests {
                 .unwrap_err()
                 .contains("发票_yyyymmdd")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ledger_groups_by_first_seen_batch_and_keeps_serials_when_batches_append() {
+        let dir = unique_temp_path("ledger-batches");
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = MERCHANT_DIGITAL;
+        let header = ["拨付批次", "商户编号", "商户订单号"];
+        let first = vec![
+            row(&["B2", m, "O1"]),
+            row(&[" B1 ", m, "O2"]),
+            row(&["", m, "O3"]),
+            row(&["B2", m, "O4"]),
+        ];
+        let mut second = vec![row(&["B1", m, "O5"]), row(&["", m, "O6"])];
+        second.extend((7..=102).map(|n| row(&["B2", m, &format!("O{n}")])));
+        let source = dir.join("2026年数码补贴明细.xlsx");
+        write_book(
+            &source,
+            0,
+            &[
+                ("一", &header, first.clone()),
+                ("二", &header, second.clone()),
+            ],
+        );
+        write_invoices(&dir, "发票_20260201.xlsx", &[]);
+        let output = dir.join("数码台账.xlsx");
+        generate_digital(&dir, &output).unwrap();
+
+        let col = |field| position(&DIGITAL, field);
+        let before = read_output(&output).1[2..].to_vec();
+        let orders = |rows: &[Vec<Data>]| {
+            rows.iter()
+                .map(|r| text(&r[col("商户订单号")]))
+                .collect::<Vec<_>>()
+        };
+        // 按首次出现顺序 B2、B1、空批次分组，不按名称排序；批次内保持源表及源行顺序。
+        let mut expected = vec!["O1".to_string(), "O4".to_string()];
+        expected.extend((7..=102).map(|n| format!("O{n}")));
+        expected.extend(["O2", "O5", "O3", "O6"].map(String::from));
+        assert_eq!(orders(&before), expected);
+        // 全表连续编号，跨批次不重置，并跨越 1-99。
+        assert_eq!(
+            before[97..]
+                .iter()
+                .map(|r| text(&r[col("序号")]))
+                .collect::<Vec<_>>(),
+            ["1-98", "1-99", "1-100", "1-101", "1-102"]
+        );
+
+        // 源数据末尾追加新批次：原记录顺序、序号、内容不变，新记录接在末尾。
+        second.extend([row(&["B3", m, "O103"]), row(&["B3", m, "O104"])]);
+        write_book(
+            &source,
+            0,
+            &[("一", &header, first), ("二", &header, second)],
+        );
+        generate_digital(&dir, &output).unwrap();
+        let after = read_output(&output).1[2..].to_vec();
+        assert_eq!(after[..102], before[..]);
+        assert_eq!(orders(&after[102..]), ["O103", "O104"]);
+        assert_eq!(text(&after[103][col("序号")]), "1-104");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
