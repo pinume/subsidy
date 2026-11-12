@@ -74,12 +74,47 @@ pub(crate) const SOURCE_HEADERS: [&str; 60] = [
     "Crm会员账号",
 ];
 
-// 源表列位置（1 基）。
+// 第9.2节字段顺序中的列位置（1 基），仅用于测试夹具按规定顺序写表。
+#[cfg(test)]
 const COL_DATE: u32 = 1;
+#[cfg(test)]
 const COL_DOC_NO: u32 = 3;
+#[cfg(test)]
 const COL_SALE_CATEGORY: u32 = 9;
+#[cfg(test)]
 const COL_PRODUCT_NAME: u32 = 21;
+#[cfg(test)]
 const COL_ORIGINAL_TICKET_NO: u32 = 41;
+
+/// 第9.1节：源表列顺序可变，按字段名称定位所需列（1 基）。
+struct SourceColumns {
+    date: u32,
+    doc_no: u32,
+    sale_category: u32,
+    product_name: u32,
+    original_ticket_no: u32,
+}
+
+impl SourceColumns {
+    /// 表头须恰好是第9.2节的60个字段（顺序不限，不得缺失、重复或增加）。
+    fn from_header(header: &[String]) -> Option<Self> {
+        let mut got: Vec<&str> = header.iter().map(String::as_str).collect();
+        let mut expected = SOURCE_HEADERS.to_vec();
+        got.sort_unstable();
+        expected.sort_unstable();
+        if got != expected {
+            return None;
+        }
+        let col = |name: &str| header.iter().position(|h| h == name).map(|i| i as u32 + 1);
+        Some(Self {
+            date: col("日期")?,
+            doc_no: col("单据号")?,
+            sale_category: col("销售类别")?,
+            product_name: col("商品名称")?,
+            original_ticket_no: col("原票号")?,
+        })
+    }
+}
 
 pub(crate) struct ReceiptRecord {
     date: Value,
@@ -144,14 +179,13 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<ReceiptRecord>, Proce
     let sheet = &sheets[0];
     let sheet_name = sheet.name().to_string();
 
-    let header = sheet.row_texts(2);
-    if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
+    let Some(columns) = SourceColumns::from_header(&sheet.row_texts(2)) else {
         return Err(ProcessError::Structure {
             file: FILE_NAME.to_string(),
             sheet: sheet_name,
             detail: "第2行表头与规定的60个字段不一致".to_string(),
         });
-    }
+    };
 
     let last_row = sheet.last_value_row().unwrap_or(2);
     let total_marker = sheet.cell(last_row, 1).to_string();
@@ -165,7 +199,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<ReceiptRecord>, Proce
 
     let mut records = Vec::new();
     for row in 3..last_row {
-        records.push(read_row(sheet, row, FILE_NAME, &sheet_name)?);
+        records.push(read_row(sheet, &columns, row, FILE_NAME, &sheet_name)?);
     }
 
     compute_remarks(&mut records);
@@ -175,11 +209,18 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<ReceiptRecord>, Proce
 
 fn read_row(
     sheet: &SheetGrid,
+    columns: &SourceColumns,
     row: u32,
     file: &str,
     sheet_name: &str,
 ) -> Result<ReceiptRecord, ProcessError> {
-    let date = parse_date_field(&sheet.cell(row, COL_DATE), "日期", file, sheet_name, row)?;
+    let date = parse_date_field(
+        &sheet.cell(row, columns.date),
+        "日期",
+        file,
+        sheet_name,
+        row,
+    )?;
 
     let text_at = |col: u32, field: &'static str| -> Result<String, ProcessError> {
         let cell = sheet.cell(row, col);
@@ -187,10 +228,10 @@ fn read_row(
             .map_err(|detail| data_error(file, sheet_name, row, field, cell.to_string(), detail))
     };
 
-    let doc_no_value = text_at(COL_DOC_NO, "单据号")?;
-    let sale_category = text_at(COL_SALE_CATEGORY, "销售类别")?;
-    let product_name = text_at(COL_PRODUCT_NAME, "商品名称")?;
-    let original_ticket_no = text_at(COL_ORIGINAL_TICKET_NO, "原票号")?;
+    let doc_no_value = text_at(columns.doc_no, "单据号")?;
+    let sale_category = text_at(columns.sale_category, "销售类别")?;
+    let product_name = text_at(columns.product_name, "商品名称")?;
+    let original_ticket_no = text_at(columns.original_ticket_no, "原票号")?;
     let match_doc_no = build_match_doc_no(&date, &doc_no_value);
 
     Ok(ReceiptRecord {
@@ -351,6 +392,20 @@ mod tests {
         let total_row = (2 + rows.len()) as u32;
         sheet.write_string(total_row, 0, "合计").unwrap();
         workbook.save(path).unwrap();
+    }
+
+    #[test]
+    fn source_columns_follow_header_names_in_any_order() {
+        // 真实批次 2026-11-12 的收款单统计表头为同一60字段的另一种顺序。
+        let mut header: Vec<String> = SOURCE_HEADERS.iter().rev().map(|h| h.to_string()).collect();
+        let columns = SourceColumns::from_header(&header).unwrap();
+        assert_eq!(columns.date, 60);
+        assert_eq!(columns.doc_no, 58);
+        assert_eq!(columns.original_ticket_no, 20);
+
+        header[0] = "日期".to_string(); // 重复`日期`、缺失`Crm会员账号`
+        assert!(SourceColumns::from_header(&header).is_none());
+        assert!(SourceColumns::from_header(&header[1..]).is_none());
     }
 
     fn doc_no_of(row: &Row) -> &str {
