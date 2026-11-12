@@ -6,9 +6,7 @@ use rust_xlsxwriter::{
 use std::path::Path;
 
 use super::excel::{ReportError, ReportSheetBuilder};
-use super::reader::{
-    cell_to_decimal, cell_to_string, get_colored_row_indices, get_colored_row_indices_multi,
-};
+use super::reader::{cell_to_string, get_colored_row_indices, get_colored_row_indices_multi};
 use super::styles::StylePool;
 
 use super::data::{CommonInputs, ReportColumn, SheetData};
@@ -387,15 +385,9 @@ fn build_failed_records_sheet(
             if target == 3 {
                 ws.write_string_with_format(cur_row, 2, "审核失败", &s.text_left)?;
             }
-            if target == 5 {
-                // Failed-upload invoice amounts retain the existing zero fallback.
-                let amount = cell_to_decimal(column.cell(row)).unwrap_or(Decimal::ZERO);
-                ws.write_with_format(cur_row, target, amount, &s.money)?;
-            } else {
-                column
-                    .kind
-                    .write(ws, s, cur_row, target, column.cell(row))?;
-            }
+            column
+                .kind
+                .write(ws, s, cur_row, target, column.cell(row))?;
         }
         ws.write_string_with_format(cur_row, 8, extra1, &s.text_left)?;
         if let Some(e2) = extra2 {

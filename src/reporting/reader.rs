@@ -177,10 +177,8 @@ pub fn cell_to_decimal(cell: &Data) -> Option<Decimal> {
         Data::Empty => None,
         Data::Int(i) => Some(Decimal::from(*i)),
         Data::Float(f) => Decimal::from_f64(*f),
-        Data::String(s) => {
-            let s_clean = s.trim().replace(',', "");
-            Decimal::from_str_exact(&s_clean).ok()
-        }
+        // 不删除逗号：源值“3000,00”以逗号作小数点，删除后会放大100倍。
+        Data::String(s) => Decimal::from_str_exact(s.trim()).ok(),
         _ => None,
     }
 }

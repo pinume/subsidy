@@ -690,6 +690,10 @@ fn run_uploaded(
             for row in 3..=last_row {
                 let mut record_row =
                     read_row(sheet, row, config, &columns, &file_name, &sheet_name)?;
+                // 数据区中间的整行空白不是记录。
+                if record_row.values.iter().all(|value| *value == Value::Empty) {
+                    continue;
+                }
                 if let Value::Text(status) = &record_row.values[VALUE_COL_STATUS] {
                     record_row.values[VALUE_COL_STATUS] =
                         Value::Text(normalize_status(status.clone()));
@@ -1459,6 +1463,38 @@ mod tests {
             Value::Decimal("15.00".parse().unwrap())
         );
 
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn blank_row_inside_data_area_is_skipped() {
+        let dir = unique_temp_path("uploaded-blank-row");
+        std::fs::create_dir_all(&dir).unwrap();
+        write_refund_appliance_fixture(&dir, &[]);
+        let headers = standard_headers(&APPLIANCE_TAIL);
+        write_workbook(
+            &dir.join("MER_89813015722APT1_20260914101809_yjhx.xlsx"),
+            "家电",
+            &headers,
+            &[
+                appliance_row("UUID-1", "89813015722APT1", "ORDER-1"),
+                vec![""; headers.len()],
+                appliance_row("UUID-2", "89813015722APT1", "ORDER-2"),
+            ],
+        );
+
+        let table = UPLOADED_APPLIANCE.run(&dir).unwrap();
+        assert_eq!(
+            table
+                .rows
+                .iter()
+                .map(|row| row.values[VALUE_COL_ORDER_NO].clone())
+                .collect::<Vec<_>>(),
+            [
+                Value::Text("ORDER-1".to_string()),
+                Value::Text("ORDER-2".to_string())
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

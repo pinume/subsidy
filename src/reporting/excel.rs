@@ -80,7 +80,8 @@ pub fn write_decimal_cell(
 ) -> Result<(), ReportError> {
     match cell_to_decimal(cell) {
         Some(value) => ws.write_with_format(row, col, value, format),
-        None => ws.write_string_with_format(row, col, "", empty_format),
+        // 无法解析的金额保留原文本（报表规则 §3.3），空值留空。
+        None => ws.write_string_with_format(row, col, cell_to_string(cell), empty_format),
     }?;
     Ok(())
 }
@@ -245,6 +246,34 @@ impl<'a> ReportSheetBuilder<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unparsable_money_text_is_kept_instead_of_scaled_or_blanked() {
+        let path = crate::test_support::unique_temp_path("money-text").with_extension("xlsx");
+        let styles = StylePool::default();
+        let mut wb = Workbook::new();
+        let ws = wb.add_worksheet();
+        for (row, cell) in [
+            Data::String("3000,00".into()),
+            Data::String("12.5".into()),
+            Data::Empty,
+        ]
+        .iter()
+        .enumerate()
+        {
+            CellKind::Money
+                .write(ws, &styles, row as u32, 0, cell)
+                .unwrap();
+        }
+        wb.save(&path).unwrap();
+        let rows = super::super::reader::read_sheet_rows(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        // “3000,00”以逗号作小数点，不得删除逗号变成 300000。
+        assert_eq!(rows[0][0], Data::String("3000,00".into()));
+        assert_eq!(rows[1][0], Data::Float(12.5));
+        // 空值留空，不写 0：读回时该行不在数据区内。
+        assert_eq!(rows.len(), 2);
+    }
 
     #[test]
     fn report_sheet_builder_initializes_and_tracks_row_flow() {
