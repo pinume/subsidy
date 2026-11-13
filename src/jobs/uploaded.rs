@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -642,6 +643,58 @@ fn collect_merchant_files(
         .collect();
     files.sort();
     Ok(files)
+}
+
+/// 报表规则§6.2.4：家电已上传源文件全部工作表的`订单号`→`检索参考号`，供家电台账补空。
+/// 复用文件识别与表头校验，只读这两列，不依赖回款清洗；按业务前提同一订单号只对应一个参考号，
+/// 保留首个非空值。订单号或参考号为空的行不入表。
+pub(crate) fn appliance_references_by_order(
+    input_dir: &Path,
+) -> Result<HashMap<String, String>, ProcessError> {
+    let config = &APPLIANCE_CONFIG;
+    let files = collect_merchant_files(input_dir, config.merchant_no)?;
+    if files.is_empty() {
+        return Err(ProcessError::NoInput {
+            pattern: format!("MER_{}_*.xlsx", config.merchant_no),
+        });
+    }
+    let mut references = HashMap::new();
+    for path in &files {
+        let file_name = path.file_name().unwrap().to_string_lossy().into_owned();
+        for sheet in &open_sheets(path)? {
+            let sheet_name = sheet.name();
+            let columns =
+                resolve_columns(sheet, config).map_err(|detail| ProcessError::Structure {
+                    file: file_name.clone(),
+                    sheet: sheet_name.to_string(),
+                    detail,
+                })?;
+            for row in 3..=sheet.last_value_row().unwrap_or(2) {
+                let [order, reference] = [VALUE_COL_ORDER_NO, VALUE_COL_REFERENCE].map(|index| {
+                    let Some(col) = columns.front_columns[index] else {
+                        return Ok(Value::Empty);
+                    };
+                    let cell = sheet.cell(row, col);
+                    read_typed_cell(
+                        &cell,
+                        ColumnType::Text,
+                        FRONT_HEADERS[index],
+                        &file_name,
+                        sheet_name,
+                        row,
+                    )
+                });
+                let (order, reference) = (order?, reference?);
+                let (order, reference) = (value_text(&order).trim(), value_text(&reference));
+                if !order.is_empty() && !reference.trim().is_empty() {
+                    references
+                        .entry(order.to_string())
+                        .or_insert_with(|| reference.to_string());
+                }
+            }
+        }
+    }
+    Ok(references)
 }
 
 fn run_uploaded(

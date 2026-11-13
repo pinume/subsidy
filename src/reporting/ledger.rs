@@ -10,7 +10,7 @@ use crate::io::xlsx_reader::RawCell;
 use crate::jobs::refund::{
     self, APPLIANCE_SYNONYMS, OUTPUT_FIELDS, REFUND_APPLIANCE, REFUND_DIGITAL,
 };
-use crate::jobs::{self, MERCHANT_APPLIANCE, MERCHANT_DIGITAL, invoice};
+use crate::jobs::{self, MERCHANT_APPLIANCE, MERCHANT_DIGITAL, invoice, uploaded};
 use crate::model::{ProcessError, Value};
 use crate::utils::product::normalize_sales_brand;
 
@@ -145,6 +145,7 @@ fn generate(
                 .map_or(Value::Empty, Value::Text);
         }
     }
+    fill_references(ledger, &mut rows, input_dir)?;
     fill_from_invoices(ledger, &mut rows, input_dir)?;
     write(ledger, &rows, output)?;
     Ok(Vec::new())
@@ -345,6 +346,30 @@ fn is_blank(value: &Value) -> bool {
     }
 }
 
+/// §6.2.4：家电`交易参考号`为空时按`商户订单号`取已上传数据的`检索参考号`；已有值不覆盖。
+/// 没有空值时不读取已上传文件。
+fn fill_references(
+    ledger: &Ledger,
+    rows: &mut [Vec<Value>],
+    input_dir: &Path,
+) -> Result<(), String> {
+    let Some(target) = ledger.fields.iter().position(|f| *f == "交易参考号") else {
+        return Ok(());
+    };
+    if !rows.iter().any(|row| is_blank(&row[target])) {
+        return Ok(());
+    }
+    let references =
+        uploaded::appliance_references_by_order(input_dir).map_err(|e| e.to_string())?;
+    let order = position(ledger, "商户订单号");
+    for row in rows.iter_mut().filter(|row| is_blank(&row[target])) {
+        if let Some(reference) = references.get(text_of(&row[order]).trim()) {
+            row[target] = Value::Text(reference.clone());
+        }
+    }
+    Ok(())
+}
+
 /// §6.1：开票状态为`已红冲`时填写发票状态；购买方名称、家电发票金额只补空值（§6.2.2、§6.3.2）。
 fn fill_from_invoices(
     ledger: &Ledger,
@@ -474,6 +499,35 @@ mod tests {
             5,
             &[("发票", &invoice::SOURCE_HEADERS, rows)],
         );
+    }
+
+    /// 家电已上传源文件：第2行为标准表头，每张表只填写`(订单号, 检索参考号)`。
+    fn write_uploads(path: &Path, sheets: &[(&str, &[(&str, &str)])]) {
+        let header: Vec<&str> = uploaded::FRONT_HEADERS
+            .iter()
+            .copied()
+            .chain(uploaded::APPLIANCE_TAIL.iter().map(|f| f.synonyms[0]))
+            .collect();
+        let sheets: Vec<(&str, Vec<Vec<String>>)> = sheets
+            .iter()
+            .map(|(name, records)| {
+                let rows = records
+                    .iter()
+                    .map(|(order, reference)| {
+                        let mut values = vec![String::new(); header.len()];
+                        values[3] = order.to_string();
+                        values[6] = reference.to_string();
+                        values
+                    })
+                    .collect();
+                (*name, rows)
+            })
+            .collect();
+        let sheets: Vec<Sheet> = sheets
+            .into_iter()
+            .map(|(name, rows)| (name, header.as_slice(), rows))
+            .collect();
+        write_book(path, 1, &sheets);
     }
 
     fn read_output(path: &Path) -> (String, Vec<Vec<Data>>) {
@@ -610,6 +664,7 @@ mod tests {
                 ("", "空号", "9", "已红冲"),
             ],
         );
+        write_uploads(&dir.join("MER_89813015722APT1_1.xlsx"), &[("上传", &[])]);
         let output = dir.join("家电台账.xlsx");
         generate_appliance(&dir, &output).unwrap();
 
@@ -695,6 +750,82 @@ mod tests {
                 .unwrap_err()
                 .contains("发票_yyyymmdd")
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// §6.2.4：空交易参考号按商户订单号取已上传检索参考号，跨文件、跨工作表匹配；已有值不覆盖。
+    #[test]
+    fn appliance_ledger_fills_blank_reference_from_uploads_by_order() {
+        let dir = unique_temp_path("ledger-reference");
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = MERCHANT_APPLIANCE;
+        let header = ["拨付批次", "核销商编", "商户订单号", "交易参考号"];
+        let source = dir.join("2026年家电类以旧换新补贴明细已经回款下发.xlsx");
+        write_book(
+            &source,
+            0,
+            &[(
+                "批次",
+                &header,
+                vec![
+                    row(&["B1", m, "O1", ""]),
+                    row(&["B1", m, "O2", "KEEP"]),
+                    row(&["B1", m, "", ""]),
+                    row(&["B1", m, "O3", ""]),
+                    row(&["B1", m, "O4", ""]),
+                    row(&["B1", m, " O5 ", ""]),
+                ],
+            )],
+        );
+        write_invoices(&dir, "发票_20260201.xlsx", &[]);
+        write_uploads(
+            &dir.join("MER_89813015722APT1_1.xlsx"),
+            &[(
+                "一",
+                &[("O1", "012345"), ("O2", "R2"), ("", "RX"), ("O4", "")],
+            )],
+        );
+        write_uploads(
+            &dir.join("MER_89813015722APT1_2.xlsx"),
+            &[("一", &[]), ("二", &[("O5", "R5")])],
+        );
+        let output = dir.join("家电台账.xlsx");
+        generate_appliance(&dir, &output).unwrap();
+        let col = position(&APPLIANCE, "交易参考号");
+        let references = |output: &Path| {
+            read_output(output).1[2..]
+                .iter()
+                .map(|r| r[col].clone())
+                .collect::<Vec<_>>()
+        };
+        let s = |v: &str| Data::String(v.to_string());
+        // 文本保留前导零；已有值、空订单号、未匹配、空参考号均不补。
+        assert_eq!(
+            references(&output),
+            [
+                s("012345"),
+                s("KEEP"),
+                Data::Empty,
+                Data::Empty,
+                Data::Empty,
+                s("R5")
+            ]
+        );
+
+        // 需要补空但缺少已上传文件：台账失败。
+        std::fs::remove_file(dir.join("MER_89813015722APT1_1.xlsx")).unwrap();
+        std::fs::remove_file(dir.join("MER_89813015722APT1_2.xlsx")).unwrap();
+        let error = generate_appliance(&dir, &output).unwrap_err();
+        assert!(error.contains("MER_89813015722APT1_"), "{error}");
+
+        // 没有空参考号时不读取已上传文件。
+        write_book(
+            &source,
+            0,
+            &[("批次", &header, vec![row(&["B1", m, "O1", "R1"])])],
+        );
+        generate_appliance(&dir, &output).unwrap();
+        assert_eq!(references(&output), [s("R1")]);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
