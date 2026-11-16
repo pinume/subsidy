@@ -4,7 +4,6 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 use rust_decimal::Decimal;
-use rust_decimal::prelude::FromPrimitive;
 
 use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, Fill, ProcessError, Row, Table, Value};
@@ -13,7 +12,7 @@ use crate::utils::{numbers, text};
 use super::uploaded::{self, UploadKey, UploadStatusIndex};
 use super::{
     Category, Job, MatchStats, MultiValueIndex, PipelineContext, PriorityOutcome,
-    build_match_doc_no, cell_text, data_error, parse_date_field, text_value,
+    build_match_doc_no, cell_amount, cell_text, data_error, parse_date_field, text_value,
 };
 
 const FILE_NAME: &str = "销售用券情况统计.xlsx";
@@ -179,14 +178,7 @@ fn parse_subsidy(
     sheet: &str,
     row: u32,
 ) -> Result<Decimal, ProcessError> {
-    let raw: Option<Decimal> = match cell {
-        RawCell::Text(t) if t.trim().is_empty() => None,
-        RawCell::Int(n) => Some(Decimal::from(*n)),
-        RawCell::Float(f) => Decimal::from_f64(*f),
-        RawCell::Text(t) => t.trim().parse().ok(),
-        _ => None,
-    };
-    let Some(raw) = raw else {
+    let Some(raw) = cell_amount(cell).ok().flatten() else {
         return Err(data_error(
             file,
             sheet,
