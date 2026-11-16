@@ -17,7 +17,11 @@ for folder in ("国补明细", "国补报表"):
         old_book = openpyxl.load_workbook(old_file, read_only=True)
         new_book = openpyxl.load_workbook(new_file, read_only=True)
         changed, shown = 0, []
-        for old_sheet, new_sheet in zip(old_book.worksheets, new_book.worksheets):
+        if old_book.sheetnames != new_book.sheetnames:
+            shown.append(f"  工作表 {old_book.sheetnames} → {new_book.sheetnames}")
+        # 按名称配对，避免插入、删除或调序后错位比较。
+        common = [name for name in old_book.sheetnames if name in new_book.sheetnames]
+        for old_sheet, new_sheet in ((old_book[n], new_book[n]) for n in common):
             old_rows = list(old_sheet.iter_rows(values_only=True))
             new_rows = list(new_sheet.iter_rows(values_only=True))
             if len(old_rows) != len(new_rows):
