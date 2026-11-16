@@ -1,4 +1,4 @@
-use super::data::SheetData;
+use super::data::{CommonInputs, SheetData};
 use super::reader::{UploadColumns, cell_to_decimal, cell_to_string};
 use super::unique_index::UniqueIndex;
 use calamine::Data;
@@ -53,11 +53,11 @@ pub fn div_pct(num: Decimal, den: Decimal) -> f64 {
 }
 
 #[derive(Debug, Clone, Copy, Default)]
-pub struct MetricRow {
-    pub app_amt: Decimal,
-    pub app_cnt: i64,
-    pub dig_amt: Decimal,
-    pub dig_cnt: i64,
+pub(crate) struct MetricRow {
+    app_amt: Decimal,
+    app_cnt: i64,
+    dig_amt: Decimal,
+    dig_cnt: i64,
 }
 
 impl MetricRow {
@@ -79,29 +79,54 @@ impl MetricRow {
         )
     }
 
-    pub fn tot_amt(&self) -> Decimal {
+    fn tot_amt(&self) -> Decimal {
         self.app_amt + self.dig_amt
     }
 
-    pub fn tot_cnt(&self) -> i64 {
-        self.app_cnt + self.dig_cnt
+    /// 按大类归类口径（第3.2节）的（金额，笔数），依次为家电电脑、数码、合计。
+    pub fn by_class(&self) -> [(Decimal, i64); 3] {
+        [
+            (self.app_amt, self.app_cnt),
+            (self.dig_amt, self.dig_cnt),
+            (self.tot_amt(), self.app_cnt + self.dig_cnt),
+        ]
     }
 }
 
+/// 汇总表的（总体行，未回款具体情况行），每行为（行名，数值）；两部分之间是提示行。
+pub(crate) type SummaryRows<T, const N: usize> = ([(&'static str, T); N], [(&'static str, T); 4]);
+
 #[derive(Debug, Clone)]
-pub struct SummaryMetrics {
-    pub occur: MetricRow,
-    pub paid: MetricRow,
-    pub unpaid: MetricRow,
-    pub pass: MetricRow,
-    pub wait: MetricRow,
-    pub fail: MetricRow,
-    pub unup: MetricRow,
+pub(crate) struct SummaryMetrics {
+    occur: MetricRow,
+    paid: MetricRow,
+    unpaid: MetricRow,
+    pass: MetricRow,
+    wait: MetricRow,
+    fail: MetricRow,
+    unup: MetricRow,
     /// 实时清分UUID与状态都重复、只计一次的上传记录数。
-    pub duplicate_uploads: usize,
+    duplicate_uploads: usize,
 }
 
 impl SummaryMetrics {
+    /// 表一“金额与数量汇总”的行名与数值：（总体，未回款具体情况）。
+    pub(crate) fn rows(&self) -> SummaryRows<&MetricRow, 3> {
+        (
+            [
+                ("国补发生额", &self.occur),
+                ("国补已回款额", &self.paid),
+                ("未回款", &self.unpaid),
+            ],
+            [
+                ("审核通过未回款", &self.pass),
+                ("待审核", &self.wait),
+                ("审核失败", &self.fail),
+                ("未上传", &self.unup),
+            ],
+        )
+    }
+
     /// 报表规则第4.1.1节：重复记录只计一次并输出告警。
     pub(crate) fn duplicate_warning(&self) -> Option<String> {
         (self.duplicate_uploads > 0).then(|| {
@@ -112,8 +137,9 @@ impl SummaryMetrics {
         })
     }
 
-    /// 数值顺序：发生、已回款、综合回款、未回款、通过、待审、失败、未上传。
-    pub(crate) fn amount_ratios(&self) -> [(Decimal, f64, Decimal, f64, Decimal, f64); 8] {
+    /// 表二“结构与比率分析”的行名与（金额，比率），依次为家电电脑、数码、合计：
+    /// （总体，未回款具体情况）。
+    pub(crate) fn amount_ratios(&self) -> SummaryRows<[(Decimal, f64); 3], 4> {
         let combined = MetricRow::new(
             self.paid.app_amt + self.pass.app_amt,
             0,
@@ -122,33 +148,36 @@ impl SummaryMetrics {
         );
         let total = self.occur.tot_amt();
         let ratio = |row: &MetricRow, denominator: &MetricRow| {
-            (
-                row.app_amt,
-                div_pct(row.app_amt, denominator.app_amt),
-                row.dig_amt,
-                div_pct(row.dig_amt, denominator.dig_amt),
-                row.tot_amt(),
-                div_pct(row.tot_amt(), denominator.tot_amt()),
-            )
+            [
+                (row.app_amt, div_pct(row.app_amt, denominator.app_amt)),
+                (row.dig_amt, div_pct(row.dig_amt, denominator.dig_amt)),
+                (row.tot_amt(), div_pct(row.tot_amt(), denominator.tot_amt())),
+            ]
         };
-        [
+        let overall = [
             // 合计占比也遵循零分母为零的规则。
             (
-                self.occur.app_amt,
-                div_pct(self.occur.app_amt, total),
-                self.occur.dig_amt,
-                div_pct(self.occur.dig_amt, total),
-                total,
-                div_pct(total, total),
+                "国补发生额及占比",
+                [
+                    (self.occur.app_amt, div_pct(self.occur.app_amt, total)),
+                    (self.occur.dig_amt, div_pct(self.occur.dig_amt, total)),
+                    (total, div_pct(total, total)),
+                ],
             ),
-            ratio(&self.paid, &self.occur),
-            ratio(&combined, &self.occur),
-            ratio(&self.unpaid, &self.occur),
-            ratio(&self.pass, &self.unpaid),
-            ratio(&self.wait, &self.unpaid),
-            ratio(&self.fail, &self.unpaid),
-            ratio(&self.unup, &self.unpaid),
-        ]
+            ("国补回款额及回款率", ratio(&self.paid, &self.occur)),
+            (
+                "回款+审核通过未回款及综合回款率",
+                ratio(&combined, &self.occur),
+            ),
+            ("未回款额", ratio(&self.unpaid, &self.occur)),
+        ];
+        let unpaid_detail = [
+            ("审核通过未回款", ratio(&self.pass, &self.unpaid)),
+            ("待审核", ratio(&self.wait, &self.unpaid)),
+            ("审核失败", ratio(&self.fail, &self.unpaid)),
+            ("未上传", ratio(&self.unup, &self.unpaid)),
+        ];
+        (overall, unpaid_detail)
     }
 
     pub(crate) fn calculate(
@@ -257,13 +286,34 @@ pub(crate) const SUMMARY_STATUSES: [&str; 5] =
     ["已回款", "审核通过未回款", "待审核", "审核失败", "未上传"];
 
 pub(crate) struct BrandSummary {
-    pub brand: String,
-    pub totals: [(Decimal, i64); 5],
+    brand: String,
+    totals: [(Decimal, i64); 5],
+}
+
+impl BrandSummary {
+    pub fn brand(&self) -> &str {
+        &self.brand
+    }
+
+    /// 按 `SUMMARY_STATUSES` 顺序返回（金额，数量）。
+    pub fn statuses(&self) -> impl Iterator<Item = (Decimal, i64)> + '_ {
+        self.totals.iter().copied()
+    }
 }
 
 pub(crate) struct CategorySummary {
-    pub category: String,
-    pub brands: Vec<BrandSummary>,
+    category: String,
+    brands: Vec<BrandSummary>,
+}
+
+impl CategorySummary {
+    pub fn category(&self) -> &str {
+        &self.category
+    }
+
+    pub fn brands(&self) -> &[BrandSummary] {
+        &self.brands
+    }
 }
 
 /// 品类品牌汇总：聚合、业务排序与五状态投影由同一 module 拥有。
@@ -334,8 +384,70 @@ impl CategoryBrandSummary {
         Ok(Self { groups })
     }
 
-    pub fn groups(&self) -> &[CategorySummary] {
+    pub fn categories(&self) -> &[CategorySummary] {
         &self.groups
+    }
+}
+
+/// 报表规则第4.6节：固定品牌组（表头、清洗后品牌、财务大类限制），按展示顺序排列。
+const OCCURRENCE_GROUPS: [(&str, &str, Option<&str>); 13] = [
+    ("海尔系", "海尔", None),
+    ("美的系", "美的", None),
+    ("海信系", "海信", None),
+    ("TCL系", "TCL", None),
+    ("博世系", "博世", None),
+    ("西门子系", "西门子", None),
+    ("老板", "老板", None),
+    ("方太", "方太", None),
+    // 清洗后的史密斯品牌名为 AO史密斯。
+    ("史密斯", "AO史密斯", None),
+    ("格力空调", "格力", Some("空调")),
+    ("创维电视", "创维", Some("彩电")),
+    ("华为（数码+新业务）", "华为", Some("数码")),
+    ("小米（新业务）", "小米", Some("数码")),
+];
+
+pub(crate) const OCCURRENCE_METRICS: [&str; 3] = ["使用金额", "已回款", "未回款"];
+
+/// 国补发生情况：固定品牌组的全量累计使用金额与已回款金额（含退货正负）。
+pub(crate) struct BrandOccurrence {
+    totals: [(Decimal, Decimal); OCCURRENCE_GROUPS.len()],
+}
+
+impl BrandOccurrence {
+    pub fn from_sales(sales: &SheetData) -> Result<Self, String> {
+        let h = &sales.header;
+        let cat_idx = h.require("财务大类", "销售用券情况统计.xlsx")?;
+        let brand_idx = h.require("品牌", "销售用券情况统计.xlsx")?;
+        let sub_idx = h.require("补贴额", "销售用券情况统计.xlsx")?;
+        let remark_idx = h.require("备注", "销售用券情况统计.xlsx")?;
+        let mut totals = [(Decimal::ZERO, Decimal::ZERO); OCCURRENCE_GROUPS.len()];
+        for row in &sales[1..] {
+            let (cat, brand) = (
+                cell_to_string(&row[cat_idx]),
+                cell_to_string(&row[brand_idx]),
+            );
+            let Some(group) = OCCURRENCE_GROUPS
+                .iter()
+                .position(|(_, b, c)| *b == brand && c.is_none_or(|c| c == cat))
+            else {
+                continue;
+            };
+            let amount = cell_to_decimal(&row[sub_idx]).unwrap_or(Decimal::ZERO);
+            totals[group].0 += amount;
+            if cell_to_string(&row[remark_idx]) == "已回款" {
+                totals[group].1 += amount;
+            }
+        }
+        Ok(Self { totals })
+    }
+
+    /// 按展示顺序返回（表头，[使用金额，已回款，未回款]）。
+    pub fn brand_groups(&self) -> impl Iterator<Item = (&'static str, [Decimal; 3])> + '_ {
+        OCCURRENCE_GROUPS
+            .iter()
+            .zip(&self.totals)
+            .map(|((label, _, _), &(used, paid))| (*label, [used, paid, used - paid]))
     }
 }
 
@@ -367,165 +479,180 @@ pub(crate) struct AnomalyColors {
     pub invoice_pink: HashSet<u32>,
 }
 
-/// 审核失败明细行模型（包含已关联商品名称或数码 IMEI）
+/// 已选列、已排序的明细区块（报表规则第4.3–4.5节）：渲染只按表头写列并逐行写入，
+/// 取哪些行、哪些列及缺列报错都由提取负责。
 #[derive(Debug, PartialEq, Clone)]
-pub(crate) struct FailedUploadRecord<'a> {
-    pub row: &'a [Data],
-    pub extra1: String,
-    pub extra2: Option<String>,
+pub(crate) struct DetailSection {
+    headers: Vec<String>,
+    rows: Vec<Vec<Data>>,
+    /// 区块内值只出现一次时需标黄的列（异常回款的交易参考号）。
+    unique_highlight: Option<u16>,
 }
 
-/// 异常回款明细节模型（封装参考号多重度分组与排序）
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) struct RefundAnomalySection<'a> {
-    pub rows: Vec<&'a [Data]>,
-    pub ref_col_idx: usize,
-}
+const APPLIANCE_UPLOAD: &str = "已上传家电电脑.xlsx";
+const DIGITAL_UPLOAD: &str = "已上传数码.xlsx";
 
-/// 异常发票明细节模型（封装按匹配单据号排序）
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) struct InvoiceAnomalySection<'a> {
-    pub rows: Vec<&'a [Data]>,
-}
+/// 审核失败源行及其附加列（商品名称或 IMEI）。
+type FailedRows<'a> = Vec<(&'a Vec<Data>, Vec<Data>)>;
 
-/// 汇总报表 Sheets 3–5 异常数据的深度领域模型
-#[derive(Debug, PartialEq, Clone)]
-pub(crate) struct AnomalyDatasets<'a> {
-    pub app_failed: Vec<FailedUploadRecord<'a>>,
-    pub dig_failed: Vec<FailedUploadRecord<'a>>,
-    pub app_refund: RefundAnomalySection<'a>,
-    pub dig_refund: RefundAnomalySection<'a>,
-    pub invoices: InvoiceAnomalySection<'a>,
-}
+const FAILED_FIELDS: [&str; 7] = [
+    "交易日期",
+    "检索参考号",
+    "描述",
+    "发票号码",
+    "发票金额",
+    "购买方名称",
+    "S/N码",
+];
 
-impl<'a> AnomalyDatasets<'a> {
-    pub fn extract(
-        sources: [&'a SheetData; 5],
-        colors: &AnomalyColors,
-        stores: [&str; 2],
-        invoice_names: &UniqueIndex<String>,
+impl DetailSection {
+    pub fn headers(&self) -> &[String] {
+        &self.headers
+    }
+
+    pub fn rows(&self) -> &[Vec<Data>] {
+        &self.rows
+    }
+
+    pub fn unique_highlight_col(&self) -> Option<u16> {
+        self.unique_highlight
+    }
+
+    /// 前 8 列为固定字段，后接各区块附加列；状态列固定写“审核失败”。
+    fn failed(
+        rows: FailedRows<'_>,
+        source: &SheetData,
+        label: &str,
+        extra_headers: &[&str],
     ) -> Result<Self, String> {
-        let [app_up, dig_up, invoices, app_refund, dig_refund] = sources;
-        let [app_store, dig_store] = stores;
-
-        let app_failed = FailedUploadRecord::extract_appliance(app_up, invoice_names)?;
-        let dig_failed = FailedUploadRecord::extract_digital(dig_up)?;
-        let app_refund_sec = RefundAnomalySection::extract(
-            app_refund,
-            &colors.app_pink,
-            app_store,
-            "回款明细家电电脑.xlsx",
-        )?;
-        let dig_refund_sec = RefundAnomalySection::extract(
-            dig_refund,
-            &colors.dig_pink,
-            dig_store,
-            "回款明细数码.xlsx",
-        )?;
-        let invoices_sec = InvoiceAnomalySection::extract(invoices, colors)?;
-
+        let mut headers: Vec<String> = FAILED_FIELDS.iter().map(|f| f.to_string()).collect();
+        headers.insert(2, "状态".into());
+        headers.extend(extra_headers.iter().map(|h| h.to_string()));
+        // 没有失败记录时不要求固定字段存在。
+        let columns = if rows.is_empty() {
+            Vec::new()
+        } else {
+            source.select(FAILED_FIELDS, label)?
+        };
+        let rows = rows
+            .into_iter()
+            .map(|(row, extras)| {
+                let mut values: Vec<Data> = columns
+                    .iter()
+                    .map(|column| column.cell(row).clone())
+                    .collect();
+                values.insert(2, Data::String("审核失败".into()));
+                values.extend(extras);
+                values
+            })
+            .collect();
         Ok(Self {
-            app_failed,
-            dig_failed,
-            app_refund: app_refund_sec,
-            dig_refund: dig_refund_sec,
-            invoices: invoices_sec,
+            headers,
+            rows,
+            unique_highlight: None,
         })
     }
-}
 
-impl<'a> FailedUploadRecord<'a> {
-    pub(crate) fn extract_appliance(
+    /// 家电电脑审核失败行：按发票号码关联商品名称，商品名称升序，空值在后。
+    fn appliance_failed_rows<'a>(
         app_up: &'a SheetData,
         invoice_names: &UniqueIndex<String>,
-    ) -> Result<Vec<Self>, String> {
+    ) -> Result<FailedRows<'a>, String> {
         let status_idx = app_up.header.require("状态", "已上传明细")?;
-        let inv_idx = app_up.header.require("发票号码", "已上传家电电脑.xlsx")?;
-
-        let mut records: Vec<_> = current_uploads(app_up, "已上传家电电脑.xlsx")?
+        let inv_idx = app_up.header.require("发票号码", APPLIANCE_UPLOAD)?;
+        let mut rows: FailedRows<'a> = current_uploads(app_up, APPLIANCE_UPLOAD)?
             .0
             .into_iter()
             .filter(|row| cell_to_string(&row[status_idx]) == "审核失败")
             .map(|row| {
-                let inv_no = cell_to_string(&row[inv_idx]);
-                let prod_name = invoice_names.get(&inv_no).cloned().unwrap_or_default();
-                FailedUploadRecord {
-                    row: row.as_slice(),
-                    extra1: prod_name,
-                    extra2: None,
-                }
+                let name = invoice_names
+                    .get(&cell_to_string(&row[inv_idx]))
+                    .cloned()
+                    .unwrap_or_default();
+                (row, vec![Data::String(name)])
             })
             .collect();
-
-        records.sort_by_key(|r| (r.extra1.is_empty(), r.extra1.clone()));
-        Ok(records)
+        rows.sort_by_key(|(_, extras)| {
+            let name = cell_to_string(&extras[0]);
+            (name.is_empty(), name)
+        });
+        Ok(rows)
     }
 
-    pub(crate) fn extract_digital(dig_up: &'a SheetData) -> Result<Vec<Self>, String> {
+    /// 数码审核失败行：保持源顺序，附 IMEI1、IMEI2。
+    fn digital_failed_rows(dig_up: &SheetData) -> Result<FailedRows<'_>, String> {
         let status_idx = dig_up.header.require("状态", "已上传明细")?;
-        let imei1_idx = dig_up
-            .header
-            .find(&["IMEI1", "imei1"])
-            .ok_or("已上传数码.xlsx: 缺少必要列 [IMEI1]")?;
-        let imei2_idx = dig_up
-            .header
-            .find(&["IMEI2", "imei2"])
-            .ok_or("已上传数码.xlsx: 缺少必要列 [IMEI2]")?;
-
-        let records: Vec<_> = current_uploads(dig_up, "已上传数码.xlsx")?
+        let imei1_idx = dig_up.header.require("IMEI1", DIGITAL_UPLOAD)?;
+        let imei2_idx = dig_up.header.require("IMEI2", DIGITAL_UPLOAD)?;
+        Ok(current_uploads(dig_up, DIGITAL_UPLOAD)?
             .0
             .into_iter()
             .filter(|row| cell_to_string(&row[status_idx]) == "审核失败")
             .map(|row| {
-                let imei1 = cell_to_string(&row[imei1_idx]);
-                let imei2 = cell_to_string(&row[imei2_idx]);
-                FailedUploadRecord {
-                    row: row.as_slice(),
-                    extra1: imei1,
-                    extra2: Some(imei2),
-                }
+                let imei = [imei1_idx, imei2_idx]
+                    .map(|idx| Data::String(cell_to_string(&row[idx])))
+                    .to_vec();
+                (row, imei)
             })
-            .collect();
-
-        Ok(records)
+            .collect())
     }
-}
 
-impl<'a> RefundAnomalySection<'a> {
-    pub(crate) fn extract(
-        refund: &'a SheetData,
+    #[cfg(test)]
+    pub(crate) fn failed_appliance(
+        app_up: &SheetData,
+        invoice_names: &UniqueIndex<String>,
+    ) -> Result<Self, String> {
+        let rows = Self::appliance_failed_rows(app_up, invoice_names)?;
+        Self::failed(rows, app_up, APPLIANCE_UPLOAD, &["商品名称"])
+    }
+
+    #[cfg(test)]
+    pub(crate) fn failed_digital(dig_up: &SheetData) -> Result<Self, String> {
+        let rows = Self::digital_failed_rows(dig_up)?;
+        Self::failed(rows, dig_up, DIGITAL_UPLOAD, &["IMEI1", "IMEI2"])
+    }
+
+    /// 源表前 `width` 列原样输出（表头不足时补空）。
+    fn leading_columns(source: &SheetData, width: usize, rows: Vec<&Vec<Data>>) -> Self {
+        let take = |row: &Vec<Data>| -> Vec<Data> {
+            (0..width)
+                .map(|col| row.get(col).cloned().unwrap_or(Data::Empty))
+                .collect()
+        };
+        Self {
+            headers: take(&source[0]).iter().map(cell_to_string).collect(),
+            rows: rows.into_iter().map(take).collect(),
+            unique_highlight: None,
+        }
+    }
+
+    /// 异常回款：本店核销商编且粉色填充；重复参考号在前、不重复在后、空值最后，组内升序。
+    /// 不重复的交易参考号标黄。
+    fn refund(
+        refund: &SheetData,
         pink: &HashSet<u32>,
         store: &str,
         file_label: &str,
     ) -> Result<Self, String> {
-        if refund.is_empty() {
-            return Ok(RefundAnomalySection {
-                rows: Vec::new(),
-                ref_col_idx: 0,
-            });
-        }
         let merchant_idx = refund.header.require("核销商编", "回款明细")?;
         let ref_idx = refund
             .header
             .find(&["交易参考号"])
             .ok_or_else(|| format!("{file_label} 缺少交易参考号"))?;
-
-        let mut matched_rows: Vec<&'a [Data]> = refund
+        let mut rows: Vec<&Vec<Data>> = refund
             .iter()
             .enumerate()
             .skip(1)
             .filter(|(index, row)| {
                 cell_to_string(&row[merchant_idx]) == store && pink.contains(&(*index as u32 + 1))
             })
-            .map(|(_, row)| row.as_slice())
+            .map(|(_, row)| row)
             .collect();
-
-        let reference_counts = matched_rows.iter().fold(HashMap::new(), |mut counts, row| {
+        let reference_counts = rows.iter().fold(HashMap::new(), |mut counts, row| {
             *counts.entry(cell_to_string(&row[ref_idx])).or_insert(0) += 1;
             counts
         });
-
-        matched_rows.sort_by_key(|row| {
+        rows.sort_by_key(|row| {
             let reference = cell_to_string(&row[ref_idx]);
             (
                 reference.is_empty(),
@@ -533,22 +660,22 @@ impl<'a> RefundAnomalySection<'a> {
                 reference,
             )
         });
-
-        Ok(RefundAnomalySection {
-            rows: matched_rows,
-            ref_col_idx: ref_idx,
+        Ok(Self {
+            unique_highlight: Some(ref_idx as u16),
+            ..Self::leading_columns(refund, 24, rows)
         })
     }
-}
 
-impl<'a> InvoiceAnomalySection<'a> {
-    pub(crate) fn extract(invoices: &'a SheetData, colors: &AnomalyColors) -> Result<Self, String> {
+    /// 异常发票行：黄色且非粉色填充，按匹配单据号升序、空值在后。
+    fn invoice_rows<'a>(
+        invoices: &'a SheetData,
+        colors: &AnomalyColors,
+    ) -> Result<Vec<&'a Vec<Data>>, String> {
         let doc_no_idx = invoices
             .header
             .find(&["匹配单据号"])
             .ok_or("发票明细缺少匹配单据号")?;
-
-        let mut collected: Vec<&'a [Data]> = invoices
+        let mut rows: Vec<&Vec<Data>> = invoices
             .iter()
             .enumerate()
             .skip(1)
@@ -556,15 +683,91 @@ impl<'a> InvoiceAnomalySection<'a> {
                 let row_num = *index as u32 + 1;
                 colors.invoice_yellow.contains(&row_num) && !colors.invoice_pink.contains(&row_num)
             })
-            .map(|(_, row)| row.as_slice())
+            .map(|(_, row)| row)
             .collect();
-
-        collected.sort_by_key(|r| {
-            let s = cell_to_string(&r[doc_no_idx]);
-            (s.is_empty(), s)
+        rows.sort_by_key(|row| {
+            let doc_no = cell_to_string(&row[doc_no_idx]);
+            (doc_no.is_empty(), doc_no)
         });
+        Ok(rows)
+    }
 
-        Ok(InvoiceAnomalySection { rows: collected })
+    /// 异常发票输出前 8 列。
+    fn invoices(invoices: &SheetData, rows: Vec<&Vec<Data>>) -> Result<Self, String> {
+        if invoices[0].len() < 8 {
+            return Err("发票明细.xlsx: 表头不足 8 列".to_string());
+        }
+        Ok(Self::leading_columns(invoices, 8, rows))
+    }
+}
+
+/// 汇总报表第3–5张表的明细区块。
+pub(crate) struct AnomalyDatasets {
+    failed: [DetailSection; 2],
+    refunds: [DetailSection; 2],
+    invoices: DetailSection,
+    warning: Option<String>,
+}
+
+impl AnomalyDatasets {
+    /// 先取行、后选列：多处输入同时出错时，先报的错与按表渲染时一致。
+    pub fn extract(inputs: &CommonInputs, colors: &AnomalyColors) -> Result<Self, String> {
+        let invoice_names = build_invoice_name_index(&inputs.invoices)?;
+        let app_failed = DetailSection::appliance_failed_rows(&inputs.app_upload, &invoice_names)?;
+        let dig_failed = DetailSection::digital_failed_rows(&inputs.dig_upload)?;
+        let refunds = [
+            DetailSection::refund(
+                &inputs.app_refund,
+                &colors.app_pink,
+                &inputs.app_store_code,
+                "回款明细家电电脑.xlsx",
+            )?,
+            DetailSection::refund(
+                &inputs.dig_refund,
+                &colors.dig_pink,
+                &inputs.dig_store_code,
+                "回款明细数码.xlsx",
+            )?,
+        ];
+        let invoice_rows = DetailSection::invoice_rows(&inputs.invoices, colors)?;
+        Ok(Self {
+            failed: [
+                DetailSection::failed(
+                    app_failed,
+                    &inputs.app_upload,
+                    APPLIANCE_UPLOAD,
+                    &["商品名称"],
+                )?,
+                DetailSection::failed(
+                    dig_failed,
+                    &inputs.dig_upload,
+                    DIGITAL_UPLOAD,
+                    &["IMEI1", "IMEI2"],
+                )?,
+            ],
+            refunds,
+            invoices: DetailSection::invoices(&inputs.invoices, invoice_rows)?,
+            warning: invoice_names.warning("发票商品名称索引"),
+        })
+    }
+
+    /// 审核失败：家电电脑、数码。
+    pub fn failed(&self) -> &[DetailSection; 2] {
+        &self.failed
+    }
+
+    /// 异常回款：家电电脑、数码。
+    pub fn refunds(&self) -> &[DetailSection; 2] {
+        &self.refunds
+    }
+
+    pub fn invoices(&self) -> &DetailSection {
+        &self.invoices
+    }
+
+    /// 发票商品名称索引的冲突告警。
+    pub fn warning(&self) -> Option<String> {
+        self.warning.clone()
     }
 }
 
@@ -585,6 +788,43 @@ mod tests {
         )
     }
 
+    /// 报表规则第4.6节：品牌归组、品类限制、已回款口径、退货相抵、无数据组与负未回款。
+    #[test]
+    fn brand_occurrence_groups_fixed_brands_and_nets_returns() {
+        let input = sales(&[
+            &["冰箱", "海尔", "100.50", "1", "已回款"],
+            &["洗衣机", "海尔", "20", "1", "待审核"],
+            &["空调", "格力", "30", "1", "已回款"],
+            &["冰箱", "格力", "999", "1", "已回款"],
+            &["彩电", "创维", "50", "1", "退货-原单"],
+            &["彩电", "创维", "-50", "-1", "退货-退单"],
+            &["数码", "华为", "10", "1", "已回款"],
+            &["彩电", "华为（终端）", "999", "1", "已回款"],
+            &["厨卫", "AO史密斯", "40", "1", "已回款"],
+            &["厨卫", "AO史密斯", "-40", "-1", "未上传"],
+            &["数码", "OPPO", "999", "1", "已回款"],
+        ]);
+        let groups: Vec<_> = BrandOccurrence::from_sales(&input)
+            .unwrap()
+            .brand_groups()
+            .collect();
+        assert_eq!(groups.len(), 13);
+        let d = |cents: i64| Decimal::new(cents, 2);
+        let expect = |label: &str, used: i64, paid: i64, unpaid: i64| {
+            let (_, values) = groups.iter().find(|(name, _)| *name == label).unwrap();
+            assert_eq!(*values, [d(used), d(paid), d(unpaid)], "{label}");
+        };
+        expect("海尔系", 12050, 10050, 2000);
+        expect("格力空调", 3000, 3000, 0);
+        expect("创维电视", 0, 0, 0);
+        expect("华为（数码+新业务）", 1000, 1000, 0);
+        expect("史密斯", 0, 4000, -4000);
+        expect("小米（新业务）", 0, 0, 0);
+        for (label, [used, paid, unpaid]) in &groups {
+            assert_eq!(*used, paid + unpaid, "{label}");
+        }
+    }
+
     #[test]
     fn category_brand_summary_orders_actual_combinations_and_projects_five_statuses() {
         let input = sales(&[
@@ -602,7 +842,7 @@ mod tests {
         ]);
         let summary = CategoryBrandSummary::from_sales(&input).unwrap();
         let names: Vec<_> = summary
-            .groups()
+            .categories()
             .iter()
             .flat_map(|group| {
                 group
@@ -625,7 +865,7 @@ mod tests {
             ]
         );
         let zero = (Decimal::ZERO, 0);
-        let brands = &summary.groups()[0].brands;
+        let brands = &summary.categories()[0].brands;
         assert_eq!(
             brands[0].totals,
             [zero, zero, (Decimal::from(5), 2), zero, zero]
@@ -647,11 +887,11 @@ mod tests {
             [zero, zero, zero, zero, (Decimal::from(4), 1)]
         );
         assert_eq!(
-            summary.groups()[1].brands[0].totals[4],
+            summary.categories()[1].brands[0].totals[4],
             (Decimal::from(8), 1)
         );
-        assert_eq!(summary.groups()[2].brands[0].totals, [zero; 5]);
-        assert_eq!(summary.groups()[3].brands[0].totals, [zero; 5]);
+        assert_eq!(summary.categories()[2].brands[0].totals, [zero; 5]);
+        assert_eq!(summary.categories()[3].brands[0].totals, [zero; 5]);
     }
 
     #[test]
@@ -714,16 +954,22 @@ mod tests {
             "更新时间",
             "IMEI1",
             "IMEI2",
+            "交易日期",
+            "检索参考号",
+            "描述",
+            "发票金额",
+            "购买方名称",
+            "S/N码",
         ];
         let row = |uuid: &str, status: &str, time: &str| {
-            vec![
+            let mut row = vec![
                 text(status),
                 text(""),
                 text(uuid),
                 Data::DateTimeIso(format!("2026-11-01T{time}")),
-                text(""),
-                text(""),
-            ]
+            ];
+            row.resize(header.len(), text(""));
+            row
         };
         let uploads = SheetData::new(vec![
             header.iter().map(|name| text(name)).collect(),
@@ -735,13 +981,17 @@ mod tests {
         ]);
         let names = UniqueIndex::default();
         assert_eq!(
-            FailedUploadRecord::extract_appliance(&uploads, &names)
+            DetailSection::failed_appliance(&uploads, &names)
                 .unwrap()
+                .rows()
                 .len(),
             1
         );
         assert_eq!(
-            FailedUploadRecord::extract_digital(&uploads).unwrap().len(),
+            DetailSection::failed_digital(&uploads)
+                .unwrap()
+                .rows()
+                .len(),
             1
         );
     }
@@ -760,124 +1010,144 @@ mod tests {
             duplicate_uploads: 0,
         };
         assert_eq!(metrics.duplicate_warning(), None);
-        for row in metrics.amount_ratios() {
-            assert_eq!(
-                row,
-                (Decimal::ZERO, 0.0, Decimal::ZERO, 0.0, Decimal::ZERO, 0.0,)
-            );
+        let (overall, unpaid_detail) = metrics.amount_ratios();
+        for (_, values) in overall.into_iter().chain(unpaid_detail) {
+            assert_eq!(values, [(Decimal::ZERO, 0.0); 3]);
         }
     }
 
     #[test]
     fn anomaly_datasets_extract_orders_and_groups_sections() {
-        let app_rows = SheetData::new(vec![
-            vec![
-                Data::String("状态".into()),
-                Data::String("发票号码".into()),
-                Data::String("实时清分UUID".into()),
-                Data::String("更新时间".into()),
-            ],
-            vec![Data::String("审核失败".into()), Data::String("INV2".into())],
-            vec![Data::String("已回款".into()), Data::String("INV1".into())],
-            vec![Data::String("审核失败".into()), Data::String("INV1".into())],
-            vec![
-                Data::String("审核失败".into()),
-                Data::String("INV_NONE".into()),
-            ],
+        // 按表头补齐空单元格。
+        let sheet = |rows: &[&[&str]]| {
+            let width = rows[0].len();
+            SheetData::new(
+                rows.iter()
+                    .map(|row| {
+                        let mut row: Vec<Data> =
+                            row.iter().map(|v| Data::String((*v).into())).collect();
+                        row.resize(width, Data::String(String::new()));
+                        row
+                    })
+                    .collect(),
+            )
+        };
+        let failed_tail = [
+            "实时清分UUID",
+            "更新时间",
+            "交易日期",
+            "检索参考号",
+            "描述",
+            "发票金额",
+            "购买方名称",
+            "S/N码",
+        ];
+        let app_header: Vec<&str> = ["状态", "发票号码"]
+            .into_iter()
+            .chain(failed_tail)
+            .collect();
+        let dig_header: Vec<&str> = ["状态", "IMEI1", "IMEI2", "发票号码"]
+            .into_iter()
+            .chain(failed_tail)
+            .collect();
+        let refund = sheet(&[
+            &["核销商编", "交易参考号"],
+            &["S1", "R_SINGLE"],
+            &["S1", "R_DUP"],
+            &["S1", "R_DUP"],
+            &["S1", ""],
+            &["OTHER", "R_DUP"],
         ]);
-        let dig_rows = SheetData::new(vec![
-            vec![
-                Data::String("状态".into()),
-                Data::String("IMEI1".into()),
-                Data::String("IMEI2".into()),
-                Data::String("实时清分UUID".into()),
-                Data::String("更新时间".into()),
-            ],
-            vec![
-                Data::String("审核失败".into()),
-                Data::String("EM1".into()),
-                Data::String("EM2".into()),
-            ],
-            vec![
-                Data::String("审核通过".into()),
-                Data::String("EM3".into()),
-                Data::String("EM4".into()),
-            ],
-            vec![
-                Data::String("审核失败".into()),
-                Data::String("EM5".into()),
-                Data::String("EM6".into()),
-            ],
-        ]);
-        let invoice_rows = SheetData::new(vec![
-            vec![Data::String("匹配单据号".into())],
-            vec![Data::String("DOC2".into())],
-            vec![Data::String("DOC1".into())],
-            vec![Data::String("".into())],
-            vec![Data::String("DOC3".into())],
-        ]);
-        let refund_rows = SheetData::new(vec![
-            vec![
-                Data::String("核销商编".into()),
-                Data::String("交易参考号".into()),
-            ],
-            vec![Data::String("S1".into()), Data::String("R_SINGLE".into())],
-            vec![Data::String("S1".into()), Data::String("R_DUP".into())],
-            vec![Data::String("S1".into()), Data::String("R_DUP".into())],
-            vec![Data::String("S1".into()), Data::String("".into())],
-            vec![Data::String("OTHER".into()), Data::String("R_DUP".into())],
-        ]);
-
+        let mut inputs = CommonInputs {
+            sales: sheet(&[&["财务大类"]]),
+            app_upload: sheet(&[
+                &app_header,
+                &["审核失败", "INV2"],
+                &["已回款", "INV1"],
+                &["审核失败", "INV1"],
+                &["审核失败", "INV_NONE"],
+            ]),
+            dig_upload: sheet(&[
+                &dig_header,
+                &["审核失败", "EM1", "EM2"],
+                &["审核通过", "EM3", "EM4"],
+                &["审核失败", "EM5", "EM6"],
+            ]),
+            invoices: sheet(&[
+                &[
+                    "匹配单据号",
+                    "数电发票号码",
+                    "主要商品名称",
+                    "4",
+                    "5",
+                    "6",
+                    "7",
+                    "8",
+                ],
+                &["DOC2", "INV2", "美的空调"],
+                &["DOC1", "INV1", "海尔冰箱"],
+                &[""],
+                &["DOC3"],
+            ]),
+            app_refund: refund,
+            dig_refund: sheet(&[&["核销商编", "交易参考号"]]),
+            app_store_code: "S1".into(),
+            dig_store_code: "S1".into(),
+        };
         let colors = AnomalyColors {
             app_pink: HashSet::from([2, 3, 4, 5]),
             dig_pink: HashSet::new(),
             invoice_yellow: HashSet::from([2, 3, 4, 5]),
             invoice_pink: HashSet::from([5]), // Row 5 is pink -> excluded from yellow
         };
-
-        let mut names = UniqueIndex::default();
-        names.insert("INV1".into(), "海尔冰箱".into());
-        names.insert("INV2".into(), "美的空调".into());
-
-        let datasets = AnomalyDatasets::extract(
-            [
-                &app_rows,
-                &dig_rows,
-                &invoice_rows,
-                &refund_rows,
-                &refund_rows,
-            ],
-            &colors,
-            ["S1", "S1"],
-            &names,
-        )
-        .unwrap();
+        let datasets = AnomalyDatasets::extract(&inputs, &colors).unwrap();
+        assert_eq!(datasets.warning(), None);
+        let column = |section: &DetailSection, col: usize| -> Vec<String> {
+            section
+                .rows()
+                .iter()
+                .map(|row| cell_to_string(&row[col]))
+                .collect()
+        };
 
         // 1. App failed sorted by product name (INV1 "海尔冰箱" < INV2 "美的空调" < empty)
-        assert_eq!(datasets.app_failed.len(), 3);
-        assert_eq!(datasets.app_failed[0].extra1, "海尔冰箱");
-        assert_eq!(datasets.app_failed[1].extra1, "美的空调");
-        assert_eq!(datasets.app_failed[2].extra1, "");
+        let [app, dig] = datasets.failed();
+        assert_eq!(app.headers().len(), 9);
+        assert_eq!(column(app, 8), ["海尔冰箱", "美的空调", ""]);
+        assert_eq!(column(app, 2), ["审核失败"; 3]);
 
         // 2. Dig failed extracts IMEI1 and IMEI2 in original order
-        assert_eq!(datasets.dig_failed.len(), 2);
-        assert_eq!(datasets.dig_failed[0].extra1, "EM1");
-        assert_eq!(datasets.dig_failed[0].extra2, Some("EM2".into()));
-        assert_eq!(datasets.dig_failed[1].extra1, "EM5");
-        assert_eq!(datasets.dig_failed[1].extra2, Some("EM6".into()));
+        assert_eq!(&dig.headers()[8..], ["IMEI1", "IMEI2"]);
+        assert_eq!(column(dig, 8), ["EM1", "EM5"]);
+        assert_eq!(column(dig, 9), ["EM2", "EM6"]);
 
         // 3. Invoices sorted by doc_no ascending with empty last (DOC1 < DOC2 < empty)
-        assert_eq!(datasets.invoices.rows.len(), 3);
-        assert_eq!(cell_to_string(&datasets.invoices.rows[0][0]), "DOC1");
-        assert_eq!(cell_to_string(&datasets.invoices.rows[1][0]), "DOC2");
-        assert_eq!(cell_to_string(&datasets.invoices.rows[2][0]), "");
+        let invoices = datasets.invoices();
+        assert_eq!(invoices.headers().len(), 8);
+        assert_eq!(column(invoices, 0), ["DOC1", "DOC2", ""]);
 
         // 4. Refund grouped: duplicates first (R_DUP, R_DUP), singletons second (R_SINGLE), empty last
-        assert_eq!(datasets.app_refund.rows.len(), 4);
-        assert_eq!(cell_to_string(&datasets.app_refund.rows[0][1]), "R_DUP");
-        assert_eq!(cell_to_string(&datasets.app_refund.rows[1][1]), "R_DUP");
-        assert_eq!(cell_to_string(&datasets.app_refund.rows[2][1]), "R_SINGLE");
-        assert_eq!(cell_to_string(&datasets.app_refund.rows[3][1]), "");
+        let [app_refund, dig_refund] = datasets.refunds();
+        assert_eq!(app_refund.unique_highlight_col(), Some(1));
+        assert_eq!(app_refund.headers().len(), 24);
+        assert_eq!(column(app_refund, 1), ["R_DUP", "R_DUP", "R_SINGLE", ""]);
+        assert!(dig_refund.rows().is_empty());
+
+        // 多处同时出错时，先报的错与改动前一致：回款缺列先于审核失败缺固定列，
+        // 匹配单据号先于发票表头列数。
+        let error = |inputs: &CommonInputs| AnomalyDatasets::extract(inputs, &colors).err();
+        inputs.app_upload = sheet(&[
+            &["状态", "发票号码", "实时清分UUID", "更新时间"],
+            &["审核失败", "INV1"],
+        ]);
+        inputs.dig_refund = sheet(&[&["核销商编"]]);
+        assert_eq!(
+            error(&inputs).as_deref(),
+            Some("回款明细数码.xlsx 缺少交易参考号")
+        );
+        inputs.dig_refund = sheet(&[&["核销商编", "交易参考号"]]);
+        inputs.invoices = sheet(&[&["数电发票号码", "主要商品名称"]]);
+        assert_eq!(error(&inputs).as_deref(), Some("发票明细缺少匹配单据号"));
     }
 
     #[test]

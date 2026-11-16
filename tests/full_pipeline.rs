@@ -288,7 +288,7 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
             .unwrap()
             .sheet_names()
             .len(),
-        5
+        6
     );
     let finance = reports.join("26年国补门店财务统筹表.xlsx");
     assert_eq!(open_workbook_auto(&finance).unwrap().sheet_names().len(), 4);
