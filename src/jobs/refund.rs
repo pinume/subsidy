@@ -93,7 +93,7 @@ struct RefundConfig {
     dealer_code: &'static str,
 }
 
-pub(crate) const APPLIANCE_SYNONYMS: [&[&str]; 24] = [
+const APPLIANCE_SYNONYMS: [&[&str]; 24] = [
     &["拨付批次"],
     &["交易完成时间"],
     &["交易参考号"],
@@ -403,6 +403,12 @@ impl RefundJob {
     /// 本类别原始补贴明细的全部批次表；回款清洗与台账共用同一读取规则。
     pub(crate) fn batch_sheets(&self, input_dir: &Path) -> Result<Vec<BatchSheet>, ProcessError> {
         batch_sheets(self.0, input_dir)
+    }
+
+    /// 统一输出字段（`OUTPUT_FIELDS`）在本类别原始表中的同义源字段；非输出字段返回 `None`。
+    pub(crate) fn source_synonyms(&self, field: &str) -> Option<&'static [&'static str]> {
+        let index = OUTPUT_FIELDS.iter().position(|name| *name == field)?;
+        Some(self.0.field_synonyms[index])
     }
 }
 

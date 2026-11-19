@@ -5,8 +5,8 @@ use crate::io::xlsx_reader::{SheetGrid, open_sheets};
 use crate::model::{Column, ColumnType, ProcessError, Row, Table, Value};
 
 use super::{
-    Category, Job, PipelineContext, build_match_doc_no, cell_text, data_error, parse_date_field,
-    text_value,
+    Category, Job, MultiValueIndex, PipelineContext, build_match_doc_no, cell_text, data_error,
+    parse_date_field, text_value,
 };
 
 const FILE_NAME: &str = "收款单统计.xlsx";
@@ -156,6 +156,18 @@ impl Job for ReceiptsJob {
             rows,
         })
     }
+}
+
+/// 按`匹配单据号`汇总收款单统计全部非空`备注`（未去重）；歧义判定同样复用`resolve`。
+pub(crate) fn remark_index(records: &[ReceiptRecord]) -> MultiValueIndex {
+    let mut grouped = MultiValueIndex::new();
+    for record in records {
+        if record.match_doc_no.is_empty() || record.remark.is_empty() {
+            continue;
+        }
+        grouped.insert(record.match_doc_no.clone(), record.remark.clone());
+    }
+    grouped
 }
 
 /// 读取并计算全部有效明细的退货`备注`，供本任务及第 10 节

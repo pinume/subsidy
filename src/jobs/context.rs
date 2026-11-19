@@ -61,25 +61,13 @@ impl PipelineContext {
             return Ok(Rc::clone(index));
         }
         let records = unionpay::load_records(input_dir)?;
-        let index = Self::build_authority_index(&records);
+        let index = Rc::new(unionpay::authority_references(&records));
         self.authority = Some(Rc::clone(&index));
         Ok(index)
     }
 
     pub(crate) fn store_authority(&mut self, records: &[unionpay::UnionPayRecord]) {
-        let index = Self::build_authority_index(records);
-        self.authority = Some(index);
-    }
-
-    fn build_authority_index(records: &[unionpay::UnionPayRecord]) -> Rc<HashSet<String>> {
-        Rc::new(
-            records
-                .iter()
-                .map(|r| r.retrieval_no.as_str())
-                .filter(|v| is_valid_ref_no(v))
-                .map(str::to_owned)
-                .collect(),
-        )
+        self.authority = Some(Rc::new(unionpay::authority_references(records)));
     }
 
     /// 按`匹配单据号`汇总发票明细全部非空`数电发票号码`（未去重）；歧义判定见`coupons::to_row`
@@ -102,7 +90,7 @@ impl PipelineContext {
         self.invoices = Some(index);
     }
 
-    /// 按`匹配单据号`汇总收款单统计全部非空`备注`（未去重）；歧义判定同样复用`resolve`。
+    /// 收款单`备注`索引，构建规则见`receipts::remark_index`。
     pub(crate) fn receipts_index(
         &mut self,
         input_dir: &Path,
@@ -111,25 +99,13 @@ impl PipelineContext {
             return Ok(Rc::clone(index));
         }
         let records = receipts::load_records(input_dir)?;
-        let index = Self::build_receipts_index(&records);
+        let index = Rc::new(receipts::remark_index(&records));
         self.receipts = Some(Rc::clone(&index));
         Ok(index)
     }
 
     pub(crate) fn store_receipts(&mut self, records: &[receipts::ReceiptRecord]) {
-        let index = Self::build_receipts_index(records);
-        self.receipts = Some(index);
-    }
-
-    fn build_receipts_index(records: &[receipts::ReceiptRecord]) -> Rc<MultiValueIndex> {
-        let mut grouped = MultiValueIndex::new();
-        for record in records {
-            if record.match_doc_no.is_empty() || record.remark.is_empty() {
-                continue;
-            }
-            grouped.insert(record.match_doc_no.clone(), record.remark.clone());
-        }
-        Rc::new(grouped)
+        self.receipts = Some(Rc::new(receipts::remark_index(records)));
     }
 
     pub fn record_stats(&mut self, stats: MatchStats) {
@@ -160,12 +136,6 @@ impl PipelineContext {
             );
         }
     }
-}
-
-fn is_valid_ref_no(value: &str) -> bool {
-    value.len() == 12
-        && value.as_bytes()[11] == b'N'
-        && value.as_bytes()[..11].iter().all(u8::is_ascii_digit)
 }
 
 #[cfg(test)]
@@ -216,13 +186,5 @@ mod tests {
         };
         ctx.record_stats(stats);
         assert_eq!(ctx.stats(), Some(stats));
-    }
-
-    #[test]
-    fn validates_reference_number_shape() {
-        assert!(is_valid_ref_no("16867252734N"));
-        assert!(!is_valid_ref_no("16867252734W")); // 结尾不是大写 N
-        assert!(!is_valid_ref_no("1686725273N")); // 只有 10 位数字
-        assert!(!is_valid_ref_no("16867252734n")); // 小写 n 不算
     }
 }

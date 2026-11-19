@@ -85,26 +85,6 @@ impl HeaderMap {
     }
 }
 
-/// Frequently accessed column indices in uploaded spreadsheets
-#[derive(Debug, Clone, Copy)]
-pub struct UploadColumns {
-    pub status: usize,
-    pub subsidy: usize,
-    pub reference: usize,
-    pub invoice: usize,
-}
-
-impl UploadColumns {
-    pub fn from_header(h: &HeaderMap, file_label: &str) -> Result<Self, String> {
-        Ok(Self {
-            status: h.require("状态", file_label)?,
-            subsidy: h.require("补贴金额", file_label)?,
-            reference: h.require("检索参考号", file_label)?,
-            invoice: h.require("发票号码", file_label)?,
-        })
-    }
-}
-
 /// Extract unique non-empty merchant code from rows, ensuring consistency across data rows
 pub fn extract_unique_merchant_code(
     rows: &[Vec<Data>],

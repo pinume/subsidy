@@ -1,5 +1,5 @@
-use super::data::SheetData;
-use super::reader::{UploadColumns, cell_to_string};
+use super::data::{SheetData, UploadSheet};
+use super::reader::cell_to_string;
 use super::unique_index::UniqueIndex;
 use crate::jobs::invoice::BlueInvoiceCandidates;
 
@@ -75,8 +75,10 @@ impl TransactionReconciler {
         invoices: &SheetData,
         sales: &SheetData,
     ) -> Result<Self, String> {
-        let app_cols = UploadColumns::from_header(&app_upload.header, "已上传家电电脑.xlsx")?;
-        let dig_cols = UploadColumns::from_header(&dig_upload.header, "已上传数码.xlsx")?;
+        let app_upload = UploadSheet::new(app_upload, "已上传家电电脑.xlsx");
+        let dig_upload = UploadSheet::new(dig_upload, "已上传数码.xlsx");
+        let app_fields = app_upload.fields()?;
+        let dig_fields = dig_upload.fields()?;
 
         let inv_h = &invoices.header;
         let inv_no_idx = inv_h
@@ -92,22 +94,15 @@ impl TransactionReconciler {
 
         // 与清洗第10.12.2节一致：同一参考号只取`更新时间`最新的记录，最新时间相同而内容不同仍为冲突。
         let mut upload_map = UniqueIndex::default();
-        for (rows, cols, label) in [
-            (app_upload, app_cols, "已上传家电电脑.xlsx"),
-            (dig_upload, dig_cols, "已上传数码.xlsx"),
-        ] {
-            let updated_idx = rows.header.require("更新时间", label)?;
-            for row in rows.latest_rows(cols.reference, updated_idx) {
-                let reference_no = cell_to_string(&row[cols.reference]);
-                if !reference_no.is_empty() {
-                    upload_map.insert(
-                        reference_no,
-                        UploadEntry {
-                            status: cell_to_string(&row[cols.status]),
-                            invoice_no: cell_to_string(&row[cols.invoice]),
-                        },
-                    );
-                }
+        for (sheet, fields) in [(app_upload, app_fields), (dig_upload, dig_fields)] {
+            for (reference_no, row) in sheet.latest_by_reference()? {
+                upload_map.insert(
+                    reference_no,
+                    UploadEntry {
+                        status: fields.status(row),
+                        invoice_no: fields.invoice(row),
+                    },
+                );
             }
         }
 

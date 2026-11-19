@@ -7,9 +7,7 @@ use rust_xlsxwriter::Workbook;
 use super::excel::{ReportError, ReportSheetBuilder};
 use super::styles::StylePool;
 use crate::io::xlsx_reader::RawCell;
-use crate::jobs::refund::{
-    self, APPLIANCE_SYNONYMS, OUTPUT_FIELDS, REFUND_APPLIANCE, REFUND_DIGITAL,
-};
+use crate::jobs::refund::{self, REFUND_APPLIANCE, REFUND_DIGITAL};
 use crate::jobs::{self, MERCHANT_APPLIANCE, MERCHANT_DIGITAL, invoice, uploaded};
 use crate::model::{ProcessError, Value};
 use crate::utils::product::normalize_sales_brand;
@@ -63,12 +61,7 @@ const APPLIANCE: Ledger = Ledger {
         "ID",
     ],
     // 复用家电回款清洗的同义字段及歧义检查。
-    synonyms: |field| {
-        OUTPUT_FIELDS
-            .iter()
-            .position(|name| *name == field)
-            .map(|index| APPLIANCE_SYNONYMS[index])
-    },
+    synonyms: |field| REFUND_APPLIANCE.source_synonyms(field),
     invoice_field: "发票号",
     fill_invoice_details: true,
 };

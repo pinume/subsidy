@@ -7,7 +7,7 @@
 | 模块 | 职责与边界 |
 |---|---|
 | `app/cli.rs` | 读取、校验源路径；交互使用标准库 |
-| `app/runner.rs` | 运行锁、8类清洗调度、逐类发布与失败隔离 |
+| `app/runner.rs` | 运行锁、8类清洗调度、逐类发布调用与失败隔离 |
 | `app/reports.rs` | 按本次发布状态检查两份工作簿的依赖；隔离4份报表的生成与发布 |
 | `jobs/` | 文件识别、结构校验、字段转换、匹配和填色；返回 `Table`，由调度器发布 |
 | `model/` | 表、行、值、列类型、填色与错误；不依赖任务和文件 I/O |
@@ -15,7 +15,7 @@
 | `io/paths.rs` | 文件识别、输出目录和真实路径保护 |
 | `io/xlsx_reader.rs` | 保留源单元格类型，以 `Range::start()` 换算 Excel 绝对坐标 |
 | `io/xlsx_writer.rs` | 校验 `Table` 列数，按列类型写单表 XLSX；业务填色优先于斑马纹 |
-| `io/publisher.rs` | 同目录临时文件、替换与清理；失败保留旧结果 |
+| `io/publisher.rs` | 结果发布的共同生命周期（`write_and_publish`）：同目录临时文件生成、写入、替换与清理；失败保留旧结果 |
 | `reporting/data.rs`、`reader.rs` | 标准明细读取、表头与类型映射、商户号及异常底色解析 |
 | `reporting/summary_data.rs` | 汇总指标、品类品牌聚合与排序、异常行索引 |
 | `reporting/summary_wb.rs`、`finance_wb.rs` | 分别生成汇总和财务统筹工作簿 |
@@ -33,11 +33,14 @@
 - 上传状态匹配 (§10.12.2) → `UploadStatusIndex` (`src/jobs/uploaded.rs`)
 - 回款补贴匹配 → `RefundSubsidyIndex` (`src/jobs/refund.rs`)
 - 回款源表读取（文件选择、`汇总`排除、表头定位与去空白）→ `RefundJob::batch_sheets` / `BatchSheet` (`src/jobs/refund.rs`)，回款清洗与台账共用
+- 回款源字段同义词 → `RefundJob::source_synonyms` (`src/jobs/refund.rs`)，按输出字段名查询，家电台账复用
+- 银联权威参考号 → `unionpay::authority_references`；收款单备注索引 → `receipts::remark_index`
 - 销售用券备注级联、匹配统计 → `SalesCouponReconciler` (`src/jobs/coupons.rs`)
-- 清洗中间表与索引缓存 → `PipelineContext` (`src/jobs/context.rs`)；整表共享使用 `Job::run_shared`
+- 清洗中间表与索引的按需加载、缓存 → `PipelineContext` (`src/jobs/context.rs`)，索引构建由各业务模块负责；整表共享使用 `Job::run_shared`
 - 财务统筹最终匹配 → `TransactionReconciler` (`src/reporting/reconciler.rs`)
 - 报表业务键冲突与告警 → `UniqueIndex` (`src/reporting/unique_index.rs`)
-- 汇总指标、上传去重、异常明细 → `src/reporting/summary_data.rs`
+- 已上传明细字段访问与去重（汇总按 UUID 和状态、财务统筹按参考号取最新候选）→ `UploadSheet` (`src/reporting/data.rs`)
+- 汇总指标、异常明细 → `src/reporting/summary_data.rs`
 - 工作表排版 → `ReportSheetBuilder`; 写出错误 → `ReportError` (`src/reporting/excel.rs`)
 
 ## 执行与共享

@@ -37,19 +37,19 @@ fn with_cleanup(error: ProcessError, errors: Vec<String>) -> ProcessError {
 }
 
 /// 覆盖写入提前返回和 panic；常规错误显式清理并合并错误信息。
-pub(crate) struct TempFile {
+struct TempFile {
     path: PathBuf,
     armed: bool,
 }
 
 impl TempFile {
-    pub(crate) fn new(path: PathBuf) -> Self {
+    fn new(path: PathBuf) -> Self {
         Self { path, armed: true }
     }
-    pub(crate) fn disarm(&mut self) {
+    fn disarm(&mut self) {
         self.armed = false;
     }
-    pub(crate) fn fail(&mut self, error: ProcessError) -> ProcessError {
+    fn fail(&mut self, error: ProcessError) -> ProcessError {
         let errors = operation("cleanup-temp", || remove_owned(&self.path))
             .err()
             .map(|e| format!("{}：{e}", self.path.display()))
@@ -104,6 +104,24 @@ pub fn publish(output_dir: &Path, filename: &str, temp: &Path) -> Result<PathBuf
         }
         Err(error) => Err(temporary.fail(error)),
     }
+}
+
+/// 结果发布的共同生命周期：同目录临时文件 → `write` 写入 → 替换正式文件。
+/// 任一步失败或 panic 都保留旧结果并清理临时文件；成功时返回正式路径和 `write` 的结果。
+pub(crate) fn write_and_publish<T>(
+    output_dir: &Path,
+    stem: &str,
+    write: impl FnOnce(&Path) -> Result<T, ProcessError>,
+) -> Result<(PathBuf, T), ProcessError> {
+    let temp = temp_path(output_dir, stem);
+    let mut guard = TempFile::new(temp.clone());
+    let value = match write(&temp) {
+        Ok(value) => value,
+        Err(error) => return Err(guard.fail(error)),
+    };
+    guard.disarm(); // publish 接管临时文件及回滚守卫。
+    let path = publish(output_dir, &format!("{stem}.xlsx"), &temp)?;
+    Ok((path, value))
 }
 
 fn operation<T>(stage: &str, action: impl FnOnce() -> std::io::Result<T>) -> std::io::Result<T> {

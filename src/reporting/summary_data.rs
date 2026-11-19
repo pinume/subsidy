@@ -1,5 +1,5 @@
-use super::data::{CommonInputs, SheetData};
-use super::reader::{UploadColumns, cell_to_decimal, cell_to_string};
+use super::data::{CommonInputs, SheetData, UploadSheet};
+use super::reader::{cell_to_decimal, cell_to_string};
 use super::unique_index::UniqueIndex;
 use calamine::Data;
 use rust_decimal::Decimal;
@@ -211,14 +211,14 @@ impl SummaryMetrics {
 
         let mut duplicate_uploads = 0;
         let mut count_uploaded = |rows: &SheetData, label: &str| -> Result<UploadTotals, String> {
-            let cols = UploadColumns::from_header(&rows.header, label)?;
-            let (current, duplicates) = current_uploads(rows, label)?;
+            let sheet = UploadSheet::new(rows, label);
+            let fields = sheet.fields()?;
+            let (current, duplicates) = sheet.current()?;
             duplicate_uploads += duplicates;
             let mut totals = UploadTotals::new();
             for row in current {
-                let status = cell_to_string(&row[cols.status]);
-                let amount = cell_to_decimal(&row[cols.subsidy]).unwrap_or(Decimal::ZERO);
-                let entry = totals.entry(status).or_default();
+                let amount = fields.subsidy(row);
+                let entry = totals.entry(fields.status(row)).or_default();
                 entry.0 += amount;
                 entry.1 += 1;
             }
@@ -255,31 +255,6 @@ impl SummaryMetrics {
             duplicate_uploads,
         })
     }
-}
-
-/// 报表规则第4.1.1节：金额和笔数不能因重复导出翻倍。同一`实时清分UUID`按`SheetData::latest_rows`
-/// 只取更新时间最新的记录；最新时间相同时每个状态各留一条。UUID 为空无法判断重复，全部保留。
-/// 返回保留的行（源顺序）与去掉的行数。不用 UniqueIndex：它把状态不同的重复判为冲突并全部丢弃。
-pub(crate) fn current_uploads<'a>(
-    rows: &'a SheetData,
-    label: &str,
-) -> Result<(Vec<&'a Vec<Data>>, usize), String> {
-    let uuid_idx = rows.header.require("实时清分UUID", label)?;
-    let updated_idx = rows.header.require("更新时间", label)?;
-    let status_idx = rows.header.require("状态", label)?;
-    let cell =
-        |row: &'a Vec<Data>, idx: usize| cell_to_string(row.get(idx).unwrap_or(&Data::Empty));
-    let mut seen = HashSet::new();
-    let current: Vec<_> = rows
-        .latest_rows(uuid_idx, updated_idx)
-        .into_iter()
-        .filter(|row| {
-            let uuid = cell(row, uuid_idx);
-            uuid.is_empty() || seen.insert((uuid, cell(row, status_idx)))
-        })
-        .collect();
-    let duplicates = rows.len() - 1 - current.len();
-    Ok((current, duplicates))
 }
 
 pub(crate) const SUMMARY_STATUSES: [&str; 5] =
@@ -560,7 +535,8 @@ impl DetailSection {
     ) -> Result<FailedRows<'a>, String> {
         let status_idx = app_up.header.require("状态", "已上传明细")?;
         let inv_idx = app_up.header.require("发票号码", APPLIANCE_UPLOAD)?;
-        let mut rows: FailedRows<'a> = current_uploads(app_up, APPLIANCE_UPLOAD)?
+        let mut rows: FailedRows<'a> = UploadSheet::new(app_up, APPLIANCE_UPLOAD)
+            .current()?
             .0
             .into_iter()
             .filter(|row| cell_to_string(&row[status_idx]) == "审核失败")
@@ -584,7 +560,8 @@ impl DetailSection {
         let status_idx = dig_up.header.require("状态", "已上传明细")?;
         let imei1_idx = dig_up.header.require("IMEI1", DIGITAL_UPLOAD)?;
         let imei2_idx = dig_up.header.require("IMEI2", DIGITAL_UPLOAD)?;
-        Ok(current_uploads(dig_up, DIGITAL_UPLOAD)?
+        Ok(UploadSheet::new(dig_up, DIGITAL_UPLOAD)
+            .current()?
             .0
             .into_iter()
             .filter(|row| cell_to_string(&row[status_idx]) == "审核失败")

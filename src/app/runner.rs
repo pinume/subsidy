@@ -81,14 +81,10 @@ fn process(
 
 fn publish(job: &dyn Job, input_dir: &Path, table: &Table) -> Result<PathBuf, ProcessError> {
     let output_dir = ensure_output_dir(input_dir)?;
-    let stem = job.output_stem();
-    let temp = publisher::temp_path(&output_dir, stem);
-    let mut guard = publisher::TempFile::new(temp.clone());
-    if let Err(error) = write_table(table, &temp) {
-        return Err(guard.fail(error));
-    }
-    guard.disarm(); // publish 接管临时文件及回滚守卫。
-    publisher::publish(&output_dir, &format!("{stem}.xlsx"), &temp)
+    publisher::write_and_publish(&output_dir, job.output_stem(), |temp| {
+        write_table(table, temp)
+    })
+    .map(|(path, ())| path)
 }
 
 pub(super) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {

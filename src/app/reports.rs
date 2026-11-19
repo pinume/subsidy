@@ -122,14 +122,9 @@ fn generate_and_publish(
     generator: impl FnOnce(&Path, &Path) -> Result<Vec<String>, String>,
 ) -> Result<Vec<String>, ProcessError> {
     std::fs::create_dir_all(output)?;
-    let temporary = publisher::temp_path(output, stem);
-    let mut guard = publisher::TempFile::new(temporary.clone());
-    let warnings = match generator(input, &temporary).map_err(ProcessError::Read) {
-        Ok(warnings) => warnings,
-        Err(error) => return Err(guard.fail(error)),
-    };
-    guard.disarm(); // publisher takes ownership of cleanup and rollback.
-    let path = publisher::publish(output, &format!("{stem}.xlsx"), &temporary)?;
+    let (path, warnings) = publisher::write_and_publish(output, stem, |temp| {
+        generator(input, temp).map_err(ProcessError::Read)
+    })?;
     println!("已发布：{}", path.display());
     Ok(warnings)
 }

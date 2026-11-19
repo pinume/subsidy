@@ -177,6 +177,22 @@ fn read_record(
     })
 }
 
+/// 销售用券参考号校验集：银联`检索号`中形如 11 位数字加大写`N`的值。
+pub(crate) fn authority_references(records: &[UnionPayRecord]) -> HashSet<String> {
+    records
+        .iter()
+        .map(|r| r.retrieval_no.as_str())
+        .filter(|v| is_valid_ref_no(v))
+        .map(str::to_owned)
+        .collect()
+}
+
+fn is_valid_ref_no(value: &str) -> bool {
+    value.len() == 12
+        && value.as_bytes()[11] == b'N'
+        && value.as_bytes()[..11].iter().all(u8::is_ascii_digit)
+}
+
 /// 文件发现 → 工作表与表头校验 → 排除首行汇总、表头、末行提示
 /// → 返回有效原始交易。`coupons.rs`复用本函数建立参考号校验集。
 pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, ProcessError> {
@@ -361,6 +377,14 @@ mod tests {
 
     use super::*;
     use crate::test_support::unique_temp_path;
+
+    #[test]
+    fn validates_reference_number_shape() {
+        assert!(is_valid_ref_no("16867252734N"));
+        assert!(!is_valid_ref_no("16867252734W")); // 结尾不是大写 N
+        assert!(!is_valid_ref_no("1686725273N")); // 只有 10 位数字
+        assert!(!is_valid_ref_no("16867252734n")); // 小写 n 不算
+    }
 
     // 交易金额、清算金额、手续费、T0手续费、D1手续费、优惠金额、分期手续费的零基列号。
     const AMOUNT_COLS: [usize; 7] = [5, 6, 7, 8, 9, 21, 22];
