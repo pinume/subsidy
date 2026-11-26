@@ -26,8 +26,4 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Run guardrails check
-        run: |
-          cargo fmt --check
-          cargo clippy --locked --all-targets -- -D warnings
-          cargo test --locked
-          python3 -I scripts/check-docs.py
+        run: .githooks/pre-commit

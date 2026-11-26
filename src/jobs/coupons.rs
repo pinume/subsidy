@@ -119,7 +119,7 @@ impl Job for CouponsJob {
         }
 
         let header = sheet.row_texts(2);
-        if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
+        if !header.iter().map(String::as_str).eq(SOURCE_HEADERS) {
             return Err(ProcessError::Structure {
                 file: FILE_NAME.to_string(),
                 sheet: sheet_name,

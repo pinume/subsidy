@@ -471,7 +471,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<InvoiceRecord>, Proce
     let sheet_name = sheet.name().to_string();
 
     let header = sheet.row_texts(6);
-    if header.iter().map(String::as_str).collect::<Vec<_>>() != SOURCE_HEADERS {
+    if !header.iter().map(String::as_str).eq(SOURCE_HEADERS) {
         return Err(ProcessError::Structure {
             file: file_name,
             sheet: sheet_name,

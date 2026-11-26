@@ -1,6 +1,5 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use calamine::{DataType, Reader, Xlsx, open_workbook};
 use rust_xlsxwriter::{Format, Workbook};
@@ -8,44 +7,19 @@ use subsidy::jobs::{Job, unionpay::UnionPayJob};
 use subsidy::model::Value;
 use zip::{ZipArchive, ZipWriter, write::SimpleFileOptions};
 
-const HEADERS: [&str; 26] = [
-    "清算时间",
-    "交易时间",
-    "终端号",
-    "交易类型",
-    "卡号",
-    "交易金额",
-    "清算金额",
-    "手续费",
-    "T0手续费",
-    "D1手续费",
-    "流水号",
-    "检索号",
-    "卡类型",
-    "发卡行",
-    "商户号",
-    "商户名称",
-    "分店简称",
-    "商户订单号",
-    "银商订单号",
-    "交易方式",
-    "分店",
-    "优惠金额",
-    "分期手续费",
-    "付款附言",
-    "备注",
-    "买家ID",
-];
+#[path = "fixtures/cli_process.rs"]
+mod cli_process;
+#[path = "../src/test_support.rs"]
+mod test_support;
+#[path = "fixtures/unionpay.rs"]
+mod unionpay_fixture;
+
+use cli_process::run_cli_process;
+use test_support::unique_temp_path;
+use unionpay_fixture::UNIONPAY;
 
 fn input_dir(label: &str) -> PathBuf {
-    let root = std::env::temp_dir().join(format!(
-        "subsidy-reading-{label}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_path(&format!("reading-{label}"));
     let input = root.join("raw");
     std::fs::create_dir_all(&input).unwrap();
     input
@@ -56,8 +30,8 @@ fn source(input: &Path, id: u32, serial: f64) -> PathBuf {
     let mut book = Workbook::new();
     let sheet = book.add_worksheet();
     sheet.write_string(0, 0, "汇总").unwrap();
-    for (col, header) in HEADERS.iter().enumerate() {
-        sheet.write_string(1, col as u16, *header).unwrap();
+    for (col, header) in UNIONPAY.split('|').enumerate() {
+        sheet.write_string(1, col as u16, header).unwrap();
     }
     let format = Format::new().set_num_format("yyyy-mm-dd hh:mm:ss");
     sheet
@@ -106,14 +80,7 @@ fn use_1904_epoch(path: &Path) {
 }
 
 fn run_cli(input: &Path) -> String {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_subsidy"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    writeln!(child.stdin.take().unwrap(), "{}", input.display()).unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = run_cli_process(None, format!("{}\n", input.display()).as_bytes());
     // Other seven categories are intentionally absent.
     assert_eq!(output.status.code(), Some(1));
     String::from_utf8(output.stdout).unwrap()

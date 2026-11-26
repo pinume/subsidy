@@ -2,10 +2,17 @@ use calamine::{Data, DataType, Range, Reader, open_workbook_auto};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use subsidy::{generate_store_finance_workbook, generate_summary_workbook};
+
+#[path = "fixtures/cli_process.rs"]
+mod cli_process;
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use cli_process::run_cli_process;
+use test_support::unique_temp_path;
 
 /// 真实数据验收：数据会持续更新，只断言任意批次都成立的关系，不写死批次计数。
 #[test]
@@ -14,14 +21,7 @@ fn real_dataset_invariants() {
     let source_dir = std::env::var_os("COMBINE_SOURCE_DIR")
         .map(std::path::PathBuf::from)
         .expect("set COMBINE_SOURCE_DIR to a raw dataset directory");
-    let root = std::env::temp_dir().join(format!(
-        "combine-acceptance-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_path("acceptance");
     let input = root.join("原始 数据");
     std::fs::create_dir_all(&input).unwrap();
     let mut originals = Vec::new();
@@ -671,15 +671,7 @@ fn data_sections(range: &Range<Data>) -> Vec<Vec<&[Data]>> {
 }
 
 fn run_cli(root: &std::path::Path) -> std::process::Output {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_subsidy"))
-        .current_dir(root)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    writeln!(child.stdin.take().unwrap(), "  \"原始 数据\"  ").unwrap();
-    child.wait_with_output().unwrap()
+    run_cli_process(Some(root), "  \"原始 数据\"  \n".as_bytes())
 }
 
 fn assert_return_trace(input: &std::path::Path, cleaned: &std::path::Path) {

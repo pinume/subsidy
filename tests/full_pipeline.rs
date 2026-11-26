@@ -1,12 +1,20 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
 
 use calamine::{Data, Reader, open_workbook_auto};
 use rust_xlsxwriter::Workbook;
 
+#[path = "fixtures/cli_process.rs"]
+mod cli_process;
 #[path = "fixtures/headers.rs"]
 mod headers;
+#[path = "../src/test_support.rs"]
+mod test_support;
+#[path = "fixtures/unionpay.rs"]
+mod unionpay_fixture;
+
+use cli_process::run_cli_process;
+use test_support::unique_temp_path;
+use unionpay_fixture::UNIONPAY;
 
 fn export(
     input: &Path,
@@ -52,14 +60,7 @@ fn field(path: &Path, sheet: usize, row: usize, name: &str) -> Data {
 
 #[test]
 fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
-    let root = std::env::temp_dir().join(format!(
-        "subsidy-full-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_path("full");
     let input = root.join("raw");
     std::fs::create_dir_all(&input).unwrap();
     export(
@@ -121,7 +122,7 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
     export(
         &input,
         "89813015722APT1_MX_20260914101809_1.xlsx",
-        headers::UNIONPAY,
+        UNIONPAY,
         1,
         "汇总",
         &[&[
@@ -218,14 +219,7 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
             (path, bytes)
         })
         .collect();
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_subsidy"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    writeln!(cli.stdin.take().unwrap(), "{}", input.display()).unwrap();
-    let result = cli.wait_with_output().unwrap();
+    let result = run_cli_process(None, format!("{}\n", input.display()).as_bytes());
     assert!(
         result.status.success(),
         "{}\n{}",
@@ -304,14 +298,7 @@ fn cli_cleans_all_eight_categories_and_publishes_four_excel_reports() {
 
 #[test]
 fn cli_warns_on_duplicate_invoice_keys_and_only_the_ledgers_fail() {
-    let root = std::env::temp_dir().join(format!(
-        "subsidy-conflict-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let root = unique_temp_path("conflict");
     let input = root.join("raw");
     std::fs::create_dir_all(&input).unwrap();
     // Two conflicting invoice records with the same number but differing product names
@@ -384,7 +371,7 @@ fn cli_warns_on_duplicate_invoice_keys_and_only_the_ledgers_fail() {
     export(
         &input,
         "89813015722APT1_MX_20260914101809_1.xlsx",
-        headers::UNIONPAY,
+        UNIONPAY,
         1,
         "汇总",
         &[&[
@@ -474,14 +461,7 @@ fn cli_warns_on_duplicate_invoice_keys_and_only_the_ledgers_fail() {
         );
     }
 
-    let mut cli = Command::new(env!("CARGO_BIN_EXE_subsidy"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    writeln!(cli.stdin.take().unwrap(), "{}", input.display()).unwrap();
-    let result = cli.wait_with_output().unwrap();
+    let result = run_cli_process(None, format!("{}\n", input.display()).as_bytes());
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
 
@@ -548,13 +528,9 @@ fn cli_ledger_keeps_records_when_headers_start_in_column_b() {
         &[],
         None,
     );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_subsidy"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    writeln!(child.stdin.take().unwrap(), "{}", input.display()).unwrap();
-    let result = child.wait_with_output().unwrap();
+    let result = run_cli_process(None, format!("{}\n", input.display()).as_bytes());
+    // 测试框架只在失败时显示该输出，后续任一断言失败都能看到 CLI 的 stderr。
+    eprint!("{}", String::from_utf8_lossy(&result.stderr));
     // Other required sources are absent; the independent digital ledger must still publish.
     assert_eq!(result.status.code(), Some(1));
     let mut book = open_workbook_auto(root.join("国补报表/数码台账.xlsx")).unwrap();

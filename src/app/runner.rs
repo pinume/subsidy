@@ -22,13 +22,10 @@ fn clean_all(input_dir: &Path) -> HashSet<Category> {
     let mut ctx = jobs::PipelineContext::new();
     let registry = jobs::registry();
     let mut success = HashSet::new();
-    let mut failure_count = 0;
 
     for job in registry {
         if execute(*job, input_dir, &mut ctx) {
             success.insert(job.category());
-        } else {
-            failure_count += 1;
         }
     }
 
@@ -37,7 +34,7 @@ fn clean_all(input_dir: &Path) -> HashSet<Category> {
         "全部类别执行完毕：共 {} 项，成功 {}，失败 {}。",
         registry.len(),
         success.len(),
-        failure_count
+        registry.len() - success.len()
     );
     success
 }

@@ -1,20 +1,17 @@
 //! `io::publisher` 的发布、覆盖与失败恢复行为。
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use subsidy::io::publisher;
 use subsidy::model::ProcessError;
 
+#[path = "../src/test_support.rs"]
+mod test_support;
+
+use test_support::unique_temp_path;
+
 fn temp_dir(label: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "clean-publishing-test-{label}-{}-{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let dir = unique_temp_path(&format!("publishing-{label}"));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }

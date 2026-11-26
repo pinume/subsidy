@@ -370,14 +370,13 @@ struct ResolvedColumns {
 }
 
 fn validate_front_header(header: &[String]) -> Result<bool, String> {
-    let autonomous = header.iter().map(String::as_str).collect::<Vec<_>>() == AUTONOMOUS_HEADERS;
+    let autonomous = header.iter().map(String::as_str).eq(AUTONOMOUS_HEADERS);
     if !autonomous
-        && (header.len() < FRONT_LEN
-            || header[..FRONT_LEN]
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                != FRONT_HEADERS)
+        && !header
+            .iter()
+            .take(FRONT_LEN)
+            .map(String::as_str)
+            .eq(FRONT_HEADERS)
     {
         return Err(format!("第2行前{FRONT_LEN}列表头与规定字段及顺序不一致"));
     }
@@ -1357,6 +1356,22 @@ mod tests {
         assert_eq!(table.rows.len(), 1);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn front_header_check_is_exact_for_autonomous_and_prefix_for_standard() {
+        let owned = |names: &[&str]| names.iter().map(|n| n.to_string()).collect::<Vec<_>>();
+        let mut standard = owned(&FRONT_HEADERS);
+        assert_eq!(validate_front_header(&standard), Ok(false));
+        standard.push("尾部扩展列".into());
+        assert_eq!(validate_front_header(&standard), Ok(false));
+        assert!(validate_front_header(&standard[..FRONT_LEN - 1]).is_err());
+
+        let mut autonomous = owned(&AUTONOMOUS_HEADERS);
+        assert_eq!(validate_front_header(&autonomous), Ok(true));
+        assert!(validate_front_header(&autonomous[..AUTONOMOUS_HEADERS.len() - 1]).is_err());
+        autonomous.push("多余列".into());
+        assert!(validate_front_header(&autonomous).is_err());
     }
 
     #[test]

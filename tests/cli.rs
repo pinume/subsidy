@@ -1,23 +1,21 @@
 use std::io::{Read, Write};
-use std::process::{Command, Stdio};
 
 use rust_xlsxwriter::Workbook;
 use subsidy::io::xlsx_reader::{RawCell, open_sheets};
 
+#[path = "fixtures/cli_process.rs"]
+mod cli_process;
+#[path = "../src/test_support.rs"]
+mod test_support;
+#[path = "fixtures/unionpay.rs"]
+mod unionpay_fixture;
+
+use cli_process::run_cli_process;
+use test_support::unique_temp_path;
+use unionpay_fixture::UNIONPAY;
+
 fn cli_result(input: &str) -> (bool, String) {
-    let mut child = Command::new(env!("CARGO_BIN_EXE_subsidy"))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let output = child.wait_with_output().unwrap();
+    let output = run_cli_process(None, input.as_bytes());
     (
         output.status.success(),
         String::from_utf8(output.stdout).unwrap() + &String::from_utf8_lossy(&output.stderr),
@@ -28,46 +26,10 @@ fn run_cli(input: &str) -> String {
     cli_result(input).1
 }
 
-const HEADERS: [&str; 26] = [
-    "清算时间",
-    "交易时间",
-    "终端号",
-    "交易类型",
-    "卡号",
-    "交易金额",
-    "清算金额",
-    "手续费",
-    "T0手续费",
-    "D1手续费",
-    "流水号",
-    "检索号",
-    "卡类型",
-    "发卡行",
-    "商户号",
-    "商户名称",
-    "分店简称",
-    "商户订单号",
-    "银商订单号",
-    "交易方式",
-    "分店",
-    "优惠金额",
-    "分期手续费",
-    "付款附言",
-    "备注",
-    "买家ID",
-];
-
 /// 通过真实终端入口验证自动批量处理、失败后继续与输出文件内容。
 #[test]
 fn cli_runs_all_categories_without_menu_and_publishes_to_detail_dir() {
-    let base = std::env::temp_dir().join(format!(
-        "clean-cli-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let base = unique_temp_path("cli");
     let input_dir = base.join("输入目录");
     std::fs::create_dir_all(&input_dir).unwrap();
 
@@ -75,8 +37,8 @@ fn cli_runs_all_categories_without_menu_and_publishes_to_detail_dir() {
     let sheet = workbook.add_worksheet();
     sheet.set_name("对账数据").unwrap();
     sheet.write_string(0, 0, "汇总").unwrap();
-    for (col, header) in HEADERS.iter().enumerate() {
-        sheet.write_string(1, col as u16, *header).unwrap();
+    for (col, header) in UNIONPAY.split('|').enumerate() {
+        sheet.write_string(1, col as u16, header).unwrap();
     }
     let row: [&str; 26] = [
         "20260914",
@@ -192,7 +154,10 @@ fn cli_runs_all_categories_without_menu_and_publishes_to_detail_dir() {
     // 确认写出的文件是一个真正可被读回的 XLSX（而不仅仅是存在同名文件）。
     let sheets = open_sheets(&output_path).unwrap();
     assert_eq!(sheets.len(), 1);
-    assert_eq!(sheets[0].row_texts(1), HEADERS.to_vec());
+    assert_eq!(
+        sheets[0].row_texts(1),
+        UNIONPAY.split('|').collect::<Vec<_>>()
+    );
     assert_eq!(sheets[0].last_value_row(), Some(2));
     assert_eq!(sheets[0].cell(2, 6), RawCell::Float(100.0));
     assert_eq!(sheets[0].cell(2, 12), RawCell::Text("16867252734N".into()));
@@ -220,7 +185,7 @@ fn cli_runs_all_categories_without_menu_and_publishes_to_detail_dir() {
     );
     assert_eq!(
         open_sheets(&output_path).unwrap()[0].row_texts(1),
-        HEADERS.to_vec()
+        UNIONPAY.split('|').collect::<Vec<_>>()
     );
     // A readable first sheet must not hide a later sheet's parse failure.
     workbook
@@ -296,14 +261,7 @@ fn cli_runs_all_categories_without_menu_and_publishes_to_detail_dir() {
 
 #[test]
 fn cli_reprompts_when_output_resolves_into_source() {
-    let base = std::env::temp_dir().join(format!(
-        "clean-cli-overlap-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let base = unique_temp_path("cli-overlap");
     let source = base.join("国补明细");
     let valid = base.join("valid");
     std::fs::create_dir_all(&source).unwrap();

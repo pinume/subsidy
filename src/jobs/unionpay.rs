@@ -224,7 +224,7 @@ pub(crate) fn load_records(input_dir: &Path) -> Result<Vec<UnionPayRecord>, Proc
             let sheet_name = sheet.name().to_string();
 
             let header = sheet.row_texts(2);
-            if header.iter().map(String::as_str).collect::<Vec<_>>() != HEADERS {
+            if !header.iter().map(String::as_str).eq(HEADERS) {
                 return Err(ProcessError::Structure {
                     file: file_name,
                     sheet: sheet_name,
