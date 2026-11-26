@@ -116,32 +116,53 @@ const DIGITAL: Ledger = Ledger {
     fill_invoice_details: false,
 };
 
-pub(crate) fn generate_appliance(input_dir: &Path, output: &Path) -> Result<Vec<String>, String> {
-    generate(&APPLIANCE, &REFUND_APPLIANCE, input_dir, output)
+/// 一次台账阶段：绑定一个源目录，两份台账的源数据与发票索引都来自该目录。
+pub(crate) struct LedgerBatch<'a> {
+    input_dir: &'a Path,
+    /// 首次成功读取后复用。
+    invoices: Option<InvoiceIndex>,
 }
 
-pub(crate) fn generate_digital(input_dir: &Path, output: &Path) -> Result<Vec<String>, String> {
-    generate(&DIGITAL, &REFUND_DIGITAL, input_dir, output)
-}
-
-fn generate(
-    ledger: &Ledger,
-    source: &refund::RefundJob,
-    input_dir: &Path,
-    output: &Path,
-) -> Result<Vec<String>, String> {
-    let mut rows = read_rows(ledger, source, input_dir).map_err(|e| e.to_string())?;
-    if let Some(target) = ledger.fields.iter().position(|f| *f == "品牌品类") {
-        let [name, category] = ["商品名称", "编码品类"].map(|f| position(ledger, f));
-        for row in &mut rows {
-            row[target] = brand_category(text_of(&row[name]), text_of(&row[category]))
-                .map_or(Value::Empty, Value::Text);
+impl<'a> LedgerBatch<'a> {
+    pub(crate) fn new(input_dir: &'a Path) -> Self {
+        Self {
+            input_dir,
+            invoices: None,
         }
     }
-    fill_references(ledger, &mut rows, input_dir)?;
-    fill_from_invoices(ledger, &mut rows, input_dir)?;
-    write(ledger, &rows, output)?;
-    Ok(Vec::new())
+
+    pub(crate) fn generate_appliance(&mut self, output: &Path) -> Result<Vec<String>, String> {
+        self.generate(&APPLIANCE, &REFUND_APPLIANCE, output)
+    }
+
+    pub(crate) fn generate_digital(&mut self, output: &Path) -> Result<Vec<String>, String> {
+        self.generate(&DIGITAL, &REFUND_DIGITAL, output)
+    }
+
+    fn generate(
+        &mut self,
+        ledger: &Ledger,
+        source: &refund::RefundJob,
+        output: &Path,
+    ) -> Result<Vec<String>, String> {
+        let mut rows = read_rows(ledger, source, self.input_dir).map_err(|e| e.to_string())?;
+        if let Some(target) = ledger.fields.iter().position(|f| *f == "品牌品类") {
+            let [name, category] = ["商品名称", "编码品类"].map(|f| position(ledger, f));
+            for row in &mut rows {
+                row[target] = brand_category(text_of(&row[name]), text_of(&row[category]))
+                    .map_or(Value::Empty, Value::Text);
+            }
+        }
+        fill_references(ledger, &mut rows, self.input_dir)?;
+        // 到此处才读取发票；只缓存成功结果，失败时下一次调用重新尝试。
+        let invoices = match &mut self.invoices {
+            Some(index) => index,
+            empty => empty.insert(InvoiceIndex::load(self.input_dir)?),
+        };
+        invoices.fill(ledger, &mut rows);
+        write(ledger, &rows, output)?;
+        Ok(Vec::new())
+    }
 }
 
 fn read_rows(
@@ -151,7 +172,7 @@ fn read_rows(
 ) -> Result<Vec<Vec<Value>>, ProcessError> {
     let merchant_index = position(ledger, ledger.merchant_field);
     let mut rows: Vec<Vec<Value>> = Vec::new();
-    for sheet in source.batch_sheets(input_dir)? {
+    source.for_each_batch_sheet(input_dir, |sheet| {
         let structure = |detail: String| sheet.structure_error(detail);
         let find = |names: &[&str]| jobs::resolve_synonym_column(sheet.header(), names, 0);
         let mut columns = Vec::with_capacity(ledger.fields.len());
@@ -186,7 +207,8 @@ fn read_rows(
                 .collect();
             rows.push(values);
         }
-    }
+        Ok(())
+    })?;
     // §6.1：按拨付批次首次出现的顺序稳定分组，批次内保持源顺序；序号读取源表并随记录保留。
     let batch = position(ledger, "拨付批次");
     let mut first_seen = HashMap::new();
@@ -363,44 +385,63 @@ fn fill_references(
     Ok(())
 }
 
-/// §6.1：开票状态为`已红冲`时填写发票状态；购买方名称、家电发票金额只补空值（§6.2.2、§6.3.2）。
-fn fill_from_invoices(
-    ledger: &Ledger,
-    rows: &mut [Vec<Value>],
-    input_dir: &Path,
-) -> Result<(), String> {
-    let records = invoice::load_records(input_dir).map_err(|e| e.to_string())?;
-    let mut by_number = HashMap::new();
-    for record in &records {
-        let number = record.invoice_no.trim();
-        if !number.is_empty() && by_number.insert(number, record).is_some() {
-            return Err(format!("发票数电发票号码重复，无法唯一补充台账：{number}"));
+/// 台账补充用的原始发票索引：去首尾空白的非空`数电发票号码` → 台账所需字段。
+struct InvoiceIndex(HashMap<String, InvoiceDetails>);
+
+struct InvoiceDetails {
+    status: String,
+    buyer_name: String,
+    total_amount: Value,
+}
+
+impl InvoiceIndex {
+    /// 读取并校验最新原始发票；非空号码重复时失败，不比较记录内容。
+    fn load(input_dir: &Path) -> Result<Self, String> {
+        let records = invoice::load_records(input_dir).map_err(|e| e.to_string())?;
+        let mut by_number = HashMap::new();
+        for record in &records {
+            let number = record.invoice_no.trim();
+            if number.is_empty() {
+                continue;
+            }
+            let details = InvoiceDetails {
+                status: record.status().to_string(),
+                buyer_name: record.buyer_name().to_string(),
+                total_amount: record.total_amount().clone(),
+            };
+            if by_number.insert(number.to_string(), details).is_some() {
+                return Err(format!("发票数电发票号码重复，无法唯一补充台账：{number}"));
+            }
         }
+        Ok(Self(by_number))
     }
-    let number = position(ledger, ledger.invoice_field);
-    let status = position(ledger, "发票状态");
-    for row in rows {
-        let Value::Text(key) = &row[number] else {
-            continue;
-        };
-        let Some(record) = by_number.get(key.trim()) else {
-            continue;
-        };
-        if record.status().trim() == "已红冲" {
-            row[status] = Value::Text("已红冲".to_string());
-        }
-        let buyer = position(ledger, "发票头/购买方名称");
-        if is_blank(&row[buyer]) {
-            row[buyer] = jobs::text_value(record.buyer_name().to_string());
-        }
-        if ledger.fill_invoice_details {
-            let amount = position(ledger, "发票金额");
-            if is_blank(&row[amount]) {
-                row[amount] = record.total_amount().clone();
+
+    /// §6.1：开票状态为`已红冲`时填写发票状态；购买方名称、家电发票金额只补空值（§6.2.2、§6.3.2）。
+    fn fill(&self, ledger: &Ledger, rows: &mut [Vec<Value>]) {
+        let number = position(ledger, ledger.invoice_field);
+        let status = position(ledger, "发票状态");
+        for row in rows {
+            let Value::Text(key) = &row[number] else {
+                continue;
+            };
+            let Some(invoice) = self.0.get(key.trim()) else {
+                continue;
+            };
+            if invoice.status.trim() == "已红冲" {
+                row[status] = Value::Text("已红冲".to_string());
+            }
+            let buyer = position(ledger, "发票头/购买方名称");
+            if is_blank(&row[buyer]) {
+                row[buyer] = jobs::text_value(invoice.buyer_name.clone());
+            }
+            if ledger.fill_invoice_details {
+                let amount = position(ledger, "发票金额");
+                if is_blank(&row[amount]) {
+                    row[amount] = invoice.total_amount.clone();
+                }
             }
         }
     }
-    Ok(())
 }
 
 fn write(ledger: &Ledger, rows: &[Vec<Value>], output: &Path) -> Result<(), ReportError> {
@@ -659,7 +700,7 @@ mod tests {
         );
         write_uploads(&dir.join("MER_89813015722APT1_1.xlsx"), &[("上传", &[])]);
         let output = dir.join("家电台账.xlsx");
-        generate_appliance(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_appliance(&output).unwrap();
 
         let (name, rows) = read_output(&output);
         assert_eq!(name, "家电台账");
@@ -733,13 +774,16 @@ mod tests {
             "发票_20260301.xlsx",
             &[("INV1", "甲", "1", ""), ("INV1", "乙", "2", "")],
         );
-        let error = generate_appliance(&dir, &output).unwrap_err();
+        let error = LedgerBatch::new(&dir)
+            .generate_appliance(&output)
+            .unwrap_err();
         assert!(error.contains("重复") && error.contains("INV1"), "{error}");
         std::fs::remove_file(dir.join("发票_20260301.xlsx")).unwrap();
         std::fs::remove_file(dir.join("发票_20260201.xlsx")).unwrap();
         std::fs::remove_file(dir.join("发票_20260101.xlsx")).unwrap();
         assert!(
-            generate_appliance(&dir, &output)
+            LedgerBatch::new(&dir)
+                .generate_appliance(&output)
                 .unwrap_err()
                 .contains("发票_yyyymmdd")
         );
@@ -783,7 +827,7 @@ mod tests {
             &[("一", &[]), ("二", &[("O5", "R5")])],
         );
         let output = dir.join("家电台账.xlsx");
-        generate_appliance(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_appliance(&output).unwrap();
         let col = position(&APPLIANCE, "交易参考号");
         let references = |output: &Path| {
             read_output(output).1[2..]
@@ -808,7 +852,9 @@ mod tests {
         // 需要补空但缺少已上传文件：台账失败。
         std::fs::remove_file(dir.join("MER_89813015722APT1_1.xlsx")).unwrap();
         std::fs::remove_file(dir.join("MER_89813015722APT1_2.xlsx")).unwrap();
-        let error = generate_appliance(&dir, &output).unwrap_err();
+        let error = LedgerBatch::new(&dir)
+            .generate_appliance(&output)
+            .unwrap_err();
         assert!(error.contains("MER_89813015722APT1_"), "{error}");
 
         // 没有空参考号时不读取已上传文件。
@@ -817,7 +863,7 @@ mod tests {
             0,
             &[("批次", &header, vec![row(&["B1", m, "O1", "R1"])])],
         );
-        generate_appliance(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_appliance(&output).unwrap();
         assert_eq!(references(&output), [s("R1")]);
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -907,7 +953,7 @@ mod tests {
             &[("INV", "购方甲", "", "已红冲")],
         );
         let output = dir.join("数码台账.xlsx");
-        generate_digital(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_digital(&output).unwrap();
 
         let (name, rows) = read_output(&output);
         assert_eq!(name, "数码台账");
@@ -963,7 +1009,8 @@ mod tests {
         assert_eq!(data[98][col("发票头/购买方名称")], Data::Empty);
         std::fs::remove_file(dir.join("发票_20260201.xlsx")).unwrap();
         assert!(
-            generate_digital(&dir, &output)
+            LedgerBatch::new(&dir)
+                .generate_digital(&output)
                 .unwrap_err()
                 .contains("发票_yyyymmdd")
         );
@@ -996,7 +1043,7 @@ mod tests {
         );
         write_invoices(&dir, "发票_20260201.xlsx", &[]);
         let output = dir.join("数码台账.xlsx");
-        generate_digital(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_digital(&output).unwrap();
 
         let col = |field| position(&DIGITAL, field);
         let before = read_output(&output).1[2..].to_vec();
@@ -1041,7 +1088,7 @@ mod tests {
             0,
             &[("一", &header, first), ("二", &header, second)],
         );
-        generate_digital(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_digital(&output).unwrap();
         let after = read_output(&output).1[2..].to_vec();
         assert_eq!(after[..102], before[..]);
         assert_eq!(
@@ -1074,7 +1121,7 @@ mod tests {
         );
         write_invoices(&dir, "发票_20260201.xlsx", &[]);
         let output = dir.join("数码台账.xlsx");
-        generate_digital(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_digital(&output).unwrap();
         let rows = read_output(&output).1;
         assert_eq!(rows.len(), 3);
         let col = |field| position(&DIGITAL, field);
@@ -1096,8 +1143,33 @@ mod tests {
         }
         book.save(dir.join("2026年数码补贴明细已经回款下发.xlsx"))
             .unwrap();
-        generate_digital(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_digital(&output).unwrap();
         assert_eq!(text(&read_output(&output).1[2][col("序号")]), "12");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ledgers_share_a_successful_invoice_index_and_retry_a_failed_one() {
+        let dir = unique_temp_path("ledger-shared-invoices");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, field) in [
+            ("2026年家电类以旧换新补贴明细已经回款下发.xlsx", "核销商编"),
+            ("2026年数码补贴明细已经回款下发.xlsx", "商户编号"),
+        ] {
+            write_book(&dir.join(name), 0, &[("批次", &[field], Vec::new())]);
+        }
+        let output = dir.join("out.xlsx");
+        let mut batch = LedgerBatch::new(&dir);
+
+        // 缺少发票：即使本店零行也失败，且不缓存。
+        let error = batch.generate_appliance(&output).unwrap_err();
+        assert!(error.contains("发票_yyyymmdd.xlsx"), "{error}");
+
+        write_invoices(&dir, "发票_20261001.xlsx", &[]);
+        batch.generate_appliance(&output).unwrap();
+        // 源文件移走后仍能生成，说明第二份台账没有重新读取发票。
+        std::fs::remove_file(dir.join("发票_20261001.xlsx")).unwrap();
+        batch.generate_digital(&output).unwrap();
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1157,7 +1229,7 @@ mod tests {
         );
         write_invoices(&dir, "发票_20260201.xlsx", &[]);
         let output = dir.join("数码台账.xlsx");
-        generate_digital(&dir, &output).unwrap();
+        LedgerBatch::new(&dir).generate_digital(&output).unwrap();
         assert_eq!(read_output(&output).1.len(), 2);
 
         write_book(
@@ -1165,7 +1237,9 @@ mod tests {
             0,
             &[("批次", &["核销商编"], vec![row(&[MERCHANT_DIGITAL])])],
         );
-        let error = generate_digital(&dir, &output).unwrap_err();
+        let error = LedgerBatch::new(&dir)
+            .generate_digital(&output)
+            .unwrap_err();
         assert!(error.contains("缺少商户筛选字段"), "{error}");
 
         // 同一字段的两个同义表头同时出现：结构异常，不任取一列。
@@ -1178,7 +1252,9 @@ mod tests {
                 vec![row(&["B1", MERCHANT_DIGITAL, MERCHANT_DIGITAL])],
             )],
         );
-        let error = generate_digital(&dir, &output).unwrap_err();
+        let error = LedgerBatch::new(&dir)
+            .generate_digital(&output)
+            .unwrap_err();
         assert!(error.contains("多个匹配"), "{error}");
         std::fs::remove_dir_all(dir).unwrap();
     }

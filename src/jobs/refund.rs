@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::FromPrimitive;
 
 use crate::io::paths::list_xlsx_files;
-use crate::io::xlsx_reader::{RawCell, SheetGrid, open_sheets};
+use crate::io::xlsx_reader::{RawCell, SheetGrid, for_each_sheet};
 use crate::model::{Column, ColumnType, DecimalScale, Fill, ProcessError, Row, Table, Value};
 
 use super::{
@@ -400,9 +400,13 @@ fn select_latest_file(candidates: Vec<PathBuf>, suffix: &str) -> Result<PathBuf,
 }
 
 impl RefundJob {
-    /// 本类别原始补贴明细的全部批次表；回款清洗与台账共用同一读取规则。
-    pub(crate) fn batch_sheets(&self, input_dir: &Path) -> Result<Vec<BatchSheet>, ProcessError> {
-        batch_sheets(self.0, input_dir)
+    /// 逐张遍历本类别原始补贴明细的批次表；回款清洗与台账共用同一读取规则。
+    pub(crate) fn for_each_batch_sheet(
+        &self,
+        input_dir: &Path,
+        visit: impl FnMut(&BatchSheet) -> Result<(), ProcessError>,
+    ) -> Result<(), ProcessError> {
+        for_each_batch_sheet(self.0, input_dir, visit)
     }
 
     /// 统一输出字段（`OUTPUT_FIELDS`）在本类别原始表中的同义源字段；非输出字段返回 `None`。
@@ -458,32 +462,36 @@ impl BatchSheet {
     }
 }
 
-fn batch_sheets(config: &RefundConfig, input_dir: &Path) -> Result<Vec<BatchSheet>, ProcessError> {
+/// 每张批次表处理完即释放原始单元格区域；`汇总`表不读取。跨表规则由调用方在遍历后执行。
+fn for_each_batch_sheet(
+    config: &RefundConfig,
+    input_dir: &Path,
+    mut visit: impl FnMut(&BatchSheet) -> Result<(), ProcessError>,
+) -> Result<(), ProcessError> {
     let path = source_file(config, input_dir)?;
     let file = path.file_name().unwrap().to_string_lossy().into_owned();
-    let mut sheets = Vec::new();
-    for grid in open_sheets(&path)? {
-        if grid.name().trim() == "汇总" {
-            continue;
-        }
-        let mut sheet = BatchSheet {
-            file: file.clone(),
-            grid,
-            header: Vec::new(),
-            header_row: 0,
-        };
-        sheet.header_row =
-            locate_header(&sheet.grid, config).map_err(|e| sheet.structure_error(e))?;
-        // 表头首尾空白不计入字段名，与表头定位一致。
-        sheet.header = sheet
-            .grid
-            .row_texts(sheet.header_row)
-            .iter()
-            .map(|name| name.trim().to_string())
-            .collect();
-        sheets.push(sheet);
-    }
-    Ok(sheets)
+    for_each_sheet(
+        &path,
+        |name| name.trim() != "汇总",
+        |grid| {
+            let mut sheet = BatchSheet {
+                file: file.clone(),
+                grid,
+                header: Vec::new(),
+                header_row: 0,
+            };
+            sheet.header_row =
+                locate_header(&sheet.grid, config).map_err(|e| sheet.structure_error(e))?;
+            // 表头首尾空白不计入字段名，与表头定位一致。
+            sheet.header = sheet
+                .grid
+                .row_texts(sheet.header_row)
+                .iter()
+                .map(|name| name.trim().to_string())
+                .collect();
+            visit(&sheet)
+        },
+    )
 }
 
 const HEADER_SCAN_ROWS: u32 = 20;
@@ -538,7 +546,7 @@ fn source_file(config: &RefundConfig, input_dir: &Path) -> Result<PathBuf, Proce
 fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessError> {
     let mut records: Vec<Vec<Value>> = Vec::new();
 
-    for sheet in batch_sheets(config, input_dir)? {
+    for_each_batch_sheet(config, input_dir, |sheet| {
         let mut columns: Vec<Option<u32>> = Vec::with_capacity(24);
         for synonyms in &config.field_synonyms {
             columns.push(
@@ -575,9 +583,10 @@ fn run_refund(config: &RefundConfig, input_dir: &Path) -> Result<Table, ProcessE
                     "筛选后的商户订单号不能为空".to_string(),
                 ));
             }
-            records.push(read_row(&sheet, row, &columns)?);
+            records.push(read_row(sheet, row, &columns)?);
         }
-    }
+        Ok(())
+    })?;
 
     let rows = classify_and_sink(records);
     Ok(Table {
@@ -644,6 +653,7 @@ mod tests {
     use rust_xlsxwriter::{Formula, Workbook};
 
     use super::*;
+    use crate::io::xlsx_reader::open_sheets;
     use crate::test_support::unique_temp_path;
 
     /// 按下标取列的常量必须指向同名输出字段；输出列调整顺序时这里先失败。
@@ -1047,6 +1057,32 @@ mod tests {
         let error = error.to_string();
         assert!(
             error.contains("批次一") && error.contains("多个匹配"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn reports_first_failing_sheet_in_source_order() {
+        let dir = unique_temp_path("refund-error-order");
+        std::fs::create_dir(&dir).unwrap();
+        write_workbook(
+            &dir.join("2026年家电类以旧换新补贴明细已经回款下发.xlsx"),
+            &[
+                (
+                    "第一批",
+                    &APPLIANCE_HEADER,
+                    &[appliance_row("A", "ORDER1", "T1", "")],
+                ),
+                ("无表头", &["其他"], &[]),
+            ],
+        );
+
+        let error = REFUND_APPLIANCE.run(&dir).unwrap_err();
+
+        assert!(
+            matches!(&error, ProcessError::Data { sheet, row: 2, field, .. }
+                if sheet == "第一批" && field == "补贴金额"),
             "{error}"
         );
         std::fs::remove_dir_all(dir).unwrap();

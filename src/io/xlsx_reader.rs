@@ -110,18 +110,37 @@ impl SheetGrid {
 
 /// 打开工作簿并按原顺序返回全部工作表。
 pub fn open_sheets(path: &Path) -> Result<Vec<SheetGrid>, ProcessError> {
+    let mut sheets = Vec::new();
+    for_each_sheet(
+        path,
+        |_| true,
+        |sheet| {
+            sheets.push(sheet);
+            Ok(())
+        },
+    )?;
+    Ok(sheets)
+}
+
+/// 打开一次工作簿，按原顺序逐张读取表名满足`wanted`的工作表并交给`visit`；
+/// 其余工作表不读取单元格区域。首个读取或处理错误即返回。
+pub(crate) fn for_each_sheet(
+    path: &Path,
+    wanted: impl Fn(&str) -> bool,
+    mut visit: impl FnMut(SheetGrid) -> Result<(), ProcessError>,
+) -> Result<(), ProcessError> {
     let mut workbook: Xlsx<_> = open_workbook(path)
         .map_err(|error| ProcessError::Read(format!("{}：{error}", path.display())))?;
-    workbook
-        .sheet_names()
-        .into_iter()
-        .map(|name| {
-            let range = workbook.worksheet_range(&name).map_err(|error| {
-                ProcessError::Read(format!("{} / {name}：{error}", path.display()))
-            })?;
-            Ok(SheetGrid { name, range })
-        })
-        .collect()
+    for name in workbook.sheet_names() {
+        if !wanted(&name) {
+            continue;
+        }
+        let range = workbook
+            .worksheet_range(&name)
+            .map_err(|error| ProcessError::Read(format!("{} / {name}：{error}", path.display())))?;
+        visit(SheetGrid { name, range })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

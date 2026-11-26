@@ -9,7 +9,7 @@ use crate::io::{
 };
 use crate::jobs::{self, Category};
 use crate::model::ProcessError;
-use crate::reporting::{data::CommonInputs, finance_wb, ledger, summary_wb};
+use crate::reporting::{data::CommonInputs, finance_wb, ledger::LedgerBatch, summary_wb};
 
 const SUMMARY_DEPENDENCIES: &[Category] = &[
     Category::Invoice,
@@ -67,28 +67,29 @@ pub(super) fn run_all(input: &Path, cleaned: &Path, success: &HashSet<Category>)
         }
         all_ok &= attempt(stem, || {
             validate_output_dir(input)?;
-            generate_and_publish(stem, cleaned, &output, |input, path| {
+            generate_and_publish(stem, &output, |path| {
                 let inputs = common_inputs
-                    .get_or_init(|| CommonInputs::load(input))
+                    .get_or_init(|| CommonInputs::load(cleaned))
                     .as_ref()
                     .map_err(Clone::clone)?;
-                generator(input, path, inputs)
+                generator(cleaned, path, inputs)
             })
         });
     }
     // 台账直接读取原始数据，不依赖本次清洗结果。
-    for (stem, generator) in [
-        (
-            "家电台账",
-            ledger::generate_appliance as fn(&Path, &Path) -> Result<Vec<String>, String>,
-        ),
-        ("数码台账", ledger::generate_digital),
-    ] {
-        all_ok &= attempt(stem, || {
-            validate_output_dir(input)?;
-            generate_and_publish(stem, input, &output, generator)
-        });
-    }
+    let mut ledgers = LedgerBatch::new(input);
+    all_ok &= attempt("家电台账", || {
+        validate_output_dir(input)?;
+        generate_and_publish("家电台账", &output, |path| {
+            ledgers.generate_appliance(path)
+        })
+    });
+    all_ok &= attempt("数码台账", || {
+        validate_output_dir(input)?;
+        generate_and_publish("数码台账", &output, |path| {
+            ledgers.generate_digital(path)
+        })
+    });
     all_ok
 }
 
@@ -117,13 +118,12 @@ fn attempt(stem: &str, run: impl FnOnce() -> Result<Vec<String>, ProcessError>) 
 
 fn generate_and_publish(
     stem: &str,
-    input: &Path,
     output: &Path,
-    generator: impl FnOnce(&Path, &Path) -> Result<Vec<String>, String>,
+    generator: impl FnOnce(&Path) -> Result<Vec<String>, String>,
 ) -> Result<Vec<String>, ProcessError> {
     std::fs::create_dir_all(output)?;
     let (path, warnings) = publisher::write_and_publish(output, stem, |temp| {
-        generator(input, temp).map_err(ProcessError::Read)
+        generator(temp).map_err(ProcessError::Read)
     })?;
     println!("已发布：{}", path.display());
     Ok(warnings)
@@ -218,7 +218,7 @@ mod tests {
                 publisher::inject(&[("replace", false)]);
             }
             let result = panic::catch_unwind(|| {
-                generate_and_publish("summary", &output, &output, |_, path| {
+                generate_and_publish("summary", &output, |path| {
                     if stage != "missing-output" {
                         std::fs::write(path, b"new xlsx").unwrap();
                     }
@@ -237,7 +237,7 @@ mod tests {
             }
             assert_eq!(std::fs::read(&xlsx).unwrap(), b"old xlsx");
             assert_eq!(std::fs::read_dir(&output).unwrap().count(), 1);
-            generate_and_publish("finance", &output, &output, |_, path| {
+            generate_and_publish("finance", &output, |path| {
                 std::fs::write(path, b"finance").map_err(|error| error.to_string())?;
                 Ok(Vec::new())
             })
@@ -258,7 +258,7 @@ mod tests {
         let expected_warnings = vec![
             "发票商品名称索引：1 个键对应多条内容不同的记录，已按未命中处理（INV001）".to_string(),
         ];
-        let warnings = generate_and_publish("test-summary", &output, &output, |_, path| {
+        let warnings = generate_and_publish("test-summary", &output, |path| {
             std::fs::write(path, b"new report").map_err(|error| error.to_string())?;
             Ok(expected_warnings.clone())
         })

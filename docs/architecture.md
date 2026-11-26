@@ -13,13 +13,13 @@
 | `model/` | 表、行、值、列类型、填色与错误；不依赖任务和文件 I/O |
 | `utils/` | 日期、十进制金额、文本、单据号等共用规则；不访问文件系统 |
 | `io/paths.rs` | 文件识别、输出目录和真实路径保护 |
-| `io/xlsx_reader.rs` | 保留源单元格类型，以 `Range::start()` 换算 Excel 绝对坐标 |
+| `io/xlsx_reader.rs` | 保留源单元格类型，以 `Range::start()` 换算 Excel 绝对坐标；提供整本读取与打开一次、逐张读取两种入口 |
 | `io/xlsx_writer.rs` | 校验 `Table` 列数，按列类型写单表 XLSX；业务填色优先于斑马纹 |
 | `io/publisher.rs` | 结果发布的共同生命周期（`write_and_publish`）：同目录临时文件生成、写入、替换与清理；失败保留旧结果 |
 | `reporting/data.rs`、`reader.rs` | 标准明细读取、表头与类型映射、商户号及异常底色解析 |
 | `reporting/summary_data.rs` | 汇总指标、品类品牌聚合与排序、异常行索引 |
 | `reporting/summary_wb.rs`、`finance_wb.rs` | 分别生成汇总和财务统筹工作簿 |
-| `reporting/ledger.rs` | 家电、数码台账：读取原始补贴明细，按原始发票填写红冲状态，家电另按发票补空 |
+| `reporting/ledger.rs` | 家电、数码台账：读取原始补贴明细，由 `LedgerBatch` 绑定源目录并管理原始发票索引；按原始发票填写红冲状态与数码购买方名称，家电另按发票补空 |
 | `reporting/excel.rs`、`styles.rs` | 统一排版、类型写入和 `ReportError`；公开报表接口返回 `String` 错误 |
 
 ## 规则所有者
@@ -32,7 +32,7 @@
 - 蓝票取号 (清洗 §10.10 及财务兜底) → `BlueInvoiceCandidates` (`src/jobs/invoice.rs`)
 - 上传状态匹配 (§10.12.2) → `UploadStatusIndex` (`src/jobs/uploaded.rs`)
 - 回款补贴匹配 → `RefundSubsidyIndex` (`src/jobs/refund.rs`)
-- 回款源表读取（文件选择、`汇总`排除、表头定位与去空白）→ `RefundJob::batch_sheets` / `BatchSheet` (`src/jobs/refund.rs`)，回款清洗与台账共用
+- 回款源表读取（文件选择、`汇总`排除、表头定位与去空白）→ `RefundJob::for_each_batch_sheet` / `BatchSheet` (`src/jobs/refund.rs`)，回款清洗与台账共用
 - 回款源字段同义词 → `RefundJob::source_synonyms` (`src/jobs/refund.rs`)，按输出字段名查询，家电台账复用
 - 银联权威参考号 → `unionpay::authority_references`；收款单备注索引 → `receipts::remark_index`
 - 销售用券备注级联、匹配统计 → `SalesCouponReconciler` (`src/jobs/coupons.rs`)
@@ -57,9 +57,11 @@
 
 清洗通过 `PipelineContext` 显式传递索引和中间表。已上传依赖对应回款数据，销售用券依赖银联、发票、收款单及两份已上传数据。已上传和回款的 `Job::run_shared()` 通过 `cached_table()` 复用 `Rc<Table>`；索引按需构建，只缓存成功结果，运行结束释放。被引用任务只提供数据，发布仍由调度器负责。
 
-CLI 报表阶段使用局部 `OnceCell<Result<CommonInputs, String>>` 加载6份共同明细及商户号。财务统筹额外读取银联，完整成功流程共解析7份输入。异常明细由 `AnomalyDatasets` 一次选好行与列（`DetailSection`），渲染只写表头与行。共同输入加载失败影响两份报表，单份报表的底色读取、计算、写出或发布失败只影响自身。台账不检查清洗依赖，直接读取原始数据：回款源表的文件选择、`汇总`排除与表头定位复用 `RefundJob::batch_sheets`，发票复用 `invoice::load_records`（`合计含税金额` 仅供台账，不进入清洗输出）；不缓存到 `PipelineContext`。
+CLI 报表阶段使用局部 `OnceCell<Result<CommonInputs, String>>` 加载6份共同明细及商户号。财务统筹额外读取银联，完整成功流程共解析7份输入。异常明细由 `AnomalyDatasets` 一次选好行与列（`DetailSection`），渲染只写表头与行。共同输入加载失败影响两份报表，单份报表的底色读取、计算、写出或发布失败只影响自身。台账不检查清洗依赖，直接读取原始数据：回款源表的文件选择、`汇总`排除与表头定位复用 `RefundJob::for_each_batch_sheet`，发票复用 `invoice::load_records`（`合计含税金额` 仅供台账，不进入清洗输出）；不缓存到 `PipelineContext`。调度器 `app/reports.rs` 为一次台账阶段创建一个 `LedgerBatch`，按家电、数码顺序逐份生成发布，并隔离单份报表的生成与发布错误。`LedgerBatch` 绑定一个源目录，并私有管理由该目录构建的发票索引 `InvoiceIndex`：每份台账完成回款源表读取、品牌品类与参考号补空后才请求索引，两份台账共用首次成功的结果；构建失败不缓存，该台账报错，下一次生成重新尝试。本店筛选为零行时同样读取并校验发票。
 
 库导出 `generate_summary_workbook` 和 `generate_store_finance_workbook`；独立调用自行加载共同输入，CLI 使用内部共享入口。
+
+回款工作簿每次遍历只打开一次，按工作簿顺序逐张读取，原始单元格区域处理完即释放；清洗的跨批次分组沉底与台账的拨付批次分组仍在遍历完成后执行。由此：多张表同时有错时，报告源表顺序中首个遇到的错误（靠前表的数据行错误先于靠后表的表头错误）；`汇总`表（名称去首尾空白后匹配）不读取单元格区域，其内容损坏不影响处理。
 
 ## Excel 边界
 
