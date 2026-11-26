@@ -25,17 +25,6 @@ fn remove_owned(path: &Path) -> std::io::Result<()> {
     }
 }
 
-fn with_cleanup(error: ProcessError, errors: Vec<String>) -> ProcessError {
-    if errors.is_empty() {
-        error
-    } else {
-        ProcessError::Io(std::io::Error::other(format!(
-            "{error}；后续恢复/清理失败：{}",
-            errors.join("；")
-        )))
-    }
-}
-
 /// 覆盖写入提前返回和 panic；常规错误显式清理并合并错误信息。
 struct TempFile {
     path: PathBuf,
@@ -50,13 +39,15 @@ impl TempFile {
         self.armed = false;
     }
     fn fail(&mut self, error: ProcessError) -> ProcessError {
-        let errors = operation("cleanup-temp", || remove_owned(&self.path))
-            .err()
-            .map(|e| format!("{}：{e}", self.path.display()))
-            .into_iter()
-            .collect();
+        let cleanup = operation("cleanup-temp", || remove_owned(&self.path));
         self.disarm();
-        with_cleanup(error, errors)
+        match cleanup {
+            Ok(()) => error,
+            Err(cleanup_error) => ProcessError::Io(std::io::Error::other(format!(
+                "{error}；后续恢复/清理失败：{}：{cleanup_error}",
+                self.path.display()
+            ))),
+        }
     }
 }
 

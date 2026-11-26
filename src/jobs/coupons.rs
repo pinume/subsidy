@@ -1807,6 +1807,7 @@ mod tests {
             ],
         );
         let mut ctx = super::super::PipelineContext::new();
+        assert!(ctx.stats().is_none());
         let table = CouponsJob.run_in_context(&dir, &mut ctx).unwrap();
         assert_eq!(table.rows.len(), 4);
         assert_eq!(table.rows[3].fill, Some(Fill::Pink));

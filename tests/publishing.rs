@@ -35,7 +35,7 @@ fn publishes_new_file_when_target_absent() {
 }
 
 #[test]
-fn overwrites_existing_target_and_removes_backup() {
+fn overwrites_existing_target_without_leaving_backup() {
     let dir = temp_dir("overwrite");
     let target_path = dir.join("样本.xlsx");
     std::fs::write(&target_path, b"old").unwrap();
@@ -48,7 +48,7 @@ fn overwrites_existing_target_and_removes_backup() {
     assert_eq!(std::fs::read(&target).unwrap(), b"new");
     assert!(
         !dir.join(".样本.xlsx.bak").exists(),
-        "全部成功后应删除 .bak 备份"
+        "覆盖成功后不应留下 .bak 备份"
     );
 
     std::fs::remove_dir_all(&dir).unwrap();

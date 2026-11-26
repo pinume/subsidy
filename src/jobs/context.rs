@@ -175,16 +175,4 @@ mod tests {
         let retried = ctx.cached_table(Category::Invoice, |_| Ok(sample_table()));
         assert!(retried.is_ok());
     }
-
-    #[test]
-    fn records_and_retrieves_match_stats() {
-        let mut ctx = PipelineContext::new();
-        assert!(ctx.stats().is_none());
-        let stats = MatchStats {
-            hits: [10, 20, 30, 40],
-            ambiguous: [1, 2, 3, 4],
-        };
-        ctx.record_stats(stats);
-        assert_eq!(ctx.stats(), Some(stats));
-    }
 }
