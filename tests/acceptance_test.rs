@@ -1,6 +1,9 @@
 use calamine::{Data, DataType, Range, Reader, open_workbook_auto};
-use std::collections::{HashMap, HashSet};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromPrimitive;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use subsidy::{generate_store_finance_workbook, generate_summary_workbook};
 
@@ -83,6 +86,7 @@ fn real_dataset_invariants() {
     assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 4);
     let wb1_path = out_dir.join("国补上传情况汇总.xlsx");
     let wb2_path = out_dir.join("26年国补门店财务统筹表.xlsx");
+    assert_ledgers(&input, &out_dir);
 
     // Public standalone APIs must produce the same workbook content as the shared CLI.
     let standalone = root.join("standalone");
@@ -257,6 +261,396 @@ fn real_dataset_invariants() {
     }
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// 台账验收（报表规则§6）：预期值只用 calamine 从原始工作簿独立计算，不复用生产读取与补值。
+fn assert_ledgers(input: &Path, out_dir: &Path) {
+    let invoices = source_invoices(input);
+    let mut references = None;
+    for spec in &LEDGERS {
+        let sources = ledger_source_rows(spec, input);
+        let mut book = open_workbook_auto(out_dir.join(format!("{}.xlsx", spec.name))).unwrap();
+        let output = book.worksheet_range(spec.name).unwrap();
+        // 第1行标题，第2行表头，第3行起为数据。
+        let rows: Vec<_> = output.rows().collect();
+        let header: Vec<_> = rows[1].iter().map(text).collect();
+        let rows = &rows[2..];
+        assert_eq!(rows.len(), sources.len(), "{} 数据行数", spec.name);
+
+        for (index, (source, row)) in sources.iter().zip(rows).enumerate() {
+            let actual = |field: &str| {
+                let col = header.iter().position(|name| name == field);
+                &row[col.unwrap_or_else(|| panic!("{} 缺少输出列 {field}", spec.name))]
+            };
+            let at = |field: &str| {
+                format!(
+                    "{} 源表“{}”第{}行 → 输出第{}行 字段 {field}",
+                    spec.name,
+                    source.sheet,
+                    source.row,
+                    index + 3
+                )
+            };
+            // 值比较会抹平单元格类型，另按实际输出单元格断言类型（§6.1 第4条）。
+            for field in spec.text_columns {
+                let cell = actual(field);
+                assert!(
+                    matches!(cell, Data::Empty | Data::String(_)),
+                    "{} 应为文本：{cell:?}",
+                    at(field)
+                );
+            }
+            for field in spec.other_amount_columns {
+                if let Data::String(raw) = actual(field) {
+                    assert!(
+                        raw.trim().parse::<Decimal>().is_err(),
+                        "{} 可解析金额应为数值：{raw:?}",
+                        at(field)
+                    );
+                }
+            }
+            for field in ["拨付批次", "序号", "商户订单号", spec.invoice_field] {
+                assert_eq!(
+                    text(actual(field)),
+                    text(source.get(field)),
+                    "{}",
+                    at(field)
+                );
+            }
+            assert_amount(actual("补贴金额"), source.get("补贴金额"), &at("补贴金额"));
+
+            let number = text(source.get(spec.invoice_field)).trim().to_string();
+            let invoice = invoices.get(&number);
+            let red = invoice.is_some_and(|invoice| invoice.status.trim() == "已红冲");
+            assert_eq!(
+                text(actual("发票状态")),
+                if red { "已红冲" } else { "" },
+                "{}",
+                at("发票状态")
+            );
+
+            let buyer = "发票头/购买方名称";
+            let invoice_buyer = invoice.map_or(Data::Empty, |invoice| invoice.buyer.clone());
+            if !spec.appliance {
+                assert_eq!(text(actual(buyer)), text(&invoice_buyer), "{}", at(buyer));
+                continue;
+            }
+            let expected = if blank(source.get(buyer)) {
+                &invoice_buyer
+            } else {
+                source.get(buyer)
+            };
+            if blank(expected) {
+                assert!(blank(actual(buyer)), "{}", at(buyer));
+            } else {
+                assert_eq!(text(actual(buyer)), text(expected), "{}", at(buyer));
+            }
+            let total = "发票金额";
+            let expected = if blank(source.get(total)) {
+                invoice.map_or(&Data::Empty, |invoice| &invoice.total)
+            } else {
+                source.get(total)
+            };
+            assert_amount(actual(total), expected, &at(total));
+
+            let field = "交易参考号";
+            let expected = if blank(source.get(field)) {
+                let references = references.get_or_insert_with(|| source_references(input));
+                let order = text(source.get("商户订单号")).trim().to_string();
+                match references.get(&order) {
+                    None => String::new(),
+                    Some(found) => {
+                        assert_eq!(
+                            found.len(),
+                            1,
+                            "违反业务前提（同一订单号只对应一个参考号），待业务确认：订单号 {order} → {found:?}；{}",
+                            at(field)
+                        );
+                        found.keys().next().unwrap().clone()
+                    }
+                }
+            } else {
+                text(source.get(field))
+            };
+            assert_eq!(text(actual(field)), expected, "{}", at(field));
+        }
+    }
+}
+
+struct LedgerSpec {
+    name: &'static str,
+    file_suffix: &'static str,
+    merchant: &'static str,
+    appliance: bool,
+    invoice_field: &'static str,
+    /// 非空时必须写为文本的标识列。
+    text_columns: &'static [&'static str],
+    /// 不做源值比较的金额列：可解析金额不得写成文本。
+    other_amount_columns: &'static [&'static str],
+    /// 本测试核对到的字段及其同义源表头（§6.2.1、§6.3.1）；首项为商户字段。
+    fields: &'static [(&'static str, &'static [&'static str])],
+}
+
+const LEDGERS: [LedgerSpec; 2] = [
+    LedgerSpec {
+        name: "家电台账",
+        file_suffix: "年家电类以旧换新补贴明细已经回款下发.xlsx",
+        merchant: "89813015722APT1",
+        appliance: true,
+        invoice_field: "发票号",
+        text_columns: &["序号", "商户订单号", "交易订单号", "交易参考号", "发票号"],
+        other_amount_columns: &["其他支付", "销售金额", "实收销售金额"],
+        fields: &[
+            (
+                "核销商编",
+                &["核销商编", "商户编号", "商户号", "经销商编号"],
+            ),
+            ("拨付批次", &["拨付批次"]),
+            ("序号", &["序号"]),
+            ("商户订单号", &["商户订单号"]),
+            ("补贴金额", &["补贴金额"]),
+            ("发票号", &["发票号"]),
+            ("发票头/购买方名称", &["发票头/购买方名称"]),
+            ("发票金额", &["发票金额"]),
+            ("交易参考号", &["交易参考号"]),
+        ],
+    },
+    LedgerSpec {
+        name: "数码台账",
+        file_suffix: "年数码补贴明细已经回款下发.xlsx",
+        merchant: "89813014812B06R",
+        appliance: false,
+        invoice_field: "发票号码",
+        text_columns: &["序号", "商户订单号", "参考号", "发票号码"],
+        other_amount_columns: &["销售金额"],
+        fields: &[
+            ("商户编号", &["商户编号", "经销商编号"]),
+            ("拨付批次", &["拨付批次"]),
+            ("序号", &["序号"]),
+            ("商户订单号", &["商户订单号"]),
+            ("补贴金额", &["补贴金额", "补贴销售金额"]),
+            ("发票号码", &["发票号码"]),
+        ],
+    },
+];
+
+struct SourceRow {
+    sheet: String,
+    /// Excel 行号（从1开始）。
+    row: u32,
+    values: HashMap<&'static str, Data>,
+}
+
+impl SourceRow {
+    fn get(&self, field: &str) -> &Data {
+        &self.values[field]
+    }
+}
+
+/// 按 Excel 绝对行（从0开始）返回从 A 列起的整行。
+fn absolute_row(range: &Range<Data>, row: u32) -> Vec<Data> {
+    let end = range.end().map_or(0, |(_, col)| col + 1);
+    (0..end)
+        .map(|col| range.get_value((row, col)).cloned().unwrap_or(Data::Empty))
+        .collect()
+}
+
+fn header_names(range: &Range<Data>, row: u32) -> Vec<String> {
+    absolute_row(range, row)
+        .iter()
+        .map(|cell| text(cell).trim().to_string())
+        .collect()
+}
+
+fn column(header: &[String], names: &[&str], location: &str) -> Option<usize> {
+    let found: Vec<_> = (0..header.len())
+        .filter(|&col| names.contains(&header[col].as_str()))
+        .collect();
+    assert!(found.len() <= 1, "{location} 表头 {names:?} 重复");
+    found.first().copied()
+}
+
+fn files_matching(input: &Path, matches: impl Fn(&str) -> bool) -> Vec<PathBuf> {
+    let mut files: Vec<_> = std::fs::read_dir(input)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| matches(&path.file_name().unwrap().to_string_lossy()))
+        .collect();
+    files.sort();
+    files
+}
+
+/// 最新年份源文件中的本店记录：按工作表及行顺序读取，再按拨付批次首次出现的顺序稳定分组。
+fn ledger_source_rows(spec: &LedgerSpec, input: &Path) -> Vec<SourceRow> {
+    let path = files_matching(input, |name| {
+        name.strip_suffix(spec.file_suffix)
+            .is_some_and(|year| year.len() == 4 && year.bytes().all(|b| b.is_ascii_digit()))
+    })
+    .pop()
+    .unwrap_or_else(|| panic!("{} 缺少补贴明细源文件", spec.name));
+    let mut book = open_workbook_auto(path).unwrap();
+    let mut groups: Vec<(String, Vec<SourceRow>)> = Vec::new();
+    for sheet in book.sheet_names() {
+        if sheet.trim() == "汇总" {
+            continue;
+        }
+        let range = book.worksheet_range(&sheet).unwrap();
+        let find_header = |names: &[&str]| {
+            (0..20).find(|&row| {
+                header_names(&range, row)
+                    .iter()
+                    .any(|name| names.contains(&name.as_str()))
+            })
+        };
+        let header_row = find_header(&["拨付批次"])
+            .or_else(|| find_header(spec.fields[0].1))
+            .unwrap_or_else(|| panic!("{} / {sheet} 找不到表头", spec.name));
+        let header = header_names(&range, header_row);
+        let columns: Vec<_> = spec
+            .fields
+            .iter()
+            .map(|(field, names)| (*field, column(&header, names, &sheet)))
+            .collect();
+        let merchant = columns[0].1.expect("源表应有商户字段");
+        for row in header_row + 1..=range.end().map_or(0, |(row, _)| row) {
+            let cells = absolute_row(&range, row);
+            if text(&cells[merchant]).trim() != spec.merchant {
+                continue;
+            }
+            let source = SourceRow {
+                sheet: sheet.clone(),
+                row: row + 1,
+                values: columns
+                    .iter()
+                    .map(|(field, col)| (*field, col.map_or(Data::Empty, |col| cells[col].clone())))
+                    .collect(),
+            };
+            let batch = text(source.get("拨付批次")).trim().to_string();
+            match groups.iter_mut().find(|(name, _)| *name == batch) {
+                Some((_, rows)) => rows.push(source),
+                None => groups.push((batch, vec![source])),
+            }
+        }
+    }
+    groups.into_iter().flat_map(|(_, rows)| rows).collect()
+}
+
+struct SourceInvoice {
+    status: String,
+    buyer: Data,
+    total: Data,
+}
+
+/// 最新日期发票：按去首尾空白的非空数电发票号码索引。
+fn source_invoices(input: &Path) -> HashMap<String, SourceInvoice> {
+    let path = files_matching(input, |name| {
+        name.strip_prefix("发票_")
+            .and_then(|rest| rest.strip_suffix(".xlsx"))
+            .is_some_and(|date| date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()))
+    })
+    .pop()
+    .expect("缺少原始发票");
+    let mut book = open_workbook_auto(path).unwrap();
+    let range = book.worksheet_range_at(0).unwrap().unwrap();
+    let header = header_names(&range, 5);
+    let [number, buyer, total, status] = ["数电发票号码", "购方名称", "合计含税金额", "开票状态"]
+        .map(|name| column(&header, &[name], "原始发票").expect(name));
+    let mut invoices = HashMap::new();
+    for row in 6..=range.end().unwrap().0 {
+        let cells = absolute_row(&range, row);
+        let key = text(&cells[number]).trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let invoice = SourceInvoice {
+            status: text(&cells[status]),
+            buyer: cells[buyer].clone(),
+            total: cells[total].clone(),
+        };
+        assert!(
+            invoices.insert(key.clone(), invoice).is_none(),
+            "原始发票第{}行号码重复：{key}",
+            row + 1
+        );
+    }
+    invoices
+}
+
+/// 家电已上传原始工作簿：订单号 → 各不同非空检索参考号及其首个源位置。
+fn source_references(input: &Path) -> HashMap<String, BTreeMap<String, String>> {
+    let mut references: HashMap<String, BTreeMap<String, String>> = HashMap::new();
+    for path in files_matching(input, |name| {
+        name.starts_with("MER_89813015722APT1_") && name.ends_with(".xlsx")
+    }) {
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let mut book = open_workbook_auto(&path).unwrap();
+        for sheet in book.sheet_names() {
+            let range = book.worksheet_range(&sheet).unwrap();
+            let header = header_names(&range, 1);
+            let [order, reference] = ["订单号", "检索参考号"].map(|name| {
+                header
+                    .iter()
+                    .position(|found| found == name)
+                    .unwrap_or_else(|| panic!("{file} / {sheet} 缺少 {name}"))
+            });
+            for row in 2..=range.end().map_or(0, |(row, _)| row) {
+                let cells = absolute_row(&range, row);
+                let key = text(&cells[order]).trim().to_string();
+                let value = text(&cells[reference]);
+                if !key.is_empty() && !value.trim().is_empty() {
+                    references
+                        .entry(key)
+                        .or_default()
+                        .entry(value)
+                        .or_insert_with(|| format!("{file} / {sheet} 第{}行", row + 1));
+                }
+            }
+        }
+    }
+    references
+}
+
+/// 标识与序号按文本比较；数值型单元格还原为完整整数文本。
+fn text(cell: &Data) -> String {
+    match cell {
+        Data::Empty => String::new(),
+        Data::Float(value) if value.fract() == 0.0 => format!("{value:.0}"),
+        other => other.to_string(),
+    }
+}
+
+fn blank(cell: &Data) -> bool {
+    text(cell).trim().is_empty()
+}
+
+/// 金额按十进制数值比较；空值为 `Ok(None)`（数值零是已有金额），无法解析时按原文比较。
+fn amount(cell: &Data) -> Result<Option<Decimal>, String> {
+    if blank(cell) {
+        return Ok(None);
+    }
+    match cell {
+        Data::Float(value) => Ok(Decimal::from_f64(*value)),
+        Data::Int(value) => Ok(Some(Decimal::from(*value))),
+        other => {
+            let raw = other.to_string();
+            raw.trim().parse().map(Some).map_err(|_| raw)
+        }
+    }
+}
+
+/// 可解析的源金额须输出为等值数值单元格；无法解析的按原文保留；空值留空。
+fn assert_amount(actual: &Data, expected: &Data, location: &str) {
+    match amount(expected) {
+        Ok(None) => assert!(blank(actual), "{location} 应留空：{actual:?}"),
+        Ok(value) => {
+            assert!(
+                matches!(actual, Data::Float(_) | Data::Int(_)),
+                "{location} 应为数值：{actual:?}"
+            );
+            assert_eq!(amount(actual), Ok(value), "{location}");
+        }
+        Err(raw) => assert_eq!(actual, &Data::String(raw), "{location} 应保留原文"),
+    }
 }
 
 /// 报表工作表的数据区块：第6行起，区块之间隔一空行、区块标题和列标题共3行。
